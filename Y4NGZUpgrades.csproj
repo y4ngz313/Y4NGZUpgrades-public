@@ -1,0 +1,105 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>Y4NGZUpgrades</AssemblyName>
+    <RootNamespace>Y4NGZUpgrades</RootNamespace>
+    <Description>Native Y4NGZ progression and upgrade framework spine</Description>
+    <Version>1.0.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Resolve the Interactions repo whether this project builds from the repo root
+         or from a worktree under .worktrees\<name>\ (two extra path levels). -->
+    <Y4NGZInteractionsProjectPath Condition="'$(Y4NGZInteractionsProjectPath)' == '' and Exists('..\..\..\..\Interactions\Y4NGZInteractions\src\Y4NGZInteractions\Y4NGZInteractions.csproj')">..\..\..\..\Interactions\Y4NGZInteractions\src\Y4NGZInteractions\Y4NGZInteractions.csproj</Y4NGZInteractionsProjectPath>
+    <Y4NGZInteractionsProjectPath Condition="'$(Y4NGZInteractionsProjectPath)' == ''">..\..\..\..\..\..\Interactions\Y4NGZInteractions\src\Y4NGZInteractions\Y4NGZInteractions.csproj</Y4NGZInteractionsProjectPath>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <RestoreAdditionalProjectSources>
+      https://api.nuget.org/v3/index.json;
+      https://nuget.bepinex.dev/v3/index.json
+    </RestoreAdditionalProjectSources>
+    <GameManagedDir>C:\Program Files (x86)\Steam\steamapps\common\Lethal Company\Lethal Company_Data\Managed</GameManagedDir>
+    <GaleProfile>C:\Users\Lawson\AppData\Roaming\com.kesomannen.gale\lethal-company\profiles\Current</GaleProfile>
+    <BepInExPlugins>$(GaleProfile)\BepInEx\plugins</BepInExPlugins>
+    <!-- Gale names a locally imported package's plugin directory after the package, so a
+         re-imported profile holds `Y4NGZUpgrades` while older profiles hold the hand-made
+         `y4ngz-Y4NGZUpgrades`. Deploying into the directory the profile does not load from is
+         silent: BepInEx keeps running the other copy and the build looks applied. Prefer the
+         directory that exists, newest layout first. -->
+    <DeployTarget Condition="'$(DeployTarget)' == '' and Exists('$(BepInExPlugins)\Y4NGZUpgrades')">$(BepInExPlugins)\Y4NGZUpgrades</DeployTarget>
+    <DeployTarget Condition="'$(DeployTarget)' == ''">$(BepInExPlugins)\y4ngz-Y4NGZUpgrades</DeployTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.3" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.Core" Version="5.*" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" PrivateAssets="all" />
+    <PackageReference Include="Rune580.Mods.LethalCompany.InputUtils" Version="0.7.13" />
+    <PackageReference Include="UnityEngine.Modules" Version="2022.3.62" IncludeAssets="compile" PrivateAssets="all" />
+    <PackageReference Include="LethalCompany.GameLibs.Steam" Version="81.0.5-ngd.0" Publicize="true" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(GameManagedDir)\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(GameManagedDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.InputSystem">
+      <HintPath>$(GameManagedDir)\Unity.InputSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AIModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.AIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.Core.Runtime">
+      <HintPath>$(GameManagedDir)\Unity.RenderPipelines.Core.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.HighDefinition.Runtime">
+      <HintPath>$(GameManagedDir)\Unity.RenderPipelines.HighDefinition.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="com.github.teamxiaolan.dawnlib">
+      <HintPath>$(BepInExPlugins)\TeamXiaolan-DawnLib\DawnLib\com.github.teamxiaolan.dawnlib.dll</HintPath>
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(Y4NGZInteractionsProjectPath)" Private="false" />
+  </ItemGroup>
+
+  <Target Name="ValidateY4NGZBuildInputs" BeforeTargets="ResolveReferences">
+    <Error Text="Missing Y4NGZInteractions project. Set Y4NGZInteractionsProjectPath to the 1.x API project." Condition="!Exists('$(Y4NGZInteractionsProjectPath)')" />
+  </Target>
+
+  <Target Name="DeployToGaleProfile" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <MakeDir Directories="$(DeployTarget)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployTarget)" />
+    <ItemGroup>
+      <InteractiveAssets Include="InteractiveAssets\**\*.*" />
+      <!-- Weapon bundles and WeaponAssets moved to runtime-assets-armory\ and ship from
+           BetterArmory since #266. A bundle is keyed by file name inside Unity, so shipping a
+           second copy from here would be a double-load, not a spare. -->
+      <RuntimeBundles Include="..\..\runtime-assets\*.lethalbundle" />
+      <RuntimeBundles Include="..\..\runtime-assets\*.bundle" />
+      <ConsumerAnimationAssets Include="..\..\runtime-assets\*.animationbundle" />
+      <ConsumerAnimationAssets Include="..\..\runtime-assets\*.manifest.json" />
+      <ConsumerAnimationAssets Include="..\..\runtime-assets\*-fp-finger-poses.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(InteractiveAssets)" DestinationFiles="@(InteractiveAssets->'$(DeployTarget)\Assets\%(RecursiveDir)%(Filename)%(Extension)')" Condition="'@(InteractiveAssets)' != ''" />
+    <Copy SourceFiles="@(RuntimeBundles)" DestinationFiles="@(RuntimeBundles->'$(DeployTarget)\%(Filename)%(Extension)')" Condition="'@(RuntimeBundles)' != ''" />
+    <Copy SourceFiles="@(ConsumerAnimationAssets)" DestinationFiles="@(ConsumerAnimationAssets->'$(DeployTarget)\%(Filename)%(Extension)')" Condition="'@(ConsumerAnimationAssets)' != ''" />
+  </Target>
+
+</Project>
