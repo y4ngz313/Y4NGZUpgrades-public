@@ -119,6 +119,22 @@ namespace Y4NGZUpgrades.Patches
             LastHolders.GetOrCreateValue(grabbable).Value = clientId;
         }
 
+        /// <summary>
+        /// F-TECH-3: Field Mechanic's fuel-pump stall halving needs exactly the same
+        /// "who put this item here" attribution as the fuel bonus, so the stamp table is shared
+        /// instead of duplicated. Both consumers live behind Ship Systems, which is also what
+        /// gates the DiscardHeldObject/PlaceGrabbableObject patches that populate it.
+        /// </summary>
+        internal static bool TryGetLastHolderClientId(GrabbableObject grabbable, out ulong clientId)
+        {
+            clientId = 0uL;
+            if (grabbable == null || !LastHolders.TryGetValue(grabbable, out StrongBox<ulong> holder))
+                return false;
+
+            clientId = holder.Value;
+            return true;
+        }
+
         private static void SinkFuelItemRoutinePrefix(GrabbableObject grabbable, ref float fuelValue)
         {
             try

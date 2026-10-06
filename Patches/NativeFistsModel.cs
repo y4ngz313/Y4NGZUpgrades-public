@@ -210,35 +210,107 @@ namespace Y4NGZUpgrades.Patches
         }
     }
 
+    /// <summary>
+    /// Per-attacker, per-target sub-shovel-unit accumulator. F-FIST-6: the remainder used to be
+    /// keyed by target alone, so two level-1 players punching the same enemy pooled their
+    /// remainders and a punch could be credited to a deposit someone else made. The attacker id is
+    /// part of the key, so each player's fractional progress is their own.
+    /// </summary>
     internal sealed class NativeFistFractionalDamage<TKey>
     {
-        private readonly Dictionary<TKey, float> remainderByTarget = new Dictionary<TKey, float>();
+        private readonly struct AttackerTarget : IEquatable<AttackerTarget>
+        {
+            internal readonly ulong ClientId;
+            internal readonly TKey Target;
 
-        internal int Add(TKey target, float shovelUnits)
+            internal AttackerTarget(ulong clientId, TKey target)
+            {
+                ClientId = clientId;
+                Target = target;
+            }
+
+            public bool Equals(AttackerTarget other)
+            {
+                return ClientId == other.ClientId &&
+                       EqualityComparer<TKey>.Default.Equals(Target, other.Target);
+            }
+
+            public override bool Equals(object obj) => obj is AttackerTarget other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int targetHash = ReferenceEquals(Target, null) ? 0 : Target.GetHashCode();
+                    return (ClientId.GetHashCode() * 397) ^ targetHash;
+                }
+            }
+        }
+
+        private readonly Dictionary<AttackerTarget, float> remainderByAttackerTarget =
+            new Dictionary<AttackerTarget, float>();
+        // Reused so purging never allocates; purges only run on hit resolution, never per frame.
+        private readonly List<AttackerTarget> purgeScratch = new List<AttackerTarget>();
+
+        internal int Add(ulong clientId, TKey target, float shovelUnits)
         {
             if (ReferenceEquals(target, null) || shovelUnits <= 0f || float.IsNaN(shovelUnits) || float.IsInfinity(shovelUnits))
                 return 0;
 
-            remainderByTarget.TryGetValue(target, out float remainder);
+            var key = new AttackerTarget(clientId, target);
+            remainderByAttackerTarget.TryGetValue(key, out float remainder);
             float total = remainder + shovelUnits;
             int whole = (int)Math.Floor(total + 0.00001f);
             float next = total - whole;
             if (next <= 0.00001f)
-                remainderByTarget.Remove(target);
+                remainderByAttackerTarget.Remove(key);
             else
-                remainderByTarget[target] = next;
+                remainderByAttackerTarget[key] = next;
             return whole;
         }
 
+        /// <summary>Drops every attacker's remainder for one target (the target died or despawned).</summary>
         internal void Remove(TKey target)
         {
-            if (!ReferenceEquals(target, null))
-                remainderByTarget.Remove(target);
+            if (ReferenceEquals(target, null))
+                return;
+
+            purgeScratch.Clear();
+            foreach (KeyValuePair<AttackerTarget, float> pair in remainderByAttackerTarget)
+            {
+                if (EqualityComparer<TKey>.Default.Equals(pair.Key.Target, target))
+                    purgeScratch.Add(pair.Key);
+            }
+            for (int i = 0; i < purgeScratch.Count; i++)
+                remainderByAttackerTarget.Remove(purgeScratch[i]);
+            purgeScratch.Clear();
+        }
+
+        /// <summary>
+        /// F-FIST-6: sweeps targets the caller considers gone (dead or despawned). Entries used to
+        /// survive until <c>ResetRuntime</c> because they were only cleared when a later punch
+        /// happened to observe the same corpse.
+        /// </summary>
+        internal void PurgeTargets(Predicate<TKey> shouldRemove)
+        {
+            if (shouldRemove == null || remainderByAttackerTarget.Count == 0)
+                return;
+
+            purgeScratch.Clear();
+            foreach (KeyValuePair<AttackerTarget, float> pair in remainderByAttackerTarget)
+            {
+                if (shouldRemove(pair.Key.Target))
+                    purgeScratch.Add(pair.Key);
+            }
+            for (int i = 0; i < purgeScratch.Count; i++)
+                remainderByAttackerTarget.Remove(purgeScratch[i]);
+            purgeScratch.Clear();
         }
 
         internal void Clear()
         {
-            remainderByTarget.Clear();
+            remainderByAttackerTarget.Clear();
+            purgeScratch.Clear();
         }
     }
 }

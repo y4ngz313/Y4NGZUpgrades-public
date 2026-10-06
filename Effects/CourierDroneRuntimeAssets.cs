@@ -3,7 +3,9 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using GameNetcodeStuff;
 using UnityEngine;
+using UnityEngine.Audio;
 using UnityEngine.Networking;
 
 namespace Y4NGZUpgrades.Effects
@@ -40,6 +42,7 @@ namespace Y4NGZUpgrades.Effects
         private static Material _dissolveMaterial;
         private static bool _dissolveMaterialLoadAttempted;
         private static bool _impactClipLoadAttempted;
+        private static AudioMixerGroup _worldMixerGroup;
         private static readonly Dictionary<string, GameObject> CompanionPrefabs = new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
 
         internal static GameObject InstantiateDroneVisual(Vector3 position, Quaternion rotation)
@@ -57,8 +60,58 @@ namespace Y4NGZUpgrades.Effects
             AddMarkerLight(drone);
             EnsureSteampunkController(drone);
             EnsureDroneAudio(drone);
+            TryFixMixerGroups(drone);
             LogSpawnDiagnostics(drone);
             return drone;
+        }
+
+        /// <summary>
+        /// F-DRONE-11: the drone's AudioSources never had an outputAudioMixerGroup, so drone SFX
+        /// bypassed the game mixer entirely - they ignored the player's SFX slider and were never
+        /// occluded or ducked like vanilla sounds. Called after EnsureDroneAudio so the three runtime
+        /// sources already exist on the object DawnLib walks.
+        /// </summary>
+        private static void TryFixMixerGroups(GameObject drone)
+        {
+            if (drone == null)
+                return;
+
+            try
+            {
+                DawnLibCompat.FixMixerGroups(drone);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogDebug($"Courier Drone mixer group fixup skipped: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Direct fallback for <see cref="TryFixMixerGroups"/>: borrows the group vanilla already
+        /// routes a player's world audio through, so the drone obeys the same volume and routing
+        /// even when DawnLib's walk misses a source added at runtime.
+        /// </summary>
+        private static AudioMixerGroup ResolveWorldMixerGroup()
+        {
+            if (_worldMixerGroup != null)
+                return _worldMixerGroup;
+
+            PlayerControllerB[] players = StartOfRound.Instance != null ? StartOfRound.Instance.allPlayerScripts : null;
+            if (players == null)
+                return null;
+
+            for (int i = 0; i < players.Length; i++)
+            {
+                PlayerControllerB player = players[i];
+                AudioSource source = player != null ? player.movementAudio : null;
+                if (source != null && source.outputAudioMixerGroup != null)
+                {
+                    _worldMixerGroup = source.outputAudioMixerGroup;
+                    return _worldMixerGroup;
+                }
+            }
+
+            return null;
         }
 
         internal static SteampunkDroneController EnsureSteampunkController(GameObject drone)
@@ -103,13 +156,6 @@ namespace Y4NGZUpgrades.Effects
         {
             SteampunkDroneController controller = EnsureSteampunkController(drone);
             return controller != null ? controller.PlayDematerializeOut() : 0f;
-        }
-
-        internal static void PlayHurt(GameObject drone, bool largeHit)
-        {
-            SteampunkDroneController controller = EnsureSteampunkController(drone);
-            if (controller != null)
-                controller.PlayHurt(largeHit);
         }
 
         internal static void PlayHitReaction(GameObject drone, bool largeHit, Vector3 joltDirection, float joltDistance, float joltSeconds)
@@ -264,6 +310,17 @@ namespace Y4NGZUpgrades.Effects
                 audio.StopMagnetLoop();
         }
 
+        /// <summary>
+        /// F-DRONE-12: silences the wreck. Deliberately does NOT go through EnsureDroneAudio - the
+        /// drone is being torn down, so adding an audio controller back onto it would be wrong.
+        /// </summary>
+        internal static void StopPropellerSound(GameObject drone)
+        {
+            CourierDroneAudioController audio = drone != null ? drone.GetComponent<CourierDroneAudioController>() : null;
+            if (audio != null)
+                audio.StopPropellerLoop();
+        }
+
         private static CourierDroneAudioController GetAudioController(GameObject drone)
         {
             if (drone == null)
@@ -347,8 +404,17 @@ namespace Y4NGZUpgrades.Effects
                 }
             }
 
-            if (prefab != null)
-                CompanionPrefabs[assetName] = prefab;
+            // F-DRONE-16: cache the miss as well. A missing asset used to return null silently AND
+            // rescan GetAllAssetNames on every single call, so an absent grenade-explosion prefab
+            // read in game as "the grenade does nothing" with no hint in the log. Caching null both
+            // stops the rescan and makes the warning fire exactly once per asset name.
+            CompanionPrefabs[assetName] = prefab;
+            if (prefab == null)
+            {
+                Plugin.Log?.LogWarning(
+                    $"Courier Drone companion prefab '{assetName}' is missing from bundle '{BundleName}'; using the vanilla fallback effect.");
+            }
+
             return prefab;
         }
 
@@ -486,44 +552,6 @@ namespace Y4NGZUpgrades.Effects
             Animator animator = drone.GetComponentInChildren<Animator>(includeInactive: true);
             if (animator != null && !SteampunkDroneController.IsBrokenPieceTransform(animator.transform))
                 ActivatePathToRoot(animator.transform, drone.transform);
-        }
-
-        private static void StartAnimations(GameObject drone)
-        {
-            Animator[] animators = drone.GetComponentsInChildren<Animator>(includeInactive: true);
-            for (int i = 0; i < animators.Length; i++)
-            {
-                Animator animator = animators[i];
-                if (animator == null)
-                    continue;
-
-                animator.enabled = true;
-                animator.applyRootMotion = false;
-                animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
-                if (animator.runtimeAnimatorController != null)
-                    animator.Play(0, 0, UnityEngine.Random.Range(0f, 1f));
-            }
-
-            Animation[] animations = drone.GetComponentsInChildren<Animation>(includeInactive: true);
-            for (int i = 0; i < animations.Length; i++)
-            {
-                Animation animation = animations[i];
-                if (animation == null)
-                    continue;
-
-                animation.enabled = true;
-                animation.wrapMode = WrapMode.Loop;
-                if (!animation.isPlaying)
-                    animation.Play();
-            }
-        }
-
-        private static void EnsureAnimationLoop(GameObject drone)
-        {
-            CourierDroneAnimationLooper looper = drone.GetComponent<CourierDroneAnimationLooper>();
-            if (looper == null)
-                looper = drone.AddComponent<CourierDroneAnimationLooper>();
-            looper.Initialize();
         }
 
         private static void NormalizeSize(GameObject drone)
@@ -802,53 +830,6 @@ namespace Y4NGZUpgrades.Effects
             }
         }
 
-        private sealed class CourierDroneAnimationLooper : MonoBehaviour
-        {
-            private Animator[] _animators;
-            private Animation[] _animations;
-
-            internal void Initialize()
-            {
-                _animators = GetComponentsInChildren<Animator>(includeInactive: true);
-                _animations = GetComponentsInChildren<Animation>(includeInactive: true);
-            }
-
-            private void Update()
-            {
-                if (_animators != null)
-                {
-                    for (int i = 0; i < _animators.Length; i++)
-                    {
-                        Animator animator = _animators[i];
-                        if (animator == null || animator.runtimeAnimatorController == null)
-                            continue;
-
-                        animator.enabled = true;
-                        animator.applyRootMotion = false;
-                        animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
-                        AnimatorStateInfo state = animator.GetCurrentAnimatorStateInfo(0);
-                        if (state.normalizedTime >= 0.985f)
-                            animator.Play(state.fullPathHash, 0, 0f);
-                    }
-                }
-
-                if (_animations == null)
-                    return;
-
-                for (int i = 0; i < _animations.Length; i++)
-                {
-                    Animation animation = _animations[i];
-                    if (animation == null)
-                        continue;
-
-                    animation.enabled = true;
-                    animation.wrapMode = WrapMode.Loop;
-                    if (!animation.isPlaying)
-                        animation.Play();
-                }
-            }
-        }
-
         private sealed class CourierDroneAudioController : MonoBehaviour
         {
             private AudioSource _propellerSource;
@@ -860,10 +841,12 @@ namespace Y4NGZUpgrades.Effects
             private bool _pendingRecall;
             private bool _pendingImpact;
             private bool _magnetRequested;
+            private bool _propellerSuppressed;
 
             internal void Initialize()
             {
                 EnsureSources();
+                ApplyMixerGroup();
                 RegisterAudioController(this);
                 EnsureAudioLoading(this);
                 RefreshLoadedClips();
@@ -911,11 +894,24 @@ namespace Y4NGZUpgrades.Effects
                     _magnetSource.Stop();
             }
 
+            /// <summary>
+            /// F-DRONE-12: the suppression flag matters because RefreshLoadedClips is called back
+            /// whenever a clip finishes loading, which would otherwise restart the loop on a wreck
+            /// that is waiting out its death animation.
+            /// </summary>
+            internal void StopPropellerLoop()
+            {
+                _propellerSuppressed = true;
+                if (_propellerSource != null)
+                    _propellerSource.Stop();
+            }
+
             internal void RefreshLoadedClips()
             {
                 EnsureSources();
+                ApplyMixerGroup();
 
-                if (_propellerSource != null && _propellerLoopClip != null)
+                if (!_propellerSuppressed && _propellerSource != null && _propellerLoopClip != null)
                 {
                     _propellerSource.clip = _propellerLoopClip;
                     if (isActiveAndEnabled && !_propellerSource.isPlaying)
@@ -979,6 +975,26 @@ namespace Y4NGZUpgrades.Effects
 
                 _magnetSource = gameObject.AddComponent<AudioSource>();
                 ConfigureWorldSource(_magnetSource, MagnetVolume, loop: true, minDistance: 3.5f, maxDistance: 22f);
+                ApplyMixerGroup();
+            }
+
+            /// <summary>
+            /// F-DRONE-11: routes the three runtime sources through the game mixer. Re-run from
+            /// Initialize/RefreshLoadedClips because StartOfRound - and therefore the group this
+            /// borrows - may not exist yet the first time the sources are built.
+            /// </summary>
+            private void ApplyMixerGroup()
+            {
+                AudioMixerGroup group = ResolveWorldMixerGroup();
+                if (group == null)
+                    return;
+
+                if (_propellerSource != null)
+                    _propellerSource.outputAudioMixerGroup = group;
+                if (_oneShotSource != null)
+                    _oneShotSource.outputAudioMixerGroup = group;
+                if (_magnetSource != null)
+                    _magnetSource.outputAudioMixerGroup = group;
             }
 
             private static void ConfigureWorldSource(AudioSource source, float volume, bool loop, float minDistance, float maxDistance)

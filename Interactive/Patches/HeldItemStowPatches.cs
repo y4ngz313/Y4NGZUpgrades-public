@@ -49,8 +49,9 @@ namespace Y4NGZUpgrades.Interactive.Patches
 
         [HarmonyPatch(typeof(PlayerControllerB), "KillPlayer")]
         [HarmonyPrefix]
-        private static void PreKillPlayer(PlayerControllerB __instance)
+        private static void PreKillPlayer(PlayerControllerB __instance, bool __runOriginal)
         {
+            if (!__runOriginal) return;
             // No restore: the item stays in ItemSlots so the vanilla death drop still finds it.
             HeldItemStowService.Clear(__instance);
             if (__instance != null)

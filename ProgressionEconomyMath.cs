@@ -156,12 +156,39 @@ namespace Y4NGZUpgrades
             int rawBodyRetrievalXp,
             float riskMultiplier)
         {
+            return ComputeRoundAwardedXp(
+                discoveryXp,
+                deliveryXp,
+                combatXp,
+                survivalXp,
+                mainframeHackXp,
+                clutchXp,
+                shipBatteryXp: 0,
+                rawContractXp,
+                rawBodyRetrievalXp,
+                riskMultiplier);
+        }
+
+        /// <summary>#459: the ship battery restore bucket is flat, like mainframe and clutch.</summary>
+        public static int ComputeRoundAwardedXp(
+            int discoveryXp,
+            int deliveryXp,
+            int combatXp,
+            int survivalXp,
+            int mainframeHackXp,
+            int clutchXp,
+            int shipBatteryXp,
+            int rawContractXp,
+            int rawBodyRetrievalXp,
+            float riskMultiplier)
+        {
             long total = Math.Max(0, discoveryXp)
                          + (long)Math.Max(0, deliveryXp)
                          + Math.Max(0, combatXp)
                          + Math.Max(0, survivalXp)
                          + Math.Max(0, mainframeHackXp)
                          + Math.Max(0, clutchXp)
+                         + Math.Max(0, shipBatteryXp)
                          + ScaleRiskXp(rawContractXp, riskMultiplier)
                          + ScaleRiskXp(rawBodyRetrievalXp, riskMultiplier);
             return total > int.MaxValue ? int.MaxValue : (int)total;
@@ -233,6 +260,67 @@ namespace Y4NGZUpgrades
             if (award <= 0d)
                 return 0;
             return award >= int.MaxValue ? int.MaxValue : (int)award;
+        }
+
+        /// <summary>
+        /// The share of one rank band a fraction key buys, rounded the same way the completion
+        /// award rounds and saturating rather than wrapping on an absurd curve. Every #457 act
+        /// price is built from this, so the act and the completion move together by construction.
+        /// </summary>
+        public static int ComputeRankWidthShare(int rankWidth, float widthFraction)
+        {
+            if (rankWidth <= 0 || widthFraction <= 0f)
+                return 0;
+
+            double share = Math.Round(rankWidth * (double)widthFraction, MidpointRounding.AwayFromZero);
+            if (share <= 0d)
+                return 0;
+            return share >= int.MaxValue ? int.MaxValue : (int)share;
+        }
+
+        /// <summary>
+        /// The price of one contract ACT (#457): the configured flat award, or the actor's rank
+        /// band share when that is larger. The flat value is a FLOOR, never a ceiling — a low
+        /// rank keeps the authored number, and a high rank is paid in proportion to the band it
+        /// is climbing, which is what makes the player who did the act out-earn a bystander whose
+        /// only income is the completion share.
+        ///
+        /// A flat award configured to zero is "this act is disabled" and stays zero: an operator
+        /// who zeroed an award must not have it resurrected by their rank.
+        ///
+        /// Base XP, like every other contract award: the moon risk multiplier is applied once, at
+        /// finalize, by <see cref="ScaleContractXp"/>.
+        /// </summary>
+        public static int ComputeContractActXp(int flatXp, int rankWidth, float widthFraction)
+        {
+            if (flatXp <= 0)
+                return 0;
+            return Math.Max(flatXp, ComputeRankWidthShare(rankWidth, widthFraction));
+        }
+
+        /// <summary>
+        /// The Payload piloting ceiling (#457). Piloting pays per second, so rank scaling has to
+        /// raise the CAP rather than the rate; the configured cap is the floor of that ceiling so
+        /// a raised config value is never lowered by a low rank.
+        /// </summary>
+        public static int ComputePayloadPilotCap(int configuredCap, int rankWidth, float widthFraction)
+        {
+            if (configuredCap <= 0)
+                return 0;
+            return Math.Max(configuredCap, ComputeRankWidthShare(rankWidth, widthFraction));
+        }
+
+        /// <summary>
+        /// Whether the local player has any claim on the crew-wide contract completion award
+        /// (#457). Company fans the outcome out to every member of the crew, including one who
+        /// joined late or never left the ship; taking part means either entering the facility or
+        /// earning contract act XP this round. Act XP alone qualifies because several objectives
+        /// (Payload piloting, the surface half of a Survey) are earned without an entrance
+        /// crossing.
+        /// </summary>
+        public static bool IsEligibleForContractCompletionXp(bool enteredFacility, bool earnedContractActXp)
+        {
+            return enteredFacility || earnedContractActXp;
         }
 
         /// <summary>

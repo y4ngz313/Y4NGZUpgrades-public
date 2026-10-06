@@ -48,6 +48,8 @@ namespace Y4NGZUpgrades.Patches
             new Dictionary<ulong, RemoteMantlePresentation>();
 
         private static bool _mantleActive;
+        private static int _mantleStartFrame = -1;
+        private static bool _mantleStaminaCharged;
         private static PlayerControllerB _mantlePlayer;
         private static Vector3 _mantleStartPosition;
         private static Vector3 _mantleLiftPosition;
@@ -77,7 +79,15 @@ namespace Y4NGZUpgrades.Patches
         private static bool _mantleBodyForceHidden;
         private static bool _mantleFpArmRenderersResolved;
         private static Renderer[] _mantleFpArmRenderers = Array.Empty<Renderer>();
+        // F-ESCAPE-6: IsMantleFpArmRenderer used to linear-scan the array for every renderer of
+        // the player hierarchy, every frame of every mantle.
+        private static readonly HashSet<Renderer> _mantleFpArmRendererSet = new HashSet<Renderer>();
         private static bool _mantleFpArmsHidden;
+        // F-ESCAPE-6: CullMantleViewOccluders used to call GetComponentsInChildren<Renderer> from
+        // the LateUpdate postfix, allocating a fresh array (dozens of entries: body, LODs, arms,
+        // visor, head costume, held item) on every frame of the mantle. Scan once per mantle.
+        private static bool _mantleOccluderCandidatesResolved;
+        private static Renderer[] _mantleOccluderCandidates = Array.Empty<Renderer>();
 
         // Render-truth instrumentation (#347): in the Cuckoo profile the LateUpdate telemetry is
         // healthy while the screen shows floating arms, so something re-poses the camera/arms
@@ -113,6 +123,11 @@ namespace Y4NGZUpgrades.Patches
         private const float MANTLE_OCCLUDER_CULL_RADIUS = 0.32f;
         private const float MANTLE_GRAB_HAND_SPREAD = 0.28f;
         private const float REMOTE_MANTLE_MAX_REACH_FRACTION = 0.92f;
+        // F-ESCAPE-4: plausibility bounds for the payload-supplied grip/normal. The probe only
+        // ever grips a ledge within MANTLE_FORWARD_REACH of the player at up to 3 m, so anything
+        // beyond a few metres of the named player is not a mantle that player could be performing.
+        private const float REMOTE_MANTLE_MAX_GRIP_DISTANCE = 6f;
+        private const float REMOTE_MANTLE_MAX_NORMAL_SQR_MAGNITUDE = 4f;
         // Camera-space forward depth the FP viewmodel hands are projected to when grabbing a ledge.
         private const float MANTLE_FP_GRAB_DEPTH = 0.5f;
 
@@ -122,10 +137,6 @@ namespace Y4NGZUpgrades.Patches
 
         private static bool _externalForcesResolved;
         private static FieldInfo _externalForcesField;
-
-        private static bool _vehicleMembersResolved;
-        private static FieldInfo[] _vehicleBoolFields = Array.Empty<FieldInfo>();
-        private static PropertyInfo[] _vehicleBoolProperties = Array.Empty<PropertyInfo>();
 
         [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
         [HarmonyPostfix]
@@ -281,6 +292,16 @@ namespace Y4NGZUpgrades.Patches
             if (player.isPlayerDead || player.inSpecialInteractAnimation || player.isClimbingLadder)
                 return false;
             if (player.isTypingChat || player.inTerminalMenu)
+                return false;
+            // F-ESCAPE-2: these used to live only in ShouldAbortMantle, so an injured player got a
+            // 20 Hz teleport-to-the-wall-and-back loop that drained their whole stamina bar,
+            // re-stowed their held item and spammed MSG_MANTLE_START/STOP — the exact state the
+            // upgrade exists for. Refuse before anything is started or charged.
+            if (player.criticallyInjured || player.isUnderwater || player.isMovementHindered > 0)
+                return false;
+            // F-ESCAPE-8: the 8% cost was charged but never required, so an out-of-stamina player
+            // could chain mantles forever. Mirrors the slide's stamina gate.
+            if (player.isExhausted || player.sprintMeter < PanicSlideUpgrade.MANTLE_MIN_SPRINT_METER)
                 return false;
             if (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen)
                 return false;
@@ -528,8 +549,11 @@ namespace Y4NGZUpgrades.Patches
                 return;
             }
 
+            // F-ESCAPE-3: the authored clip is presentation, the lift is gameplay. A missing or
+            // contract-rejected movement bundle used to delete the mantle outright (no motion, no
+            // stamina, no message). Mantle anyway and explain the missing animation once.
             if (!SlideAnimationBridge.BeginMantle(player, probe.Tall))
-                return;
+                PanicSlidePatch.NotifyMovementAnimationUnavailableOnce();
 
             _mantlePlayer = player;
             _mantleStartPosition = probe.StartPosition;
@@ -540,6 +564,10 @@ namespace Y4NGZUpgrades.Patches
             _mantleWallNormal = probe.WallNormal;
             _mantleDuration = ResolveMantleDuration(probe);
             _mantleStartedAt = Time.time;
+            // F-ESCAPE-2: lets AbortMantle refund the stamina when the mantle dies on its first
+            // Update frame instead of charging for a lift that never moved the player.
+            _mantleStartFrame = Time.frameCount;
+            _mantleStaminaCharged = false;
             _mantleActive = true;
             _nextMantleArmsDiagnosticAt = 0f;
             _mantleOccluderDumpDone = false;
@@ -548,7 +576,7 @@ namespace Y4NGZUpgrades.Patches
             FaceMantleWall(player, probe.WallNormal);
             _mantleAnimStarted = true;
             PanicSlidePatch.BeginMovementLookLimit(player);
-            Plugin.Log?.LogInfo("[Panic Slide] Mantle FP arms diagnostics enabled for active mantle.");
+            Plugin.Log?.LogDebug("[Panic Slide] Mantle FP arms diagnostics enabled for active mantle.");
 
             SaveAndLockInput(player);
             ZeroMovementForces(player);
@@ -570,6 +598,16 @@ namespace Y4NGZUpgrades.Patches
             if (player == null || player != _mantlePlayer)
             {
                 AbortMantle("player-changed");
+                return;
+            }
+
+            // F-ESCAPE-5: an external teleport (Inverse Teleporter, or any mod) must win. The mover
+            // is a world-space lerp over positions captured at mantle start, so after a teleport
+            // the swept-clearance check fails and the generic abort would drag the player back to
+            // the ledge — on the Inverse Teleporter that can be fatal. Bail without restoring.
+            if (player.teleportingThisFrame || player.teleportedLastFrame)
+            {
+                AbortMantle("teleported", restorePosition: false);
                 return;
             }
 
@@ -605,7 +643,9 @@ namespace Y4NGZUpgrades.Patches
 
         private static bool ShouldAbortMantle(PlayerControllerB player)
         {
-            if (player == null || player.isPlayerDead || player.criticallyInjured)
+            // F-ESCAPE-2: criticallyInjured moved to CanTryMantle. Aborting on it here charged the
+            // stamina and teleported the player to the wall first, every 50 ms.
+            if (player == null || player.isPlayerDead)
                 return true;
             if (player.inSpecialInteractAnimation || player.isClimbingLadder)
                 return true;
@@ -675,7 +715,7 @@ namespace Y4NGZUpgrades.Patches
                 : "<null>";
             string containerPos = FormatNullablePosition(player.cameraContainerTransform);
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide] Mantle FP arms diagnostics: " +
                 $"frame={Time.frameCount}, " +
                 $"localArmsTransform.position={FormatNullablePosition(armsTransform)}, " +
@@ -693,7 +733,7 @@ namespace Y4NGZUpgrades.Patches
             // differ), so the preview must be anchored from these live numbers, not the hierarchy.
             Transform metarigTransform = player.playerModelArmsMetarig;
             Transform rotationTarget = player.localArmsRotationTarget;
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide] Mantle FP arms rig anchors: " +
                 $"frame={Time.frameCount}, " +
                 $"metarig(cam-local)={FormatCameraLocal(cameraTransform, metarigTransform)}, " +
@@ -817,7 +857,7 @@ namespace Y4NGZUpgrades.Patches
                 : Vector3.zero;
             Vector3 spine003Now = CameraLocalOrZero(cameraTransform, _mantleArmsSpine003);
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide] Mantle render-truth diff: " +
                 $"frame={Time.frameCount}, " +
                 $"camera={camera.name}, " +
@@ -862,7 +902,7 @@ namespace Y4NGZUpgrades.Patches
             HarmonyLib.Patches patches = method != null ? Harmony.GetPatchInfo(method) : null;
             if (patches == null)
             {
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     $"[Panic Slide] Patch owners {declaringType.Name}.{methodName}: none.");
                 return;
             }
@@ -872,7 +912,7 @@ namespace Y4NGZUpgrades.Patches
             AppendPatchList(builder, "postfix", patches.Postfixes);
             AppendPatchList(builder, "transpiler", patches.Transpilers);
             AppendPatchList(builder, "finalizer", patches.Finalizers);
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 $"[Panic Slide] Patch owners {declaringType.Name}.{methodName}: " +
                 (builder.Length > 0 ? builder.ToString() : "none") + ".");
         }
@@ -918,7 +958,7 @@ namespace Y4NGZUpgrades.Patches
             if (cameraRoot != null && cameraRoot != player.transform.root)
                 AppendForeignComponents(cameraRoot, seen, builder, ref count);
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 $"[Panic Slide] Foreign components on player/camera hierarchy ({count}): " +
                 (count > 0 ? builder.ToString() : "none") + ".");
         }
@@ -1203,6 +1243,12 @@ namespace Y4NGZUpgrades.Patches
             _mantleFpArmRenderers = armsRoot != null
                 ? armsRoot.GetComponentsInChildren<Renderer>(true)
                 : Array.Empty<Renderer>();
+            _mantleFpArmRendererSet.Clear();
+            for (int i = 0; i < _mantleFpArmRenderers.Length; i++)
+            {
+                if (_mantleFpArmRenderers[i] != null)
+                    _mantleFpArmRendererSet.Add(_mantleFpArmRenderers[i]);
+            }
         }
 
         // ---- Third-person ledge grab IK -------------------------------------------------------
@@ -1237,7 +1283,7 @@ namespace Y4NGZUpgrades.Patches
             if (!(Plugin.RemoteMantleBodyGrabIk?.Value ?? true))
             {
                 RemoteMantles.Remove(playerClientId);
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-mantle] body_grab_end_gate: " +
                     $"playerClientId={playerClientId} reason='config_disabled'.");
                 return;
@@ -1246,7 +1292,7 @@ namespace Y4NGZUpgrades.Patches
             if (!ReferenceEquals(remote.Player, player) || !SlideAnimationBridge.IsActive(player))
             {
                 RemoteMantles.Remove(playerClientId);
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-mantle] body_grab_end_gate: " +
                     $"playerClientId={playerClientId} reason='" +
                     $"{(!ReferenceEquals(remote.Player, player) ? "player_replaced" : "bridge_inactive")}'.");
@@ -1635,13 +1681,15 @@ namespace Y4NGZUpgrades.Patches
                 return;
 
             ResolveMantleFpArmRenderers(player);
+            ResolveMantleOccluderCandidates(player);
             Camera cam = player.gameplayCamera;
             int mask = cam.cullingMask;
             Vector3 camPos = cam.transform.position;
             float radiusSqr = MANTLE_OCCLUDER_CULL_RADIUS * MANTLE_OCCLUDER_CULL_RADIUS;
 
-            foreach (Renderer renderer in player.GetComponentsInChildren<Renderer>(true))
+            for (int index = 0; index < _mantleOccluderCandidates.Length; index++)
             {
+                Renderer renderer = _mantleOccluderCandidates[index];
                 if (renderer == null || !renderer.enabled || renderer.gameObject == null)
                     continue;
                 int layer = renderer.gameObject.layer;
@@ -1656,7 +1704,7 @@ namespace Y4NGZUpgrades.Patches
                 renderer.forceRenderingOff = true;
                 _mantleTempCulled.Add(renderer);
                 if (_mantleOccluderLogged.Add(renderer.name))
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         $"[Panic Slide] Mantle FP occluder culled: '{renderer.name}' (layer={layer}, dist={Mathf.Sqrt(sqr):F2})");
             }
         }
@@ -1671,10 +1719,18 @@ namespace Y4NGZUpgrades.Patches
 
         private static bool IsMantleFpArmRenderer(Renderer renderer)
         {
-            for (int i = 0; i < _mantleFpArmRenderers.Length; i++)
-                if (ReferenceEquals(_mantleFpArmRenderers[i], renderer))
-                    return true;
-            return false;
+            return renderer != null && _mantleFpArmRendererSet.Contains(renderer);
+        }
+
+        // F-ESCAPE-6: resolved once per mantle alongside ResolveMantleHideTargets; dropped in
+        // RestoreMantleState so the next mantle re-scans a possibly rebuilt player model.
+        private static void ResolveMantleOccluderCandidates(PlayerControllerB player)
+        {
+            if (_mantleOccluderCandidatesResolved || player == null)
+                return;
+
+            _mantleOccluderCandidatesResolved = true;
+            _mantleOccluderCandidates = player.GetComponentsInChildren<Renderer>(true);
         }
 
         private static Transform FindDeep(Transform root, string name)
@@ -1792,7 +1848,7 @@ namespace Y4NGZUpgrades.Patches
                     lines.Add($"'{renderer.name}'(layer={layer}, dist={dist:F2})");
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide] Mantle occluder dump (renderers drawn by gameplay camera within 1.2m): " +
                     (lines.Count == 0 ? "<none>" : string.Join(", ", lines.ToArray())));
             }
@@ -1821,7 +1877,7 @@ namespace Y4NGZUpgrades.Patches
             _cooldownEnd = Time.time + PanicSlideUpgrade.MANTLE_COOLDOWN_SECONDS;
         }
 
-        private static void AbortMantle(string reason)
+        private static void AbortMantle(string reason, bool restorePosition = true)
         {
             if (!_mantleActive)
                 return;
@@ -1829,7 +1885,11 @@ namespace Y4NGZUpgrades.Patches
             PlayerControllerB player = _mantlePlayer;
             if (player != null)
                 SendMantleStop(player.playerClientId);
-            if (player != null && !player.isPlayerDead && _mantleLastSafePosition != Vector3.zero)
+            // F-ESCAPE-2: a mantle that dies on its first Update frame never moved the player, so
+            // the 8% is refunded rather than charged for nothing.
+            if (_mantleStaminaCharged && Time.frameCount <= _mantleStartFrame + 1)
+                RefundStaminaCost(player);
+            if (restorePosition && player != null && !player.isPlayerDead && _mantleLastSafePosition != Vector3.zero)
                 SetPlayerPosition(player, _mantleLastSafePosition);
             if (player != null && _mantleAnimStarted)
             {
@@ -1857,10 +1917,21 @@ namespace Y4NGZUpgrades.Patches
             SetMantleFirstPersonArmsHidden(player, false);
             _mantleFpArmRenderersResolved = false;
             _mantleFpArmRenderers = Array.Empty<Renderer>();
+            _mantleFpArmRendererSet.Clear();
             _mantleFpArmsHidden = false;
             // Un-cull any renderers we force-hid from the first-person lens this mantle.
             RestoreMantleViewOccluders();
+            // F-ESCAPE-6: the per-mantle occluder candidate list is re-scanned next mantle.
+            _mantleOccluderCandidatesResolved = false;
+            _mantleOccluderCandidates = Array.Empty<Renderer>();
             _mantleOccluderLogged.Clear();
+            // F-ESCAPE-14: the arms hand/spine/shoulder caches are re-resolved per mantle for the
+            // same reason as the body and FP arm bones below — the player model can be rebuilt
+            // (respawn), which left the diagnostics reading destroyed transforms.
+            _mantleArmsHandBonesResolved = false;
+            _mantleArmsHandLeft = _mantleArmsHandRight = _mantleArmsSpine003 = null;
+            _mantleArmsShoulderLeft = _mantleArmsShoulderRight = null;
+            _mantleArmsTargetLeft = _mantleArmsTargetRight = null;
             // Body + FP arm bones are re-resolved per mantle (the player model can be rebuilt).
             _mantleBodyArmBonesResolved = false;
             _bodyArmUpperL = _bodyArmLowerL = _bodyHandL = null;
@@ -1874,6 +1945,8 @@ namespace Y4NGZUpgrades.Patches
             UnsubscribeMantleRenderTruth();
 
             _mantleActive = false;
+            _mantleStartFrame = -1;
+            _mantleStaminaCharged = false;
             _mantlePlayer = null;
             _mantleStartPosition = Vector3.zero;
             _mantleLiftPosition = Vector3.zero;
@@ -1934,6 +2007,19 @@ namespace Y4NGZUpgrades.Patches
                 return;
 
             player.sprintMeter = Mathf.Clamp01(player.sprintMeter - PanicSlideUpgrade.MANTLE_STAMINA_COST);
+            if (player.sprintMeterUI != null)
+                player.sprintMeterUI.fillAmount = player.sprintMeter;
+            _mantleStaminaCharged = true;
+        }
+
+        // F-ESCAPE-2: first-frame abort refund (see AbortMantle).
+        private static void RefundStaminaCost(PlayerControllerB player)
+        {
+            _mantleStaminaCharged = false;
+            if (player == null)
+                return;
+
+            player.sprintMeter = Mathf.Clamp01(player.sprintMeter + PanicSlideUpgrade.MANTLE_STAMINA_COST);
             if (player.sprintMeterUI != null)
                 player.sprintMeterUI.fillAmount = player.sprintMeter;
         }
@@ -2106,61 +2192,13 @@ namespace Y4NGZUpgrades.Patches
             return Vector3.Dot(velocity, horizontalForward.normalized) > 0.25f;
         }
 
+        // F-ESCAPE-6: this runs from CanTryMantle on every airborne frame of a tier-2 owner, not
+        // just during a mantle. The old resolver probed four candidate member names by reflection
+        // and boxed a bool through FieldInfo.GetValue each time; of those names only
+        // inVehicleAnimation exists in v81, and it is a public field.
         private static bool IsPlayerInVehicle(PlayerControllerB player)
         {
-            if (player == null)
-                return false;
-
-            ResolveVehicleMembers();
-            try
-            {
-                for (int i = 0; i < _vehicleBoolFields.Length; i++)
-                {
-                    if (_vehicleBoolFields[i].GetValue(player) is bool value && value)
-                        return true;
-                }
-
-                for (int i = 0; i < _vehicleBoolProperties.Length; i++)
-                {
-                    if (_vehicleBoolProperties[i].GetValue(player, null) is bool value && value)
-                        return true;
-                }
-            }
-            catch { }
-
-            return false;
-        }
-
-        private static void ResolveVehicleMembers()
-        {
-            if (_vehicleMembersResolved)
-                return;
-
-            _vehicleMembersResolved = true;
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            string[] names =
-            {
-                "inVehicleAnimation",
-                "isInVehicle",
-                "isInCruiser",
-                "isDrivingVehicle",
-            };
-
-            var fields = new System.Collections.Generic.List<FieldInfo>();
-            var properties = new System.Collections.Generic.List<PropertyInfo>();
-            for (int i = 0; i < names.Length; i++)
-            {
-                FieldInfo field = typeof(PlayerControllerB).GetField(names[i], flags);
-                if (field != null && field.FieldType == typeof(bool))
-                    fields.Add(field);
-
-                PropertyInfo property = typeof(PlayerControllerB).GetProperty(names[i], flags);
-                if (property != null && property.PropertyType == typeof(bool))
-                    properties.Add(property);
-            }
-
-            _vehicleBoolFields = fields.ToArray();
-            _vehicleBoolProperties = properties.ToArray();
+            return player != null && player.inVehicleAnimation;
         }
 
         private static void ResolveFallFields()
@@ -2361,6 +2399,10 @@ namespace Y4NGZUpgrades.Patches
                 byte clipId;
                 reader.ReadValueSafe(out playerClientId);
                 reader.ReadValueSafe(out clipId);
+                // F-ESCAPE-4: only the connection that owns the named player (or the host relay)
+                // may drive that player's mantle presentation on this machine.
+                if (!PanicSlidePatch.IsAcceptedMovementSender(senderClientId, playerClientId, MSG_MANTLE_START))
+                    return;
 
                 float sessionSeconds = 0f;
                 Vector3 ledgeGripCenter = Vector3.zero;
@@ -2405,6 +2447,8 @@ namespace Y4NGZUpgrades.Patches
             {
                 ulong playerClientId;
                 reader.ReadValueSafe(out playerClientId);
+                if (!PanicSlidePatch.IsAcceptedMovementSender(senderClientId, playerClientId, MSG_MANTLE_STOP))
+                    return;
                 ApplyRemoteMantleStop(playerClientId);
                 RelayMantleStopIfHost(senderClientId, playerClientId);
             }
@@ -2471,7 +2515,7 @@ namespace Y4NGZUpgrades.Patches
             PlayerControllerB player = ResolvePlayer(playerClientId);
             if (player == null || IsLocalPlayer(player))
             {
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-mantle] start_gate: " +
                     $"playerClientId={playerClientId} tall={tall} bridgeStarted=False " +
                     $"payload='{(hasExtension ? "extended" : "legacy")}' " +
@@ -2483,19 +2527,33 @@ namespace Y4NGZUpgrades.Patches
             }
             bool bridgeStarted =
                 SlideAnimationBridge.BeginMantle(player, tall, resolvedSessionSeconds);
+            // F-ESCAPE-4: the grip and normal are fed straight into SolveArmBendPreservingBlended,
+            // so they are range-checked before they can be stored. A NaN/infinite vector poisons
+            // the arm rotations permanently, and a grip far from the named player is not a ledge
+            // that player could be holding.
+            bool wallNormalValid = IsFiniteVector(wallNormal)
+                && wallNormal.sqrMagnitude > 0.0001f
+                && wallNormal.sqrMagnitude < REMOTE_MANTLE_MAX_NORMAL_SQR_MAGNITUDE;
+            bool gripPlausible = IsFiniteVector(ledgeGripCenter)
+                && player.transform != null
+                && (ledgeGripCenter - player.transform.position).sqrMagnitude
+                    <= REMOTE_MANTLE_MAX_GRIP_DISTANCE * REMOTE_MANTLE_MAX_GRIP_DISTANCE;
             bool bodyGrabEnabled = bridgeStarted
                 && bodyGrabConfigured
                 && hasExtension
-                && wallNormal.sqrMagnitude > 0.0001f;
+                && wallNormalValid
+                && gripPlausible;
             string bodyGrabReason = !bridgeStarted
                 ? "bridge_start_failed"
                 : !bodyGrabConfigured
                     ? "config_disabled"
                     : !hasExtension
                         ? "legacy_payload"
-                        : wallNormal.sqrMagnitude <= 0.0001f
+                        : !wallNormalValid
                             ? "wall_normal_invalid"
-                            : "ready";
+                            : !gripPlausible
+                                ? "grip_implausible"
+                                : "ready";
 
             RemoteMantles.Remove(playerClientId);
             if (bodyGrabEnabled)
@@ -2507,7 +2565,7 @@ namespace Y4NGZUpgrades.Patches
                     wallNormal.normalized);
             }
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-mantle] start_gate: " +
                 $"playerClientId={playerClientId} tall={tall} bridgeStarted={bridgeStarted} " +
                 $"payload='{(hasExtension ? "extended" : "legacy")}' " +
@@ -2522,7 +2580,7 @@ namespace Y4NGZUpgrades.Patches
             bool removedPresentation = RemoteMantles.Remove(playerClientId);
             if (removedPresentation)
             {
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-mantle] body_grab_end_gate: " +
                     $"playerClientId={playerClientId} reason='stop_received'.");
             }
@@ -2531,7 +2589,7 @@ namespace Y4NGZUpgrades.Patches
             if (bridgeEnded)
                 SlideAnimationBridge.End(player, "remote-mantle-stop");
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-mantle] stop_gate: " +
                 $"playerClientId={playerClientId} bridgeEnded={bridgeEnded} " +
                 $"bodyGrabPresentationRemoved={removedPresentation}.");
@@ -2541,9 +2599,17 @@ namespace Y4NGZUpgrades.Patches
         {
             int cleared = RemoteMantles.Count;
             RemoteMantles.Clear();
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-mantle] body_grab_clear_gate: " +
                 $"cleared={cleared} reason='{reason}'.");
+        }
+
+        // F-ESCAPE-4: NaN/infinity guard for payload-supplied vectors.
+        private static bool IsFiniteVector(Vector3 value)
+        {
+            return !float.IsNaN(value.x) && !float.IsInfinity(value.x)
+                && !float.IsNaN(value.y) && !float.IsInfinity(value.y)
+                && !float.IsNaN(value.z) && !float.IsInfinity(value.z);
         }
 
         private static PlayerControllerB ResolvePlayer(ulong playerClientId)
@@ -2627,7 +2693,7 @@ namespace Y4NGZUpgrades.Patches
                     return;
 
                 _lastBodyGrabGate = result;
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-mantle] body_grab_gate: " +
                     $"playerClientId={Player?.playerClientId.ToString() ?? "<null>"} " +
                     $"result='{result}' weight={weight:0.######}.");

@@ -1,11 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="..\..\y4ngz.local.props" Condition="Exists('..\..\y4ngz.local.props')" />
+
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>Y4NGZUpgrades</AssemblyName>
     <RootNamespace>Y4NGZUpgrades</RootNamespace>
     <Description>Native Y4NGZ progression and upgrade framework spine</Description>
-    <Version>1.0.0</Version>
+    <Version>1.2.0</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -22,7 +24,7 @@
       https://nuget.bepinex.dev/v3/index.json
     </RestoreAdditionalProjectSources>
     <GameManagedDir>C:\Program Files (x86)\Steam\steamapps\common\Lethal Company\Lethal Company_Data\Managed</GameManagedDir>
-    <GaleProfile>C:\Users\Lawson\AppData\Roaming\com.kesomannen.gale\lethal-company\profiles\Current</GaleProfile>
+    <GaleProfile Condition="'$(GaleProfile)' == ''">$(AppData)\com.kesomannen.gale\lethal-company\profiles\Current</GaleProfile>
     <BepInExPlugins>$(GaleProfile)\BepInEx\plugins</BepInExPlugins>
     <!-- Gale names a locally imported package's plugin directory after the package, so a
          re-imported profile holds `Y4NGZUpgrades` while older profiles hold the hand-made
@@ -85,9 +87,13 @@
 
   <Target Name="DeployToGaleProfile" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
     <MakeDir Directories="$(DeployTarget)" />
+    <!-- Ambience playback moved to Y4NGZAtmosphere. Keep the tracked source WAVs in this
+         repository, but remove any stale deployed copy and never copy it back. -->
+    <RemoveDir Directories="$(DeployTarget)\Assets\Ambience" Condition="Exists('$(DeployTarget)\Assets\Ambience')" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployTarget)" />
     <ItemGroup>
-      <InteractiveAssets Include="InteractiveAssets\**\*.*" />
+      <InteractiveAssets Include="InteractiveAssets\**\*.*"
+                         Exclude="InteractiveAssets\Ambience\**\*.*" />
       <!-- Weapon bundles and WeaponAssets moved to runtime-assets-armory\ and ship from
            BetterArmory since #266. A bundle is keyed by file name inside Unity, so shipping a
            second copy from here would be a double-load, not a spare. -->

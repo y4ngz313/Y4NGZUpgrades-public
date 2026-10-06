@@ -432,8 +432,9 @@ namespace Y4NGZUpgrades.Interactive.Patches
 
         [HarmonyPatch(typeof(PlayerControllerB), "KillPlayer")]
         [HarmonyPrefix]
-        private static void CancelPendingOnDeath(PlayerControllerB __instance)
+        private static void CancelPendingOnDeath(PlayerControllerB __instance, bool __runOriginal)
         {
+            if (!__runOriginal) return;
             if (__instance != null && __instance == _pendingPlayer)
                 CancelPendingSequence("death");
         }

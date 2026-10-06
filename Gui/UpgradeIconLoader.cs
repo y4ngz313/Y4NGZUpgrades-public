@@ -26,6 +26,46 @@ internal static class UpgradeIconLoader
     private static readonly Dictionary<string, Sprite> _upgradeIconSprites =
         new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
 
+    private static readonly Dictionary<Texture2D, Rect> _visibleUvRects =
+        new Dictionary<Texture2D, Rect>();
+
+    // Tree cards fit the drawing, not the PNG's transparent canvas. This is a
+    // cached UV window; the shared texture and its HUD/inspector users keep
+    // their authored pixels and framing.
+    internal static Rect VisibleUvRect(Texture2D texture)
+    {
+        if (texture == null) return new Rect(0f, 0f, 1f, 1f);
+        if (_visibleUvRects.TryGetValue(texture, out Rect cached)) return cached;
+
+        int width = texture.width;
+        int height = texture.height;
+        int left = width, bottom = height, right = -1, top = -1;
+        Color32[] pixels = texture.GetPixels32();
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            if (pixels[y * width + x].a <= 16) continue;
+            left = Math.Min(left, x);
+            right = Math.Max(right, x);
+            bottom = Math.Min(bottom, y);
+            top = Math.Max(top, y);
+        }
+
+        Rect uv = new Rect(0f, 0f, 1f, 1f);
+        if (right >= left && top >= bottom)
+        {
+            // Preserve the antialiased edge instead of cropping to hard ink.
+            left = Math.Max(0, left - 2);
+            bottom = Math.Max(0, bottom - 2);
+            right = Math.Min(width - 1, right + 2);
+            top = Math.Min(height - 1, top + 2);
+            uv = new Rect((float)left / width, (float)bottom / height,
+                (float)(right - left + 1) / width, (float)(top - bottom + 1) / height);
+        }
+        _visibleUvRects[texture] = uv;
+        return uv;
+    }
+
     internal static string NormalizeKey(string iconKey)
     {
         return Y4NGZUpgradeDefinition.NormalizeId(iconKey);

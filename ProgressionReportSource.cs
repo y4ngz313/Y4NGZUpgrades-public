@@ -15,7 +15,10 @@ namespace Y4NGZUpgrades
         BodyRetrieval,
         MainframeHack,
         Clutch,
-        Contract
+        Contract,
+        // #459: appended, never reordered - the member names are the report's category identity.
+        ShipBatteryReplaced,
+        ShipApparatusDocked
     }
 
     public sealed class ProgressionReportSource
@@ -27,13 +30,21 @@ namespace Y4NGZUpgrades
         public int Amount { get; }
         public int Order { get; }
 
+        /// <summary>
+        /// Credits the category carried this round, for the sources whose sentence states a haul
+        /// rather than a count (#456: "Found $412 of scrap"). Zero where the sentence has no
+        /// currency to state.
+        /// </summary>
+        public int Value { get; }
+
         public ProgressionReportSource(
             string key,
             ProgressionReportSourceKind kind,
             string subject,
             int count,
             int amount,
-            int order)
+            int order,
+            int value = 0)
         {
             Key = string.IsNullOrWhiteSpace(key) ? kind.ToString() : key.Trim();
             Kind = kind;
@@ -41,6 +52,7 @@ namespace Y4NGZUpgrades
             Count = Math.Max(0, count);
             Amount = Math.Max(0, amount);
             Order = Math.Max(0, order);
+            Value = Math.Max(0, value);
         }
     }
 }

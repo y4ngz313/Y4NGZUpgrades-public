@@ -4,6 +4,19 @@ using Y4NGZUpgrades.Effects;
 
 namespace Y4NGZUpgrades.Patches
 {
+    /// <summary>
+    /// F-ENF-14: despite the generic name, this class is BURNING-ONLY. Its
+    /// <c>HitEnemyOnLocalClient</c> postfix reads <c>force</c> solely to early-out on zero and does
+    /// nothing but apply flamethrower burning. Pumping Iron's melee force bonus and its tier-2
+    /// stagger live in <see cref="ProteinPowderFix"/>, which reaches
+    /// <see cref="EnemyStunRelay.StunEnemy"/>; nothing here touches either.
+    ///
+    /// Worth recording because three separate patch classes now postfix the same
+    /// <c>EnemyAI.HitEnemyOnLocalClient</c> - <see cref="ProteinPowderFix"/>, this one, and
+    /// BetterArmory's ArmoryCombatReticlePatch - with no shared ordering between them. A rename to
+    /// BurningStatusPatch, or one dispatcher with explicit ordering, is the real fix; both are out
+    /// of scope here because the type name is referenced from the BetterArmory side.
+    /// </summary>
     [HarmonyPatch]
     internal static class EnemyStatusEffectPatch
     {

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Y4NGZUpgrades.Upgrades;
 
@@ -6,7 +7,7 @@ namespace Y4NGZUpgrades.Config
     /// <summary>
     /// Human-facing names for the single Gale-visible Y4NGZUpgrades configuration file. Gale
     /// renders BepInEx sections as expandable rows, so the live layout deliberately exposes only
-    /// eight broad groups. Earlier fine-grained section and split-file names remain migration-only.
+    /// nine broad groups. Earlier fine-grained section and split-file names remain migration-only.
     /// </summary>
     internal static class Y4NGZConfigLayout
     {
@@ -17,6 +18,20 @@ namespace Y4NGZUpgrades.Config
         internal const string ProgressionScopeName = "Progression";
         internal const string XpSourcesScopeName = "XP Sources";
         internal const string Lucky8ScopeName = "LUCKY-8";
+
+        /// <summary>
+        /// Every imported Late Game Upgrades row plus the three LGU switches (mode, layout and
+        /// player-menu integration). Their keys keep their names, so a row reads
+        /// <c>[LGU] LGU Beekeeper - General - Enabled</c>, and a later class or tier move of an
+        /// imported row needs no config migration.
+        /// </summary>
+        internal const string LguScopeName = "LGU";
+
+        /// <summary>
+        /// Migration only: the name #442 shipped the LGU group under. #435 renamed the group with
+        /// every key name unchanged; nothing binds here.
+        /// </summary>
+        internal const string LegacyGeneralGroupName = "General";
 
         internal const string LegacyPlayerMenuFileName = "Player Menu.cfg";
         internal const string LegacyProgressionFileName = "Progression.cfg";
@@ -30,12 +45,36 @@ namespace Y4NGZUpgrades.Config
                 "Enforcer",
                 "Foreman",
                 "Ghost",
+                LguScopeName,
                 Lucky8ScopeName,
                 PlayerMenuScopeName,
                 ProgressionScopeName,
                 "Technician",
                 XpSourcesScopeName
             };
+        }
+
+        /// <summary>
+        /// The sections compaction keeps: the live groups plus <see cref="LegacyGeneralGroupName"/>.
+        /// A binding adopts and retires its own [General] copy; the rest stays, because an imported
+        /// row is not bound while Late Game Upgrades is absent or not integrated, and a key the
+        /// player added is theirs.
+        /// </summary>
+        internal static IReadOnlyList<string> CompactionKeptGroupNames()
+        {
+            var names = new List<string>(AllGroupNames());
+            names.Add(LegacyGeneralGroupName);
+            return names;
+        }
+
+        /// <summary>
+        /// The name a live group shipped under before it was renamed, or null. Only LGU was.
+        /// </summary>
+        internal static string RenamedFromGroupName(string groupName)
+        {
+            return string.Equals(groupName, LguScopeName, StringComparison.OrdinalIgnoreCase)
+                ? LegacyGeneralGroupName
+                : null;
         }
 
         internal static string GroupedKey(string prefix, string subsection, string key)
@@ -61,13 +100,21 @@ namespace Y4NGZUpgrades.Config
             return GroupedKey(treeClass.ToString(), displayName, string.Empty);
         }
 
+        /// <summary>The group an upgrade row's settings live in: its class, or LGU for imported rows.</summary>
+        internal static string UpgradeGroupName(UpgradeCatalogTable.Entry entry)
+        {
+            return entry.RequiredProviders == OptionalUpgradeProvider.LateGameUpgrades
+                ? LguScopeName
+                : entry.TreeClass.ToString();
+        }
+
         internal static IReadOnlyList<string> AllUpgradeScopeNames()
         {
             var names = new List<string>(UpgradeCatalogTable.All.Count);
             for (int i = 0; i < UpgradeCatalogTable.All.Count; i++)
             {
                 UpgradeCatalogTable.Entry entry = UpgradeCatalogTable.All[i];
-                names.Add(UpgradeScopeName(entry.TreeClass, entry.DisplayName));
+                names.Add(UpgradeScopeName(entry.TreeClass, entry.ConfigName));
             }
 
             return names;
@@ -92,7 +139,7 @@ namespace Y4NGZUpgrades.Config
             for (int i = 0; i < UpgradeCatalogTable.All.Count; i++)
             {
                 UpgradeCatalogTable.Entry entry = UpgradeCatalogTable.All[i];
-                names.Add(LegacyUpgradeFileName(entry.TreeClass, entry.DisplayName));
+                names.Add(LegacyUpgradeFileName(entry.TreeClass, entry.ConfigName));
             }
 
             return names;

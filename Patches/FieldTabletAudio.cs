@@ -52,6 +52,9 @@ namespace Y4NGZUpgrades.Patches
         private static AudioSource _inputSource;
         private static AudioSource _actionSource;
         private static Transform _anchor;
+        // The mixer source the sources were last routed through; with _anchor it lets the
+        // per-frame BindTo return early once nothing about the binding has changed.
+        private static AudioSource _boundMixerSource;
         private static bool _loadStarted;
         private static bool _equipQueued;
         private static int _lastEquipIndex = -1;
@@ -75,14 +78,28 @@ namespace Y4NGZUpgrades.Patches
 
         /// <summary>
         /// Follows the actual screen surface and borrows the player's item mixer group. Called by
-        /// the screen runtime every frame because the tablet is animated in both hands.
+        /// the screen runtime every frame; once the anchor, mixer source and audio sources are
+        /// unchanged it only retries a queued equip cue. The LateUpdate postfix moves the host
+        /// with the hand-animated tablet through <see cref="FollowBoundAnchor"/>.
         /// </summary>
         internal static void BindTo(Transform anchor, AudioSource mixerSource)
         {
             if (anchor == null)
                 return;
 
+            if (ReferenceEquals(anchor, _anchor)
+                && ReferenceEquals(mixerSource, _boundMixerSource)
+                && _host != null
+                && _inputSource != null
+                && _actionSource != null)
+            {
+                if (_equipQueued)
+                    TryPlayQueuedEquip();
+                return;
+            }
+
             _anchor = anchor;
+            _boundMixerSource = mixerSource;
             EnsureSources();
             FollowAnchor();
 
@@ -141,6 +158,7 @@ namespace Y4NGZUpgrades.Patches
         internal static void Unbind()
         {
             _anchor = null;
+            _boundMixerSource = null;
             _equipQueued = false;
         }
 
@@ -152,6 +170,7 @@ namespace Y4NGZUpgrades.Patches
         internal static void Shutdown()
         {
             _anchor = null;
+            _boundMixerSource = null;
             _equipQueued = false;
             StopSource(_inputSource);
             StopSource(_actionSource);

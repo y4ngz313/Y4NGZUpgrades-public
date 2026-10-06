@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using GameNetcodeStuff;
 using HarmonyLib;
@@ -8,7 +9,6 @@ using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using Y4NGZInteractions.InteractionAnimationApi;
-using Y4NGZUpgrades.HUD;
 using Y4NGZUpgrades.Interactive;
 using Y4NGZUpgrades.Interactive.Hud;
 using Y4NGZUpgrades.Upgrades;
@@ -20,7 +20,7 @@ namespace Y4NGZUpgrades.Patches
     {
         private const string MSG_THROW_SYNC = "WorklightBeacon_Throw";
         private const string MSG_PICKUP_SYNC = "WorklightBeacon_Pickup";
-        private const string HUD_KEY = "worklight_beacon";
+        private const string MSG_STICK_SYNC = "WorklightBeacon_Stick";
         private const string PROMPT_KEY = "worklight_beacon";
         // Baked 30 FPS throw: right-hand camera-depth maximum is frame 8.
         private const float THROW_RELEASE_DELAY = 8f / 30f;
@@ -43,10 +43,13 @@ namespace Y4NGZUpgrades.Patches
         private static float _cooldownTimer;
         private static bool _handlersRegistered;
         private static bool _roundChargeGranted;
+        private static int _grantedMaxCharges;
         private static bool _packRegistered;
         private static bool _missingManifestLogged;
         private static float _nextRegistrationAttemptAt;
         private static uint _nextBeaconId = 1u;
+        // F-FOREMAN-B-20: host-side throw gate, keyed by the connection the message arrived on.
+        private static readonly Dictionary<ulong, float> HostLastThrowAt = new Dictionary<ulong, float>();
 
         // Per-round reset, dispatched by RoundLifecycle.RoundStarted. It used to postfix
         // StartOfRound.StartGame, which never runs on a client (#214).
@@ -55,9 +58,10 @@ namespace Y4NGZUpgrades.Patches
             int maxCharges = WorklightBeaconUpgrade.GetMaxCharges();
             _chargesRemaining = maxCharges;
             _roundChargeGranted = maxCharges > 0;
+            _grantedMaxCharges = maxCharges;
             _cooldownTimer = 0f;
             _nextBeaconId = 1u;
-            UpgradeHUDManager.DestroyHUDElement(HUD_KEY);
+            HostLastThrowAt.Clear();
             EnsurePackRegistered();
         }
 
@@ -66,11 +70,12 @@ namespace Y4NGZUpgrades.Patches
         private static void PostEndOfGame()
         {
             WorklightBeaconProjectile.DestroyAllActive();
-            UpgradeHUDManager.DestroyHUDElement(HUD_KEY);
             Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PROMPT_KEY);
             _chargesRemaining = 0;
             _roundChargeGranted = false;
+            _grantedMaxCharges = 0;
             _cooldownTimer = 0f;
+            HostLastThrowAt.Clear();
         }
 
         [HarmonyPatch(typeof(GameNetworkManager), "Disconnect")]
@@ -83,6 +88,7 @@ namespace Y4NGZUpgrades.Patches
             _packRegistered = false;
             _missingManifestLogged = false;
             _nextRegistrationAttemptAt = 0f;
+            HostLastThrowAt.Clear();
             Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PROMPT_KEY);
         }
 
@@ -240,6 +246,32 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
+        /// <summary>
+        /// F-FOREMAN-B-20: an unmodded or modified client could previously spawn unlimited lights
+        /// on every machine in the lobby. The host drops relays that come faster than the throw
+        /// cooldown, or that would push the sender past the level-3 charge count of live beacons.
+        /// This cannot check upgrade ownership: worklight_beacon is not one of
+        /// UpgradeTierSync.SyncedUpgradeIds, so the host has no authoritative tier for a client.
+        /// </summary>
+        private static bool HostAllowsThrow(ulong senderClientId, ulong throwerNetObjId)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (HostLastThrowAt.TryGetValue(senderClientId, out float lastThrowAt)
+                && now - lastThrowAt < WorklightBeaconUpgrade.COOLDOWN_SECONDS)
+            {
+                return false;
+            }
+
+            if (WorklightBeaconProjectile.CountActiveFor(throwerNetObjId)
+                >= WorklightBeaconUpgrade.MAX_LIVE_BEACONS_PER_THROWER)
+            {
+                return false;
+            }
+
+            HostLastThrowAt[senderClientId] = now;
+            return true;
+        }
+
         private static PlayerControllerB ResolvePlayerByActualClientId(ulong clientId)
         {
             PlayerControllerB[] players = StartOfRound.Instance?.allPlayerScripts;
@@ -284,6 +316,13 @@ namespace Y4NGZUpgrades.Patches
                         return;
 
                     playerNetObjId = sender.NetworkObjectId;
+                    // F-FOREMAN-B-20: worklight_beacon is not in UpgradeTierSync, so the host has
+                    // no synced tier to resolve for the sender - clamp the attacker-supplied tier
+                    // to the real range and bound the damage by rate and by live count instead.
+                    tier = Mathf.Clamp(tier, 1, 3);
+                    if (!HostAllowsThrow(senderClientId, playerNetObjId))
+                        return;
+
                     RelayThrow(
                         senderClientId,
                         playerNetObjId,
@@ -347,15 +386,24 @@ namespace Y4NGZUpgrades.Patches
                     ? player.playerModelArmsMetarig
                     : player.playerBodyAnimator?.transform;
                 Transform hand = FindChildRecursive(searchRoot, "hand.R");
-                direction = isLocal && player.gameplayCamera != null
-                    ? player.gameplayCamera.transform.forward
+
+                // F-FOREMAN-B-2: only the thrower may re-derive the aim. Observers used to fall
+                // back to player.transform.forward - body yaw with the pitch discarded - so a
+                // beacon thrown up a stairwell landed metres away on their screens. Everyone else
+                // uses the transmitted direction verbatim and only moves the *origin* to the hand
+                // they can actually see.
+                if (isLocal && player.gameplayCamera != null)
+                    direction = player.gameplayCamera.transform.forward;
+                Vector3 aim = direction.sqrMagnitude > 0.0001f
+                    ? direction.normalized
                     : player.transform.forward;
+
                 if (hand != null)
-                    position = hand.position + direction.normalized * 0.12f;
+                    position = hand.position + aim * 0.12f;
                 else if (isLocal && player.gameplayCamera != null)
-                    position = player.gameplayCamera.transform.position + direction.normalized * 0.35f;
+                    position = player.gameplayCamera.transform.position + aim * 0.35f;
                 else
-                    position = player.transform.position + Vector3.up * 1.2f + direction.normalized * 0.25f;
+                    position = player.transform.position + Vector3.up * 1.2f + aim * 0.25f;
                 return;
             }
         }
@@ -392,6 +440,7 @@ namespace Y4NGZUpgrades.Patches
             {
                 NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(MSG_THROW_SYNC, OnReceiveThrowEvent);
                 NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(MSG_PICKUP_SYNC, OnReceivePickupEvent);
+                NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(MSG_STICK_SYNC, OnReceiveStickEvent);
                 _handlersRegistered = true;
             }
             catch (System.Exception ex)
@@ -450,18 +499,26 @@ namespace Y4NGZUpgrades.Patches
             if (!WorklightBeaconUpgrade.IsUnlocked())
                 return;
 
-            int max = WorklightBeaconUpgrade.GetMaxCharges();
-            EnsureRoundChargeAvailable(max);
-            if (!RefundChargeFromPickup(max))
+            ulong throwerNetObjId = beacon.ThrowerNetObjId;
+            uint pickedBeaconId = beacon.BeaconId;
+
+            // F-FOREMAN-B-9: the refund goes to the player who spent the charge. Only the
+            // thrower's client increments; a teammate reclaiming someone else's beacon just
+            // clears it from the world, and the thrower gets the charge back when the pickup
+            // notice reaches them. Without this, two owners could farm each other's beacons.
+            if (local != null && local.NetworkObjectId == throwerNetObjId)
             {
-                HUDManager.Instance?.DisplayTip("WORKLIGHT BEACON", "Beacon harness is full.", isWarning: true);
-                return;
+                int max = WorklightBeaconUpgrade.GetMaxCharges();
+                EnsureRoundChargeAvailable(max);
+                if (!RefundChargeFromPickup(max))
+                {
+                    HUDManager.Instance?.DisplayTip("WORKLIGHT BEACON", "Beacon harness is full.", isWarning: true);
+                    return;
+                }
             }
 
             // Destroy locally first: the charge has already been refunded, so a failure inside the
             // send path must not leave the beacon standing on the picker's own machine.
-            ulong throwerNetObjId = beacon.ThrowerNetObjId;
-            uint pickedBeaconId = beacon.BeaconId;
             WorklightBeaconProjectile.DestroySynced(throwerNetObjId, pickedBeaconId);
             BroadcastPickup(throwerNetObjId, pickedBeaconId);
         }
@@ -548,24 +605,179 @@ namespace Y4NGZUpgrades.Patches
                 if (network != null && network.IsServer && senderClientId != network.LocalClientId)
                     RelayPickup(senderClientId, playerNetObjId, beaconId);
 
-                WorklightBeaconProjectile.DestroySynced(playerNetObjId, beaconId);
+                // F-FOREMAN-B-9: the charge belongs to whoever spent it. DestroySynced only reports
+                // true when a live beacon was actually removed here, which is what keeps a
+                // redundant relay (or the thrower's own loopback) from refunding twice.
+                bool removed = WorklightBeaconProjectile.DestroySynced(playerNetObjId, beaconId);
+                PlayerControllerB local = GameNetworkManager.Instance?.localPlayerController;
+                if (removed && local != null && local.NetworkObjectId == playerNetObjId)
+                {
+                    int max = WorklightBeaconUpgrade.GetMaxCharges();
+                    EnsureRoundChargeAvailable(max);
+                    RefundChargeFromPickup(max);
+                }
             }
             catch (System.Exception ex)
             {
                 Plugin.Log?.LogWarning($"[WorklightBeacon] malformed pickup sync: {ex.Message}");
             }
         }
+
+        private const int STICK_PAYLOAD_BYTES = sizeof(ulong) * 2 + sizeof(uint) + sizeof(float) * 6;
+
+        private static void WriteStick(
+            FastBufferWriter writer,
+            ulong playerNetObjId,
+            uint beaconId,
+            Vector3 point,
+            Vector3 normal,
+            ulong parentNetObjId)
+        {
+            writer.WriteValueSafe(playerNetObjId);
+            writer.WriteValueSafe(beaconId);
+            writer.WriteValueSafe(point.x);
+            writer.WriteValueSafe(point.y);
+            writer.WriteValueSafe(point.z);
+            writer.WriteValueSafe(normal.x);
+            writer.WriteValueSafe(normal.y);
+            writer.WriteValueSafe(normal.z);
+            writer.WriteValueSafe(parentNetObjId);
+        }
+
+        /// <summary>
+        /// F-FOREMAN-B-2: each client used to simulate the flight itself and stick on its own first
+        /// collision, so the beacon ended up in a different place on every machine. The thrower's
+        /// simulation is the authority; this fans out the pose it settled on and everyone snaps.
+        /// Same host-relay topology as the throw: host broadcasts, a client sends to the host.
+        /// </summary>
+        internal static void BroadcastStick(ulong playerNetObjId, uint beaconId, Vector3 point, Vector3 normal, ulong parentNetObjId)
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            if (network == null || !network.IsClient) return;
+            CustomMessagingManager messaging = network.CustomMessagingManager;
+            if (messaging == null) return;
+
+            FastBufferWriter writer = new FastBufferWriter(STICK_PAYLOAD_BYTES, Allocator.Temp);
+            try
+            {
+                WriteStick(writer, playerNetObjId, beaconId, point, normal, parentNetObjId);
+                if (network.IsServer)
+                    messaging.SendNamedMessageToAll(MSG_STICK_SYNC, writer);
+                else
+                    messaging.SendNamedMessage(MSG_STICK_SYNC, NetworkManager.ServerClientId, writer);
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[WorklightBeacon] stick send failed: {ex.Message}");
+            }
+            finally
+            {
+                writer.Dispose();
+            }
+        }
+
+        private static void RelayStick(ulong excludeClientId, ulong playerNetObjId, uint beaconId, Vector3 point, Vector3 normal, ulong parentNetObjId)
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            CustomMessagingManager messaging = network?.CustomMessagingManager;
+            if (network == null || messaging == null || !network.IsServer) return;
+
+            foreach (ulong clientId in network.ConnectedClientsIds)
+            {
+                if (clientId == excludeClientId || clientId == network.LocalClientId)
+                    continue;
+
+                FastBufferWriter writer = new FastBufferWriter(STICK_PAYLOAD_BYTES, Allocator.Temp);
+                try
+                {
+                    WriteStick(writer, playerNetObjId, beaconId, point, normal, parentNetObjId);
+                    messaging.SendNamedMessage(MSG_STICK_SYNC, clientId, writer);
+                }
+                catch (System.Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"[WorklightBeacon] stick relay to {clientId} failed: {ex.Message}");
+                }
+                finally
+                {
+                    writer.Dispose();
+                }
+            }
+        }
+
+        private static void OnReceiveStickEvent(ulong senderClientId, FastBufferReader reader)
+        {
+            try
+            {
+                ulong playerNetObjId;
+                uint beaconId;
+                float px, py, pz, nx, ny, nz;
+                ulong parentNetObjId;
+                reader.ReadValueSafe(out playerNetObjId);
+                reader.ReadValueSafe(out beaconId);
+                reader.ReadValueSafe(out px);
+                reader.ReadValueSafe(out py);
+                reader.ReadValueSafe(out pz);
+                reader.ReadValueSafe(out nx);
+                reader.ReadValueSafe(out ny);
+                reader.ReadValueSafe(out nz);
+                reader.ReadValueSafe(out parentNetObjId);
+
+                NetworkManager network = NetworkManager.Singleton;
+                if (network != null && network.IsServer && senderClientId != network.LocalClientId)
+                {
+                    // Only the thrower may move their own beacon: the claimed thrower has to be
+                    // the player behind the connection this arrived on.
+                    PlayerControllerB sender = ResolvePlayerByActualClientId(senderClientId);
+                    if (sender == null || sender.NetworkObjectId != playerNetObjId)
+                        return;
+
+                    RelayStick(
+                        senderClientId,
+                        playerNetObjId,
+                        beaconId,
+                        new Vector3(px, py, pz),
+                        new Vector3(nx, ny, nz),
+                        parentNetObjId);
+                }
+
+                PlayerControllerB local = GameNetworkManager.Instance?.localPlayerController;
+                if (local != null && local.NetworkObjectId == playerNetObjId)
+                    return;
+
+                WorklightBeaconProjectile.ApplyStickFromNetwork(
+                    playerNetObjId,
+                    beaconId,
+                    new Vector3(px, py, pz),
+                    new Vector3(nx, ny, nz),
+                    parentNetObjId);
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[WorklightBeacon] malformed stick sync: {ex.Message}");
+            }
+        }
 #pragma warning restore Harmony003
 
         private static void EnsureRoundChargeAvailable(int maxCharges)
         {
-            if (_roundChargeGranted)
-                return;
             if (maxCharges <= 0)
                 return;
 
-            _chargesRemaining = maxCharges;
-            _roundChargeGranted = true;
+            if (!_roundChargeGranted)
+            {
+                _chargesRemaining = maxCharges;
+                _roundChargeGranted = true;
+                _grantedMaxCharges = maxCharges;
+                return;
+            }
+
+            // F-FOREMAN-B-11: buying a level mid-round raises GetMaxCharges(), so hand over the
+            // difference; the prompt used to sit at 3/5 until the player reclaimed a beacon.
+            if (maxCharges > _grantedMaxCharges)
+            {
+                _chargesRemaining = Mathf.Min(maxCharges, _chargesRemaining + (maxCharges - _grantedMaxCharges));
+                _grantedMaxCharges = maxCharges;
+            }
         }
 
         private static void TriggerRemoteThrowAnimation(ulong playerNetObjId)

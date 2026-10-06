@@ -5,8 +5,6 @@ using HarmonyLib;
 using Unity.Collections;
 using Unity.Netcode;
 using UnityEngine;
-using UnityEngine.InputSystem;
-using Y4NGZUpgrades.HUD;
 using Y4NGZUpgrades.Upgrades;
 
 namespace Y4NGZUpgrades.Patches
@@ -14,33 +12,31 @@ namespace Y4NGZUpgrades.Patches
     [HarmonyPatch]
     internal static class ForemanSupportPatch
     {
-        private const string MSG_SUPPORT_STATE = "ForemanSupport_State";
+        // F-FOREMAN-A-6: the name is bumped alongside the payload shrink (the dead Rally Call
+        // tier/expiry fields are gone). An old build cannot mis-parse the shorter record
+        // because it never registers a handler for this name.
+        private const string MSG_SUPPORT_STATE = "ForemanSupport_State2";
         private const float STATE_BROADCAST_INTERVAL = 0.75f;
         private const float STATE_EXPIRY_SECONDS = 2.5f;
-        private const string RALLY_HUD_KEY = "rally_call";
-        private const int RALLY_HUD_STACK_POSITION = 4;
 
         private sealed class SupportState
         {
             internal int BuddyTier;
-            internal int RallyTier;
-            internal float RallyExpiresAt;
             internal float ExpiresAt;
             internal Vector3 Position;
         }
 
-        private sealed class AppliedSupportBonus
-        {
-            internal float MovementSpeedBonus;
-        }
+        // Review pass: the aura is registered with the single owner of movementSpeed rather than
+        // written into the field here (see ApplySpeedBuff). The id only has to be stable.
+        private const string SPEED_MULTIPLIER_SOURCE = "y4ngz.foreman.buddy-aura";
 
         private static readonly Dictionary<int, SupportState> SupportStates = new Dictionary<int, SupportState>();
-        private static readonly Dictionary<int, AppliedSupportBonus> AppliedBonuses = new Dictionary<int, AppliedSupportBonus>();
+
+        // F-FOREMAN-A-11: leftover sub-1HP mitigation, per player id, carried into the next hit.
+        private static readonly Dictionary<int, float> MitigationCarry = new Dictionary<int, float>();
 
         private static bool _handlersRegistered;
         private static float _nextStateBroadcastTime;
-        private static float _localRallyExpiresAt;
-        private static float _localRallyCooldownEnd;
 
         [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
         [HarmonyPostfix]
@@ -60,7 +56,8 @@ namespace Y4NGZUpgrades.Patches
         {
             _handlersRegistered = false;
             SupportStates.Clear();
-            AppliedBonuses.Clear();
+            UnwindAppliedSpeedBonuses();
+            MitigationCarry.Clear();
         }
 
         // Per-round reset, dispatched by RoundLifecycle.RoundStarted. It used to postfix
@@ -68,10 +65,9 @@ namespace Y4NGZUpgrades.Patches
         internal static void OnRoundStarted()
         {
             SupportStates.Clear();
-            AppliedBonuses.Clear();
+            UnwindAppliedSpeedBonuses();
+            MitigationCarry.Clear();
             _nextStateBroadcastTime = 0f;
-            _localRallyExpiresAt = 0f;
-            _localRallyCooldownEnd = 0f;
         }
 
         [HarmonyPatch(typeof(StartOfRound), "EndOfGame")]
@@ -79,9 +75,20 @@ namespace Y4NGZUpgrades.Patches
         private static void PostEndOfGame()
         {
             SupportStates.Clear();
-            AppliedBonuses.Clear();
-            UpgradeHUDManager.DestroyHUDElement(RALLY_HUD_KEY);
-            ForemanAuraStatusHud.Destroy();
+            UnwindAppliedSpeedBonuses();
+            MitigationCarry.Clear();
+        }
+
+        /// <summary>
+        /// F-FOREMAN-A-1: the aura must not survive the lifecycle boundary the crew crosses while
+        /// standing together in the ship, or it compounds into the next landing. Deregistering the
+        /// multiplier is the whole unwind now that <see cref="MergedUpgradePatches"/> owns the
+        /// field (see <see cref="ApplySpeedBuff"/>); it recomputes from its own snapshot base on
+        /// the next LateUpdate, so nothing stays baked into movementSpeed.
+        /// </summary>
+        private static void UnwindAppliedSpeedBonuses()
+        {
+            MergedUpgradePatches.ClearSpeedMultiplier(SPEED_MULTIPLIER_SOURCE);
         }
 
         [HarmonyPatch(typeof(PlayerControllerB), "Update")]
@@ -92,70 +99,9 @@ namespace Y4NGZUpgrades.Patches
                 return;
 
             RegisterNetworkHandlers();
-            PollRallyKey(__instance);
-            UpdateRallyHUD(__instance);
             BroadcastLocalStateIfNeeded(__instance, force: false);
         }
 
-        private static void UpdateRallyHUD(PlayerControllerB player)
-        {
-            if (!RallyCallUpgrade.IsUnlocked())
-            {
-                GameObject go = UpgradeHUDManager.GetHUDElement(RALLY_HUD_KEY);
-                if (go != null) go.SetActive(false);
-                return;
-            }
-
-            bool gated = player == null
-                || player.isPlayerDead
-                || player.isTypingChat
-                || player.inTerminalMenu
-                || (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen);
-            if (gated)
-            {
-                GameObject go = UpgradeHUDManager.GetHUDElement(RALLY_HUD_KEY);
-                if (go != null) go.SetActive(false);
-                return;
-            }
-
-            EnsureRallyHUD();
-            GameObject element = UpgradeHUDManager.GetHUDElement(RALLY_HUD_KEY);
-            if (element == null)
-                return;
-
-            element.SetActive(true);
-            UpgradeHUDManager.SetHUDElementLabel(RALLY_HUD_KEY, $"RALLY [{Gui.UpgradeInput.DisplayLabel(Gui.Plugin.Keybinds?.RallyCall, "R")}]");
-
-            if (Time.time < _localRallyCooldownEnd)
-            {
-                float total = RallyCallUpgrade.DURATION_SECONDS + RallyCallUpgrade.COOLDOWN_SECONDS;
-                UpgradeHUDManager.SetCooldownActive(RALLY_HUD_KEY, true);
-                UpgradeHUDManager.UpdateFillBar(RALLY_HUD_KEY, (_localRallyCooldownEnd - Time.time) / Mathf.Max(0.01f, total));
-            }
-            else
-            {
-                UpgradeHUDManager.SetCooldownActive(RALLY_HUD_KEY, false);
-            }
-        }
-
-        private static void EnsureRallyHUD()
-        {
-            if (UpgradeHUDManager.GetHUDElement(RALLY_HUD_KEY) != null)
-                return;
-            if (HUDManager.Instance == null || HUDManager.Instance.playerScreenTexture == null)
-                return;
-
-            Canvas canvas = HUDManager.Instance.playerScreenTexture.canvas;
-            if (canvas == null)
-                return;
-
-            UpgradeHUDManager.CreateIconKeyHUDElement(
-                RALLY_HUD_KEY,
-                "rally_call",
-                $"RALLY [{Gui.UpgradeInput.DisplayLabel(Gui.Plugin.Keybinds?.RallyCall, "R")}]",
-                RALLY_HUD_STACK_POSITION,
-                canvas.transform);
-        }
 
         [HarmonyPatch(typeof(PlayerControllerB), "LateUpdate")]
         [HarmonyPostfix]
@@ -174,57 +120,29 @@ namespace Y4NGZUpgrades.Patches
             if (!IsLocalPlayer(__instance) || damageNumber <= 0)
                 return;
 
-            float reduction = Mathf.Max(
+            // The reductions deliberately do NOT stack - the largest one applies (documented in
+            // the Buddy System / Ping catalog text, F-FOREMAN-A-15).
+            float reduction = Mathf.Clamp01(Mathf.Max(
                 GetSupportDamageReduction(__instance),
                 ForemanPingPatch.GetMarkedTeammateDamageReduction(__instance),
-                ForemanPingPatch.GetRecentMarkedEnemyDamageReduction());
+                ForemanPingPatch.GetRecentMarkedEnemyDamageReduction()));
 
             if (reduction <= 0f)
                 return;
 
-            damageNumber = Mathf.Max(0, Mathf.RoundToInt(damageNumber * (1f - Mathf.Clamp01(reduction))));
-        }
+            // F-FOREMAN-A-11: RoundToInt erased the whole tier-1 3% cut (20 -> 19.4 -> 19 was the
+            // only vanilla hit size that moved at all). Mitigate in fractions of a point and carry
+            // the remainder to the next hit, so a small percentage pays out exactly over time.
+            int playerId = (int)__instance.playerClientId;
+            MitigationCarry.TryGetValue(playerId, out float carry);
 
-        private static void PollRallyKey(PlayerControllerB player)
-        {
-            if (!RallyCallUpgrade.IsUnlocked())
-                return;
-            if (!Gui.UpgradeInput.WasPressed(Gui.Plugin.Keybinds?.RallyCall))
-                return;
+            float mitigation = damageNumber * reduction + carry;
+            int whole = Mathf.FloorToInt(mitigation);
+            if (whole > damageNumber)
+                whole = damageNumber;
 
-            TryActivateRally(player);
-        }
-
-        private static void TryActivateRally(PlayerControllerB player)
-        {
-            if (!RallyCallUpgrade.IsUnlocked())
-                return;
-            if (!CanUseActiveAbility(player))
-                return;
-
-            if (Time.time < _localRallyCooldownEnd)
-            {
-                HUDManager.Instance?.DisplayTip("RALLY CALL", $"Cooldown: {_localRallyCooldownEnd - Time.time:F0}s", isWarning: true);
-                return;
-            }
-
-            int tier = RallyCallUpgrade.GetTier();
-            _localRallyExpiresAt = Time.time + RallyCallUpgrade.DURATION_SECONDS;
-            _localRallyCooldownEnd = _localRallyExpiresAt + RallyCallUpgrade.COOLDOWN_SECONDS;
-            UpdateLocalSupportState(player);
-            BroadcastLocalStateIfNeeded(player, force: true);
-            BreakGhostGirlHaunting();
-            Plugin.Log?.LogInfo($"[Rally Call] Activated tier {tier}.");
-        }
-
-        private static bool CanUseActiveAbility(PlayerControllerB player)
-        {
-            return player != null
-                && !player.isPlayerDead
-                && !player.isTypingChat
-                && !player.inTerminalMenu
-                && !player.inSpecialInteractAnimation
-                && (player.quickMenuManager == null || !player.quickMenuManager.isMenuOpen);
+            MitigationCarry[playerId] = Mathf.Clamp(mitigation - whole, 0f, 1f);
+            damageNumber = Mathf.Max(0, damageNumber - whole);
         }
 
         private static void BroadcastLocalStateIfNeeded(PlayerControllerB player, bool force)
@@ -237,12 +155,11 @@ namespace Y4NGZUpgrades.Patches
                 return;
 
             int buddyTier = GetLocalBuddyTier(player);
-            int rallyTier = Time.time < _localRallyExpiresAt ? RallyCallUpgrade.GetTier() : 0;
-            if (buddyTier <= 0 && rallyTier <= 0)
+            if (buddyTier <= 0)
                 return;
 
             _nextStateBroadcastTime = Time.time + STATE_BROADCAST_INTERVAL;
-            BroadcastSupportState((int)player.playerClientId, buddyTier, rallyTier, _localRallyExpiresAt, player.transform.position);
+            BroadcastSupportState((int)player.playerClientId, buddyTier, player.transform.position);
         }
 
         private static void UpdateLocalSupportState(PlayerControllerB player)
@@ -253,8 +170,6 @@ namespace Y4NGZUpgrades.Patches
             int playerId = (int)player.playerClientId;
             SupportState state = GetState(playerId);
             state.BuddyTier = GetLocalBuddyTier(player);
-            state.RallyTier = Time.time < _localRallyExpiresAt ? RallyCallUpgrade.GetTier() : 0;
-            state.RallyExpiresAt = _localRallyExpiresAt;
             state.ExpiresAt = Time.time + STATE_EXPIRY_SECONDS;
             state.Position = player.transform.position;
         }
@@ -272,7 +187,6 @@ namespace Y4NGZUpgrades.Patches
         private static float GetSupportSpeedBonus(PlayerControllerB localPlayer)
         {
             float bestBuddy = 0f;
-            float bestRally = 0f;
             int localId = (int)localPlayer.playerClientId;
 
             foreach (KeyValuePair<int, SupportState> pair in SupportStates)
@@ -281,28 +195,20 @@ namespace Y4NGZUpgrades.Patches
                 if (!IsStateFresh(state))
                     continue;
 
+                if (pair.Key == localId || state.BuddyTier <= 0 || !CanUseProviderStateForBuddy(pair.Key))
+                    continue;
+
                 Vector3 providerPosition = ResolveProviderPosition(pair.Key, state);
-                float distance = Vector3.Distance(localPlayer.transform.position, providerPosition);
-
-                if (pair.Key != localId
-                    && state.BuddyTier > 0
-                    && CanUseProviderStateForBuddy(pair.Key)
-                    && distance <= BuddySystemUpgrade.GetRange(state.BuddyTier))
-                {
+                if (Vector3.Distance(localPlayer.transform.position, providerPosition) <= BuddySystemUpgrade.GetRange(state.BuddyTier))
                     bestBuddy = Mathf.Max(bestBuddy, BuddySystemUpgrade.GetBuff(state.BuddyTier));
-                }
-
-                if (state.RallyTier > 0 && Time.time < state.RallyExpiresAt && distance <= RallyCallUpgrade.RANGE)
-                    bestRally = Mathf.Max(bestRally, RallyCallUpgrade.GetSpeedBonus(state.RallyTier));
             }
 
-            return bestBuddy + bestRally;
+            return bestBuddy;
         }
 
         private static float GetSupportDamageReduction(PlayerControllerB localPlayer)
         {
             float bestBuddy = 0f;
-            float bestRally = 0f;
             int localId = (int)localPlayer.playerClientId;
 
             foreach (KeyValuePair<int, SupportState> pair in SupportStates)
@@ -311,72 +217,56 @@ namespace Y4NGZUpgrades.Patches
                 if (!IsStateFresh(state))
                     continue;
 
+                if (pair.Key == localId || state.BuddyTier <= 0 || !CanUseProviderStateForBuddy(pair.Key))
+                    continue;
+
                 Vector3 providerPosition = ResolveProviderPosition(pair.Key, state);
-                float distance = Vector3.Distance(localPlayer.transform.position, providerPosition);
-
-                if (pair.Key != localId
-                    && state.BuddyTier > 0
-                    && CanUseProviderStateForBuddy(pair.Key)
-                    && distance <= BuddySystemUpgrade.GetRange(state.BuddyTier))
-                {
+                if (Vector3.Distance(localPlayer.transform.position, providerPosition) <= BuddySystemUpgrade.GetRange(state.BuddyTier))
                     bestBuddy = Mathf.Max(bestBuddy, BuddySystemUpgrade.GetBuff(state.BuddyTier));
-                }
-
-                if (state.RallyTier > 0 && Time.time < state.RallyExpiresAt && distance <= RallyCallUpgrade.RANGE)
-                    bestRally = Mathf.Max(bestRally, RallyCallUpgrade.GetDamageReduction(state.RallyTier));
             }
 
-            return Mathf.Clamp01(bestBuddy + bestRally);
+            return Mathf.Clamp01(bestBuddy);
         }
 
-        private static void ApplySpeedBuff(PlayerControllerB player)
+        /// <summary>
+        /// Read-only inspector query for the support auras currently applying to one player.
+        /// This follows the same fresh-state, provider-validity, and range gates as the actual
+        /// speed and damage effects; it never creates or refreshes network state.
+        /// </summary>
+        internal static int GetActiveBuddyAuraProviderCount(PlayerControllerB localPlayer)
         {
-            AppliedSupportBonus applied = GetAppliedBonus(player);
-            float baseSpeed = player.movementSpeed - applied.MovementSpeedBonus;
-            float speedBonus = GetSupportSpeedBonus(player);
-            float nextBonus = Mathf.Max(0f, baseSpeed) * speedBonus;
-            player.movementSpeed = Mathf.Max(0.1f, baseSpeed + nextBonus);
-            applied.MovementSpeedBonus = nextBonus;
-            ForemanAuraStatusHud.SetAuraActive(IsReceivingBuddyAura(player));
-        }
+            if (localPlayer == null)
+                return 0;
 
-        private static bool IsReceivingBuddyAura(PlayerControllerB localPlayer)
-        {
-            if (localPlayer == null || localPlayer.isPlayerDead)
-                return false;
-
+            int count = 0;
             int localId = (int)localPlayer.playerClientId;
-            Vector3 localPosition = localPlayer.transform.position;
-
             foreach (KeyValuePair<int, SupportState> pair in SupportStates)
             {
-                if (pair.Key == localId)
-                    continue;
-
                 SupportState state = pair.Value;
-                if (!IsStateFresh(state) || state.BuddyTier <= 0)
+                if (!IsStateFresh(state) || pair.Key == localId || state.BuddyTier <= 0 ||
+                    !CanUseProviderStateForBuddy(pair.Key))
+                {
                     continue;
-                if (!CanUseProviderStateForBuddy(pair.Key))
-                    continue;
+                }
 
                 Vector3 providerPosition = ResolveProviderPosition(pair.Key, state);
-                if (Vector3.Distance(localPosition, providerPosition) <= BuddySystemUpgrade.GetRange(state.BuddyTier))
-                    return true;
+                if (Vector3.Distance(localPlayer.transform.position, providerPosition) <=
+                    BuddySystemUpgrade.GetRange(state.BuddyTier))
+                {
+                    count++;
+                }
             }
 
-            return false;
+            return count;
         }
 
-        private static AppliedSupportBonus GetAppliedBonus(PlayerControllerB player)
+        /// <summary>Registers the aura with the sole owner of movementSpeed.</summary>
+        private static void ApplySpeedBuff(PlayerControllerB player)
         {
-            int key = player.GetInstanceID();
-            if (!AppliedBonuses.TryGetValue(key, out AppliedSupportBonus bonus))
-            {
-                bonus = new AppliedSupportBonus();
-                AppliedBonuses[key] = bonus;
-            }
-
-            return bonus;
+            // SetSpeedMultiplier drops the source when the value is <= 1, so a lapsed aura needs no
+            // separate clear here.
+            MergedUpgradePatches.SetSpeedMultiplier(
+                SPEED_MULTIPLIER_SOURCE, 1f + GetSupportSpeedBonus(player));
         }
 
         private static SupportState GetState(int playerId)
@@ -437,33 +327,6 @@ namespace Y4NGZUpgrades.Patches
             return player == local || (local == null && player.IsOwner && player.isPlayerControlled);
         }
 
-        private static void BreakGhostGirlHaunting()
-        {
-            DressGirlAI[] girls = UnityEngine.Object.FindObjectsOfType<DressGirlAI>();
-            for (int i = 0; i < girls.Length; i++)
-            {
-                DressGirlAI girl = girls[i];
-                if (girl == null || girl.isEnemyDead || girl.hauntingPlayer == null)
-                    continue;
-
-                try
-                {
-                    girl.staringInHaunt = false;
-                    girl.disappearingFromStare = true;
-                    girl.moveTowardsDestination = false;
-                    girl.targetPlayer = null;
-                    girl.SwitchToBehaviourStateOnLocalClient(0);
-                    girl.EnableEnemyMesh(enable: false, overrideDoNotSet: true, tamperWithMeshes: true);
-                    if (girl.creatureVoice != null) girl.creatureVoice.Stop();
-                    if (girl.creatureSFX != null) girl.creatureSFX.Stop();
-                }
-                catch (Exception ex)
-                {
-                    Plugin.Log?.LogWarning($"[Rally Call] Failed to break Ghost Girl haunting: {ex.Message}");
-                }
-            }
-        }
-
         private static void RegisterNetworkHandlers()
         {
             if (_handlersRegistered) return;
@@ -481,15 +344,12 @@ namespace Y4NGZUpgrades.Patches
         }
 
 #pragma warning disable Harmony003
-        private const int SUPPORT_STATE_BYTES = sizeof(int) * 3 + sizeof(float) * 4;
+        private const int SUPPORT_STATE_BYTES = sizeof(int) * 2 + sizeof(float) * 3;
 
-        private static void WriteSupportState(
-            FastBufferWriter writer, int playerId, int buddyTier, int rallyTier, float rallyExpiresAt, Vector3 position)
+        private static void WriteSupportState(FastBufferWriter writer, int playerId, int buddyTier, Vector3 position)
         {
             writer.WriteValueSafe(playerId);
             writer.WriteValueSafe(buddyTier);
-            writer.WriteValueSafe(rallyTier);
-            writer.WriteValueSafe(rallyExpiresAt);
             writer.WriteValueSafe(position.x);
             writer.WriteValueSafe(position.y);
             writer.WriteValueSafe(position.z);
@@ -501,7 +361,7 @@ namespace Y4NGZUpgrades.Patches
         /// relays. This runs every 0.75s from a PlayerControllerB.Update postfix, so an escaping
         /// exception would break the whole patch chain - hence the catch.
         /// </summary>
-        private static void BroadcastSupportState(int playerId, int buddyTier, int rallyTier, float rallyExpiresAt, Vector3 position)
+        private static void BroadcastSupportState(int playerId, int buddyTier, Vector3 position)
         {
             NetworkManager network = NetworkManager.Singleton;
             if (network == null || !network.IsClient) return;
@@ -511,7 +371,7 @@ namespace Y4NGZUpgrades.Patches
             FastBufferWriter writer = new FastBufferWriter(SUPPORT_STATE_BYTES, Allocator.Temp);
             try
             {
-                WriteSupportState(writer, playerId, buddyTier, rallyTier, rallyExpiresAt, position);
+                WriteSupportState(writer, playerId, buddyTier, position);
                 if (network.IsServer)
                     messaging.SendNamedMessageToAll(MSG_SUPPORT_STATE, writer);
                 else
@@ -528,8 +388,7 @@ namespace Y4NGZUpgrades.Patches
         }
 
         /// <summary>Host-only re-broadcast of one client's state to every other client.</summary>
-        private static void RelaySupportState(
-            ulong excludeClientId, int playerId, int buddyTier, int rallyTier, float rallyExpiresAt, Vector3 position)
+        private static void RelaySupportState(ulong excludeClientId, int playerId, int buddyTier, Vector3 position)
         {
             NetworkManager network = NetworkManager.Singleton;
             CustomMessagingManager messaging = network?.CustomMessagingManager;
@@ -543,7 +402,7 @@ namespace Y4NGZUpgrades.Patches
                 FastBufferWriter writer = new FastBufferWriter(SUPPORT_STATE_BYTES, Allocator.Temp);
                 try
                 {
-                    WriteSupportState(writer, playerId, buddyTier, rallyTier, rallyExpiresAt, position);
+                    WriteSupportState(writer, playerId, buddyTier, position);
                     messaging.SendNamedMessage(MSG_SUPPORT_STATE, clientId, writer);
                 }
                 catch (Exception ex)
@@ -578,13 +437,9 @@ namespace Y4NGZUpgrades.Patches
             {
                 int playerId;
                 int buddyTier;
-                int rallyTier;
-                float rallyExpiresAt;
                 float x, y, z;
                 reader.ReadValueSafe(out playerId);
                 reader.ReadValueSafe(out buddyTier);
-                reader.ReadValueSafe(out rallyTier);
-                reader.ReadValueSafe(out rallyExpiresAt);
                 reader.ReadValueSafe(out x);
                 reader.ReadValueSafe(out y);
                 reader.ReadValueSafe(out z);
@@ -605,13 +460,11 @@ namespace Y4NGZUpgrades.Patches
 
                 SupportState state = GetState(playerId);
                 state.BuddyTier = buddyTier;
-                state.RallyTier = rallyTier;
-                state.RallyExpiresAt = rallyExpiresAt;
                 state.ExpiresAt = Time.time + STATE_EXPIRY_SECONDS;
                 state.Position = new Vector3(x, y, z);
 
                 if (relaying)
-                    RelaySupportState(senderClientId, playerId, buddyTier, rallyTier, rallyExpiresAt, new Vector3(x, y, z));
+                    RelaySupportState(senderClientId, playerId, buddyTier, new Vector3(x, y, z));
             }
             catch (Exception ex)
             {

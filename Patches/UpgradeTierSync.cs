@@ -20,9 +20,13 @@ namespace Y4NGZUpgrades.Patches
         private const string MSG_SET_CLIENT = "Y4NGZUpgradeTier.SetClientRpc";
         private const string MSG_REQUEST_ALL_SERVER = "Y4NGZUpgradeTier.RequestAllServerRpc";
         private const string MSG_SYNC_ALL_CLIENT = "Y4NGZUpgradeTier.SyncAllClientRpc";
-        private const byte MaxSyncedTier = 3;
+        // Raised from 3 when Sprinter sold five levels. Only a validation bound, kept so a host
+        // still relays every value an older peer publishes. Indices 10 and 11 are 0/1
+        // capabilities and sit well inside it.
+        private const byte MaxSyncedTier = 5;
 
-        // Wire format uses the array index instead of the id string; append only.
+        // Wire format uses the array index instead of the id string; append only. Never reorder:
+        // an older peer reads index 2 as Veteran whatever this build calls it.
         private static readonly string[] SyncedUpgradeIds =
         {
             ChameleonUpgrade.UPGRADE_ID,
@@ -31,7 +35,36 @@ namespace Y4NGZUpgrades.Patches
             TurretHackerUpgrade.UPGRADE_ID,
             FieldOperationsUpgrade.UPGRADE_ID,
             NativeFistsUpgrade.UPGRADE_ID,
+            // Appended: every one of these is consumed by a host-resolved effect, so the host has
+            // to know a client's tier (F-INFRA-4, F-GHOST-1).
+            LightFeetUpgrade.UPGRADE_ID,
+            // Retired slot (#435), see RetiredSprinterRankIndex: kept so index 8 onward keep their
+            // wire positions, but this build neither publishes nor reads it.
+            SprinterUpgrade.UPGRADE_ID,
+            DeathboundUpgrade.UPGRADE_ID,
+            InspireUpgrade.UPGRADE_ID,
+            // #435: a CAPABILITY, not a rank. The host can no longer authorise a turret hack from
+            // the synced Field Mechanic rank, because full rank 2 must be refused while unique
+            // rank 2 must be accepted, and neither peer may read the other's preference. Index 9
+            // and below keep their existing meanings; an older peer simply never sends this one,
+            // and an absent entry reads 0, which is "not authorised".
+            TurretHackerUpgrade.TURRET_HACK_CAPABILITY_ID,
+            // #435: Sprinter rank 3's quiet footsteps, which the host applies to every remote
+            // footstep. The same capability rule as index 10: an older peer never sends it and
+            // reads 0, so a mixed lobby can only under-reduce, never grant the reduction to an
+            // old-ladder rank.
+            SprinterUpgrade.QUIET_FOOTSTEPS_CAPABILITY_ID,
+            CourierDroneUpgrade.UPGRADE_ID,
         };
+
+        /// <summary>
+        /// Index 7 carried the Sprinter rank on the old five-rank ladder, where the footstep
+        /// reduction was rank 4. The fresh three-rank ladder moves it to rank 3, and a bare rank
+        /// cannot say which ladder a peer is on, so the consumer reads index 11 instead. Publishing
+        /// the new rank here would be state nobody on this build reads, and an older host would
+        /// mistake it for its own ladder.
+        /// </summary>
+        private const int RetiredSprinterRankIndex = 7;
 
         // (clientId, syncedIndex) -> tier
         private static readonly Dictionary<(ulong, int), byte> tiersByClient = new Dictionary<(ulong, int), byte>();
@@ -113,7 +146,10 @@ namespace Y4NGZUpgrades.Patches
                     return;
 
                 for (int i = 0; i < SyncedUpgradeIds.Length; i++)
-                    SendTier(local.actualClientId, i, (byte)GetLocalTier(i));
+                {
+                    if (i != RetiredSprinterRankIndex)
+                        SendTier(local.actualClientId, i, (byte)GetLocalTier(i));
+                }
             }
             catch (Exception e)
             {
@@ -127,7 +163,7 @@ namespace Y4NGZUpgrades.Patches
             if (networkManager == null || networkManager.CustomMessagingManager == null || networkManager.IsServer)
                 return;
 
-            var writer = new FastBufferWriter(1, Allocator.Temp);
+            using var writer = new FastBufferWriter(1, Allocator.Temp);
             networkManager.CustomMessagingManager.SendNamedMessage(
                 MSG_REQUEST_ALL_SERVER, 0uL, writer, NetworkDelivery.ReliableFragmentedSequenced);
         }
@@ -175,6 +211,14 @@ namespace Y4NGZUpgrades.Patches
                 case TurretHackerUpgrade.UPGRADE_ID: return TurretHackerUpgrade.GetTier();
                 case FieldOperationsUpgrade.UPGRADE_ID: return FieldOperationsUpgrade.GetTier();
                 case NativeFistsUpgrade.UPGRADE_ID: return NativeFistsUpgrade.GetTier();
+                case LightFeetUpgrade.UPGRADE_ID: return LightFeetUpgrade.GetTier();
+                case TurretHackerUpgrade.TURRET_HACK_CAPABILITY_ID:
+                    return TurretHackerUpgrade.CanHackTurrets() ? 1 : 0;
+                case SprinterUpgrade.QUIET_FOOTSTEPS_CAPABILITY_ID:
+                    return SprinterUpgrade.HasQuietFootsteps() ? 1 : 0;
+                case DeathboundUpgrade.UPGRADE_ID: return DeathboundUpgrade.GetTier();
+                case InspireUpgrade.UPGRADE_ID: return InspireUpgrade.GetTier();
+                case CourierDroneUpgrade.UPGRADE_ID: return CourierDroneUpgrade.GetTier();
                 default: return 0;
             }
         }
@@ -190,7 +234,7 @@ namespace Y4NGZUpgrades.Patches
             else
             {
                 // clientId(8) + index(1) + tier(1)
-                var writer = new FastBufferWriter(10, Allocator.Temp);
+                using var writer = new FastBufferWriter(10, Allocator.Temp);
                 writer.WriteValueSafe(clientId);
                 writer.WriteValueSafe((byte)index);
                 writer.WriteValueSafe(tier);
@@ -201,7 +245,7 @@ namespace Y4NGZUpgrades.Patches
 
         private static void SendSetToAllClients(ulong clientId, int index, byte tier)
         {
-            var writer = new FastBufferWriter(10, Allocator.Temp);
+            using var writer = new FastBufferWriter(10, Allocator.Temp);
             writer.WriteValueSafe(clientId);
             writer.WriteValueSafe((byte)index);
             writer.WriteValueSafe(tier);
@@ -262,7 +306,7 @@ namespace Y4NGZUpgrades.Patches
             {
                 int count = tiersByClient.Count;
                 // count(2) + per entry: clientId(8) + index(1) + tier(1)
-                var writer = new FastBufferWriter(2 + count * 10, Allocator.Temp);
+                using var writer = new FastBufferWriter(2 + count * 10, Allocator.Temp);
                 writer.WriteValueSafe((short)count);
                 foreach (KeyValuePair<(ulong, int), byte> kvp in tiersByClient)
                 {

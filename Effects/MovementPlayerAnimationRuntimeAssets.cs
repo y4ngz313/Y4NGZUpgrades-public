@@ -74,6 +74,22 @@ namespace Y4NGZUpgrades.Effects
             ResolveController();
         }
 
+        /// <summary>
+        /// F-ESCAPE-3: <see cref="ResolveController"/> used to latch <c>_loadAttempted</c> on its
+        /// first failure and never look again, so one unlucky moment (a load-order race, another
+        /// loader holding the bundle, a transient file error) disabled the authored slide and
+        /// mantle clips for the rest of the session. Called once per round so the resolver gets a
+        /// fresh attempt. The "already told you" log latches stay set: the player-facing signal is
+        /// the HUD tip in <c>PanicSlidePatch</c>, and the ability itself now runs regardless.
+        /// </summary>
+        internal static void AllowControllerLoadRetry()
+        {
+            if (_controller != null)
+                return;
+
+            _loadAttempted = false;
+        }
+
         internal static RuntimeAnimatorController ResolveController()
         {
             if (_controller != null)

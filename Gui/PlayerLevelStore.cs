@@ -11,6 +11,10 @@ internal class PlayerLevelData
 {
     public List<string> suits     = new();
     public List<string> cosmetics = new();
+    // This entitlement migration runs once per resolved save identity. It is deliberately
+    // separate from the cosmetic list: a later external MoreCompany selection is equipment
+    // truth, not a new free entitlement.
+    public bool cosmeticInitialImportCompleted;
     // Emotes are NOT tracked here - TooManyEmotes ships its own shop, save
     // path (TooManyEmotes.UnlockedEmotes), and sync RPCs. The PLAYER LEVEL
     // emote section calls SessionManager.UnlockEmoteLocal directly.
@@ -117,6 +121,15 @@ internal static class PlayerLevelStore
     public static void Save()
     {
         if (_data == null || string.IsNullOrWhiteSpace(_key)) return;
+        // A host identity can change between a menu action and this disk write. Never let a
+        // stale in-memory row cross that boundary; the next Get() loads the new host/save scope.
+        if (!TryGetCurrentKey(out string currentKey) ||
+            !string.Equals(_key, currentKey, StringComparison.OrdinalIgnoreCase))
+        {
+            _key = null;
+            _data = null;
+            return;
+        }
         try
         {
             if (!Directory.Exists(SaveDir)) Directory.CreateDirectory(SaveDir);
@@ -168,4 +181,42 @@ internal static class PlayerLevelStore
     // Re-evaluate the active save file (e.g. after StartOfRound.Start fires
     // with a different save loaded).
     public static void Reload() { _data = null; _key = null; }
+
+    /// <summary>
+    /// Imports worn recognized cosmetics exactly once for this resolved save identity. Existing
+    /// unknown ids are intentionally retained: a missing pack can return later without erasing
+    /// its entitlement. The caller must have already established that the provider's registry and
+    /// selection list are live. This deliberately remains pending if there are no recognized
+    /// worn ids: MoreCompany can expose its catalog before applying an outfit asynchronously.
+    /// </summary>
+    internal static bool TryImportInitialRecognizedCosmetics(
+        IEnumerable<string> knownIds,
+        IEnumerable<string> equippedIds)
+    {
+        if (!TryGetCurrentKey(out string currentKey))
+            return false;
+
+        PlayerLevelData data = Get();
+        bool hasRecognizedWornId = CosmeticInitialImportPolicy.HasRecognizedWornId(
+            knownIds,
+            equippedIds);
+        if (data == null || !string.Equals(_key, currentKey, StringComparison.OrdinalIgnoreCase) ||
+            !CosmeticInitialImportPolicy.ShouldImport(
+                providerAndSaveReady: true,
+                alreadyImported: data.cosmeticInitialImportCompleted,
+                hasRecognizedWornId: hasRecognizedWornId))
+        {
+            return false;
+        }
+
+        HashSet<string> merged = CosmeticInitialImportPolicy.MergeRecognizedWornIds(
+            data.cosmetics,
+            knownIds,
+            equippedIds);
+        bool changed = !CosmeticInitialImportPolicy.SetEquals(data.cosmetics, merged);
+        data.cosmetics = new List<string>(merged);
+        data.cosmeticInitialImportCompleted = true;
+        Save();
+        return changed;
+    }
 }

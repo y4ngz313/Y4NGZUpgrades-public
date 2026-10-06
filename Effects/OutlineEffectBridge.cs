@@ -15,7 +15,9 @@ namespace Y4NGZUpgrades.Effects
     internal enum UpgradeOutlineSource
     {
         Ping = 0,
-        SquadSight = 1,
+        // WP12 dead-code sweep: SquadSight = 1 is retired. SquadSightPatch outlines through
+        // BuddySystem; no caller ever passed SquadSight. The remaining values keep their
+        // numbers so an in-flight request dictionary key never shifts meaning.
         Generic = 2,
         SixthSense = 3,
         BuddySystem = 4
@@ -194,14 +196,34 @@ namespace Y4NGZUpgrades.Effects
 
             internal bool Show(UpgradeOutlineSource source, int channel, float duration)
             {
+                // F-GHOST-5: Sixth Sense re-Shows every in-range occluded target every 0.25s, and an
+                // unconditional forceFullScan here made each of those refreshes run
+                // RefreshGameplayCullingMask + RefreshActiveLodRendererSets (a GetComponentsInChildren
+                // <LODGroup> plus per-LOD screen-height maths) + RefreshPlayerBodyRendererFilter + a
+                // GetComponentsInChildren<Renderer> walk, and reset _nextRendererRefreshAt so the
+                // 0.5s internal throttle was permanently defeated. The hierarchy only needs a fresh
+                // scan when this source is new or its channel moved; a plain extension of ExpiresAt
+                // can ride the throttled RefreshRendererCacheIfDue path like every Update tick does.
+                OutlineRequest existing;
+                bool newSource = !_requests.TryGetValue(source, out existing);
+                bool channelChanged = newSource || existing.Channel != channel;
+
                 _requests[source] = new OutlineRequest
                 {
                     Channel = channel,
                     ExpiresAt = Time.time + duration
                 };
 
-                _outlineStateDirty = true;
-                EnsureRenderers(forceFullScan: true);
+                if (channelChanged)
+                {
+                    _outlineStateDirty = true;
+                    EnsureRenderers(forceFullScan: true);
+                }
+                else
+                {
+                    RefreshRendererCacheIfDue();
+                }
+
                 ResolveActiveChannel();
                 return ApplyChannel() > 0;
             }

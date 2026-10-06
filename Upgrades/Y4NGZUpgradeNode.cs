@@ -48,7 +48,21 @@ namespace Y4NGZUpgrades.Upgrades
 
         internal int GetPriceForLevel(int level)
         {
-            return UpgradePriceMath.GetPriceForLevel(level, Definition.MaxTier, UnlockPrice, Prices);
+            NativeVariantBinding variant = Definition.Variant;
+            int configuredPrice = variant == null
+                // A row with a live ladder (#441) registers live-level prices already.
+                ? UpgradePriceMath.GetPriceForLevel(level, Definition.MaxTier, UnlockPrice, Prices)
+                // A unique-only rank costs the full-native steps up to its milestone that this
+                // save has not already bought (#435), so the quote moves with the player's own
+                // configured prices and with the full ranks they own. A live ladder prices the
+                // unique rank its next live level writes.
+                : NativeUpgradeFamilies.UniqueRankPrice(
+                    variant.Variant,
+                    Definition.LiveLadder?.PricedStoredLevel(level) ?? level,
+                    Y4NGZUpgradeManager.GetFullNativeLevel(Id),
+                    variant.FullUnlockPrice,
+                    variant.FullTierPrices);
+            return PurchaseTokenCostPolicy.Resolve(configuredPrice, Plugin.PurchasesCostTokens);
         }
 
         public int GetCurrentLevel()

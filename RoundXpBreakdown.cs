@@ -19,6 +19,8 @@ namespace Y4NGZUpgrades
         public int SurvivalXp;
         public int MainframeHackXp;
         public int ClutchXp;
+        /// <summary>Ship Systems battery restores (#459), flat.</summary>
+        public int ShipBatteryXp;
         public int ContractXp;
         public int ContractXpAwarded;
         /// <summary>
@@ -46,6 +48,7 @@ namespace Y4NGZUpgrades
             + Mathf.Max(0, SurvivalXp)
             + Mathf.Max(0, MainframeHackXp)
             + Mathf.Max(0, ClutchXp)
+            + Mathf.Max(0, ShipBatteryXp)
             + Mathf.Max(0, ContractXp)
             + Mathf.Max(0, BodyRetrievalXp);
 
@@ -56,6 +59,7 @@ namespace Y4NGZUpgrades
             + Mathf.Max(0, SurvivalXp)
             + Mathf.Max(0, MainframeHackXp)
             + Mathf.Max(0, ClutchXp)
+            + Mathf.Max(0, ShipBatteryXp)
             + Mathf.Max(0, ContractXpAwarded)
             + Mathf.Max(0, BodyRetrievalXpAwarded);
 

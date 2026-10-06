@@ -102,9 +102,11 @@ namespace Y4NGZUpgrades.Patches
         private static int _presentationVisibleLayer = -1;
         private static bool _presentationSaved;
 
-        private static bool _jumpMemberResolved;
-        private static FieldInfo _isJumpingField;
-        private static PropertyInfo _isJumpingProperty;
+        // F-ESCAPE-9: throttle for the "why did nothing happen" feedback tip.
+        private const float SLIDE_FAILURE_TIP_THROTTLE_SECONDS = 4f;
+        private static float _nextSlideFailureTipAt;
+        // F-ESCAPE-3: one HUD tip per round when the authored movement clip is unavailable.
+        private static bool _movementAnimationTipShown;
 
         [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
         [HarmonyPostfix]
@@ -119,6 +121,13 @@ namespace Y4NGZUpgrades.Patches
         {
             RegisterNetworkHandlers();
             _cooldownEnd = 0f;
+            _nextSlideFailureTipAt = 0f;
+            // F-ESCAPE-3: the controller resolver used to latch its first failure forever, so a
+            // bundle that was momentarily unavailable (load order, another loader claiming it)
+            // disabled the authored movement clips for the whole session. Retry once per round
+            // and let the HUD tip fire again if it is still missing.
+            _movementAnimationTipShown = false;
+            MovementPlayerAnimationRuntimeAssets.AllowControllerLoadRetry();
             ForceEndLocalSlide("start-game", sendStop: false);
             SlideAnimationBridge.EndAll("start-game");
             ClearRemoteSlideTerrainPresentations("start-game");
@@ -201,8 +210,11 @@ namespace Y4NGZUpgrades.Patches
             if (!CanSlide(__instance))
                 return true;
 
-            TrySlide(__instance);
-            return false;
+            // F-ESCAPE-9: only swallow the crouch input when the slide actually started. Every
+            // other path (cooldown, a live Interactions session, vanilla refusing the crouch)
+            // used to eat the press and leave the player with no slide AND no crouch, which is
+            // the everyday source of the "the upgrade does nothing" report.
+            return !TrySlide(__instance);
         }
 
         private static bool CanSlide(PlayerControllerB player)
@@ -216,7 +228,12 @@ namespace Y4NGZUpgrades.Patches
             if (player.thisController == null || !player.thisController.isGrounded)
                 return false;
             if (player.sprintMeter < PanicSlideUpgrade.MIN_SPRINT_METER)
+            {
+                // F-ESCAPE-9: the player is sprinting at a ledge-worthy speed and pressed crouch;
+                // say why the slide did not fire instead of silently falling through.
+                NotifySlideUnavailable("Not enough stamina to slide.");
                 return false;
+            }
             if (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen)
                 return false;
             if (player.isTypingChat || player.inTerminalMenu || player.inSpecialInteractAnimation)
@@ -224,10 +241,14 @@ namespace Y4NGZUpgrades.Patches
             return true;
         }
 
-        private static void TrySlide(PlayerControllerB player)
+        /// <summary>Returns true only when the slide actually started (F-ESCAPE-9).</summary>
+        private static bool TrySlide(PlayerControllerB player)
         {
             if (Time.time < _cooldownEnd)
-                return;
+            {
+                NotifySlideUnavailable($"Slide recharging ({_cooldownEnd - Time.time:0.0}s).");
+                return false;
+            }
 
             Vector3 forward = ResolveCameraForward(player);
 
@@ -260,11 +281,15 @@ namespace Y4NGZUpgrades.Patches
                     InteractionAnimationPresentationKind.DedicatedLocalViewmodel,
                     out _))
             {
-                return;
+                return false;
             }
 
+            // F-ESCAPE-3: the authored clip is presentation, the impulse is gameplay. A missing or
+            // contract-rejected movement bundle used to delete the whole ability silently (no
+            // force, no stamina, no cooldown, no crouch, no message). Run the slide either way and
+            // tell the player once why it looks wrong.
             if (!SlideAnimationBridge.Begin(player))
-                return;
+                NotifyMovementAnimationUnavailableOnce();
 
             BeginLocalAnimatedSlide(player, forward);
 
@@ -278,10 +303,16 @@ namespace Y4NGZUpgrades.Patches
             if (!_slideForcedCrouch)
             {
                 ForceEndLocalSlide("crouch-rejected", sendStop: false);
-                return;
+                return false;
             }
 
-            float weightMultiplier = Mathf.Clamp(1.15f - (player.carryWeight - 1f) * 0.12f, 0.55f, 1.15f);
+            // F-ESCAPE-10: named + retuned so "a heavy load weakens the slide" is a real mechanic
+            // (see the constants in PanicSlideUpgrade for the numbers and the reachable floor).
+            float weightMultiplier = Mathf.Clamp(
+                PanicSlideUpgrade.SLIDE_WEIGHT_BASE_MULTIPLIER
+                    - (player.carryWeight - 1f) * PanicSlideUpgrade.SLIDE_WEIGHT_PENALTY_PER_CARRY_UNIT,
+                PanicSlideUpgrade.SLIDE_WEIGHT_MIN_MULTIPLIER,
+                PanicSlideUpgrade.SLIDE_WEIGHT_BASE_MULTIPLIER);
             player.externalForceAutoFade += forward * PanicSlideUpgrade.SLIDE_FORCE * weightMultiplier;
             player.sprintMeter = Mathf.Clamp01(player.sprintMeter - PanicSlideUpgrade.STAMINA_COST);
             if (player.sprintMeterUI != null)
@@ -290,6 +321,66 @@ namespace Y4NGZUpgrades.Patches
             _cooldownEnd = Time.time + PanicSlideUpgrade.COOLDOWN_SECONDS;
             HUDManager.Instance?.ShakeCamera(ScreenShakeType.Small);
             SendSlideStart(player.playerClientId);
+            return true;
+        }
+
+        // F-ESCAPE-9: throttled so a mashed crouch key cannot spam the HUD.
+        private static void NotifySlideUnavailable(string message)
+        {
+            if (Time.time < _nextSlideFailureTipAt)
+                return;
+
+            _nextSlideFailureTipAt = Time.time + SLIDE_FAILURE_TIP_THROTTLE_SECONDS;
+            HUDManager.Instance?.DisplayTip("ESCAPE ARTIST", message, isWarning: true);
+        }
+
+        // F-ESCAPE-3: the ability still runs without the authored clip; this only explains the
+        // missing animation, once per round.
+        internal static void NotifyMovementAnimationUnavailableOnce()
+        {
+            if (_movementAnimationTipShown)
+                return;
+
+            _movementAnimationTipShown = true;
+            HUDManager.Instance?.DisplayTip(
+                "ESCAPE ARTIST",
+                "Movement animations are unavailable; the ability still works.",
+                isWarning: true);
+        }
+
+        /// <summary>
+        /// F-ESCAPE-11: a jump cancels an active slide. The slide holds vanilla crouch for its
+        /// whole duration and vanilla Jump_performed refuses while <c>isCrouching</c>, so the
+        /// stand-up has to happen on this same input frame for the jump to be accepted. Returns
+        /// false (slide left running, jump handled normally) when vanilla refuses to stand the
+        /// player up — under an obstruction there is no headroom to jump into either.
+        /// </summary>
+        internal static bool TryCancelSlideForJump(PlayerControllerB player)
+        {
+            if (player == null || player != _localSlidePlayer || !IsLocalSlideActive())
+                return false;
+
+            // Mirror the parts of vanilla Jump_performed's gate that would reject the jump anyway,
+            // so the slide is never cancelled for a press vanilla is going to ignore.
+            if (player.isExhausted || player.isTypingChat || player.inTerminalMenu
+                || player.inSpecialInteractAnimation || player.isClimbingLadder)
+            {
+                return false;
+            }
+            if (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen)
+                return false;
+
+            if (_slideForcedCrouch && player.isCrouching)
+            {
+                player.Crouch(crouch: false);
+                if (player.isCrouching)
+                    return false;
+
+                _slideForcedCrouch = false;
+            }
+
+            StartLocalExit("jump");
+            return true;
         }
 
         private static void BeginLocalAnimatedSlide(PlayerControllerB player, Vector3 direction)
@@ -407,33 +498,11 @@ namespace Y4NGZUpgrades.Patches
             return false;
         }
 
+        // F-ESCAPE-6: read the publicized field directly. The reflection resolver boxed a bool
+        // through FieldInfo.GetValue on every frame of every slide.
         private static bool IsPlayerJumping(PlayerControllerB player)
         {
-            if (player == null)
-                return false;
-
-            ResolveJumpMember();
-            try
-            {
-                if (_isJumpingField != null && _isJumpingField.GetValue(player) is bool fieldValue)
-                    return fieldValue;
-                if (_isJumpingProperty != null && _isJumpingProperty.GetValue(player, null) is bool propertyValue)
-                    return propertyValue;
-            }
-            catch { }
-
-            return false;
-        }
-
-        private static void ResolveJumpMember()
-        {
-            if (_jumpMemberResolved)
-                return;
-
-            _jumpMemberResolved = true;
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            _isJumpingField = typeof(PlayerControllerB).GetField("isJumping", flags);
-            _isJumpingProperty = typeof(PlayerControllerB).GetProperty("isJumping", flags);
+            return player != null && player.isJumping;
         }
 
         private static void UpdateSlideDirection(PlayerControllerB player)
@@ -1020,7 +1089,7 @@ namespace Y4NGZUpgrades.Patches
 
         private static void LogFirstPersonPresentationDiagnostics(PlayerControllerB player, int cameraMask)
         {
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide] First-person movement presentation active. " +
                 $"gameplayCamera.cullingMask=0x{cameraMask:X8}; " +
                 $"redirectLayer={(_presentationLayerRedirectActive ? _presentationVisibleLayer.ToString() : "<none>")}; " +
@@ -1088,6 +1157,10 @@ namespace Y4NGZUpgrades.Patches
         private static void PostDisconnect()
         {
             _handlersRegistered = false;
+            // F-ESCAPE-7: match LedgeMantlePatch.PostDisconnect. Without this every remote slide
+            // presentation kept a strong PlayerControllerB reference and its captured metarig base
+            // pose across the lobby transition, and its Restore() was never called.
+            ClearRemoteSlideTerrainPresentations("disconnect");
         }
 
         private static void RegisterNetworkHandlers()
@@ -1168,6 +1241,8 @@ namespace Y4NGZUpgrades.Patches
             {
                 ulong playerClientId;
                 reader.ReadValueSafe(out playerClientId);
+                if (!IsAcceptedMovementSender(senderClientId, playerClientId, MSG_SLIDE_START))
+                    return;
                 ApplyRemoteSlideStart(playerClientId);
                 RelaySlideMessageIfHost(MSG_SLIDE_START, senderClientId, playerClientId);
             }
@@ -1183,6 +1258,8 @@ namespace Y4NGZUpgrades.Patches
             {
                 ulong playerClientId;
                 reader.ReadValueSafe(out playerClientId);
+                if (!IsAcceptedMovementSender(senderClientId, playerClientId, MSG_SLIDE_STOP))
+                    return;
                 ApplyRemoteSlideStop(playerClientId);
                 RelaySlideMessageIfHost(MSG_SLIDE_STOP, senderClientId, playerClientId);
             }
@@ -1190,6 +1267,30 @@ namespace Y4NGZUpgrades.Patches
             {
                 Plugin.Log?.LogDebug($"PanicSlidePatch: malformed slide stop message: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// F-ESCAPE-4: a movement event is only accepted from the connection that owns the named
+        /// player, or from the server (the host relay). Matches UpgradeTierSync's house rule, and
+        /// resolves the payload's player SLOT to its <c>actualClientId</c> rather than comparing a
+        /// slot index against a connection id (the BetterArmory 1.0.8 lesson, #416).
+        /// </summary>
+        internal static bool IsAcceptedMovementSender(
+            ulong senderClientId,
+            ulong playerClientId,
+            string messageName)
+        {
+            if (senderClientId == NetworkManager.ServerClientId)
+                return true;
+
+            PlayerControllerB player = ResolvePlayer(playerClientId);
+            if (player != null && player.actualClientId == senderClientId)
+                return true;
+
+            Plugin.Log?.LogDebug(
+                $"PanicSlidePatch: dropped {messageName} for playerClientId={playerClientId} " +
+                $"from senderClientId={senderClientId} (sender does not own that player).");
+            return false;
         }
 
         private static void RelaySlideMessageIfHost(string messageName, ulong senderClientId, ulong playerClientId)
@@ -1209,7 +1310,7 @@ namespace Y4NGZUpgrades.Patches
             PlayerControllerB player = ResolvePlayer(playerClientId);
             if (player == null)
             {
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-slide] start_gate: " +
                     $"playerClientId={playerClientId} bridgeStarted=False " +
                     $"terrainConfigured={terrainConfigured} " +
@@ -1218,7 +1319,7 @@ namespace Y4NGZUpgrades.Patches
             }
             if (IsLocalPlayer(player))
             {
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-slide] start_gate: " +
                     $"playerClientId={playerClientId} bridgeStarted=False " +
                     $"terrainConfigured={terrainConfigured} " +
@@ -1264,7 +1365,7 @@ namespace Y4NGZUpgrades.Patches
                 }
             }
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-slide] start_gate: " +
                 $"playerClientId={playerClientId} bridgeStarted={bridgeStarted} " +
                 $"terrainConfigured={terrainConfigured} " +
@@ -1282,7 +1383,7 @@ namespace Y4NGZUpgrades.Patches
             if (!bridgeExitTriggered)
                 RemoveRemoteSlideTerrainPresentation(playerClientId, "stop_without_remote_player");
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-slide] stop_gate: " +
                 $"playerClientId={playerClientId} bridgeExitTriggered={bridgeExitTriggered} " +
                 $"terrainPresentationActive={terrainPresentationActive} " +
@@ -1333,7 +1434,7 @@ namespace Y4NGZUpgrades.Patches
 
             RemoteSlidePresentations.Remove(playerClientId);
             presentation.Restore();
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-slide] terrain_end_gate: " +
                 $"playerClientId={playerClientId} reason='{reason}'.");
             return true;
@@ -1349,7 +1450,7 @@ namespace Y4NGZUpgrades.Patches
             }
 
             RemoteSlidePresentations.Clear();
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.remote-slide] terrain_clear_gate: " +
                 $"restored={restored} reason='{reason}'.");
         }
@@ -1456,7 +1557,7 @@ namespace Y4NGZUpgrades.Patches
                     return;
 
                 _lastGateResult = result;
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.remote-slide] terrain_gate: " +
                     $"playerClientId={Player?.playerClientId.ToString() ?? "<null>"} " +
                     $"result='{result}' groundY={groundY:0.######} " +

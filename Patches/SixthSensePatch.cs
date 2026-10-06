@@ -18,7 +18,6 @@ namespace Y4NGZUpgrades.Patches
         private const float StaticRescanInterval = 5f;
         private const float ItemRescanInterval = 1f;
         private const int ObjectiveTypesPerRefreshTick = 3;
-        private const float StaticRescanPhaseOffset = ObjectiveRescanInterval * 0.5f;
         private const string CompanyAssemblyName = "Y4NGZCompany";
         private const string ShipSystemsAssemblyName = "Y4NGZShipSystems";
         private const string MonitorTakeoverAssemblyName = "Y4NGZMonitorTakeover";
@@ -28,7 +27,13 @@ namespace Y4NGZUpgrades.Patches
         {
             internal Component Component;
             internal GameObject Root;
-            internal Vector3 Position;
+
+            // F-GHOST-15: the offset from the root transform to the renderer-bounds centre, not an
+            // absolute world position. Turrets, mines and items already re-derive their centre from
+            // this offset every refresh; objectives stored an absolute point captured at scan time,
+            // so a provider objective that moves (a carryable bomb or container) had its outline and
+            // its occlusion linecast lagging by up to the full 5s rescan interval.
+            internal Vector3 CenterOffset;
             internal int RootKey;
         }
 
@@ -176,7 +181,8 @@ namespace Y4NGZUpgrades.Patches
                 ConsiderTarget(
                     player,
                     candidate.Root,
-                    candidate.Position,
+                    // F-GHOST-15: re-derive the centre from the live transform each refresh.
+                    candidate.Root.transform.position + candidate.CenterOffset,
                     SixthSenseUpgrade.BASE_RANGE,
                     UpgradeOutlineChannel.Utility);
             }
@@ -391,7 +397,7 @@ namespace Y4NGZUpgrades.Patches
                 {
                     Component = component,
                     Root = root,
-                    Position = center,
+                    CenterOffset = center - root.transform.position,
                     RootKey = root.GetInstanceID()
                 });
             }
@@ -406,23 +412,20 @@ namespace Y4NGZUpgrades.Patches
             _objectiveRebuildNextTypeIndex = 0;
         }
 
+        // F-GHOST-9: this used to refuse to rebuild whenever an objective rescan was due and push
+        // _nextStaticRescanTime out by 2.5s instead. Because ClearTargetDiscoveryCaches() also
+        // armed that same 2.5s offset and sets _nextObjectiveRescanTime to 0, the very first refresh
+        // after landing ALWAYS deferred - entrances, turrets and mines stayed Array.Empty for at
+        // least 2.5s every round - and with providers installed the objective rebuild occupies
+        // roughly 2 of every 5 seconds, so the static caches then refreshed on a jittery cadence
+        // rather than the nominal 5s. Three FindObjectsByType calls every 5s is cheaper than the
+        // dodge was, so they now run unconditionally.
         private static void EnsureStaticTargetCacheFresh()
         {
             if (Time.time < _nextStaticRescanTime)
                 return;
 
-            if (ObjectiveScanDueThisFrame())
-            {
-                _nextStaticRescanTime = Time.time + StaticRescanPhaseOffset;
-                return;
-            }
-
             RebuildStaticTargetCaches();
-        }
-
-        private static bool ObjectiveScanDueThisFrame()
-        {
-            return _objectiveRebuildInProgress || Time.time >= _nextObjectiveRescanTime;
         }
 
         private static void RebuildStaticTargetCaches()
@@ -554,13 +557,19 @@ namespace Y4NGZUpgrades.Patches
                 out root,
                 out center);
 
-            if (root != null)
-                return true;
+            if (root == null)
+            {
+                NetworkObject networkObject = component.GetComponentInParent<NetworkObject>();
+                root = networkObject != null ? networkObject.gameObject : component.gameObject;
+                center = root != null ? root.transform.position : component.transform.position;
+            }
 
-            NetworkObject networkObject = component.GetComponentInParent<NetworkObject>();
-            root = networkObject != null ? networkObject.gameObject : component.gameObject;
-            center = root != null ? root.transform.position : component.transform.position;
-            return root != null;
+            // F-GHOST-17: the ObjectiveNeedles list also matches non-world types - MainframeAudio,
+            // Y4NGZCompanyHost, HUD presenters - which have nothing to draw. Accepting them created
+            // an outline driver with zero renderers on each, and every one of those churned through
+            // Show/ApplyChannel every 0.25s for no visible result. An outline is meaningless without
+            // a renderer somewhere in the hierarchy, so require one.
+            return root != null && HasUsableRenderer(root);
         }
 
         private static void ResolveRenderableTarget(
@@ -722,7 +731,9 @@ namespace Y4NGZUpgrades.Patches
             _cachedMines = Array.Empty<Landmine>();
             _cachedItems = Array.Empty<GrabbableObject>();
             _nextObjectiveRescanTime = 0f;
-            _nextStaticRescanTime = Time.time + StaticRescanPhaseOffset;
+            // F-GHOST-9: no phase offset. This was the other half of the 2.5s blind window after
+            // every round start and scene change.
+            _nextStaticRescanTime = 0f;
             _nextItemRescanTime = 0f;
         }
 

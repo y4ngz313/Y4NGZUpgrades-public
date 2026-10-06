@@ -34,9 +34,35 @@ namespace Y4NGZUpgrades.Patches
             ResetInteractionPrompts();
         }
 
-        internal static float ApplyBreakChanceMultiplier(float chance)
+        /// <summary>
+        /// F-TECH-3: FuelPumpItem.ServerTickFill only ever runs on the host, so reading the
+        /// local save state here halved stalls for the whole crew whenever the HOST owned the
+        /// upgrade and did nothing at all for a client who bought it. The transpiler now also
+        /// pushes the pump instance so the responsible crewmate can be resolved and their
+        /// synced tier read, the same way ScavengerCompanyPatch credits fuel deposits.
+        /// </summary>
+        internal static float ApplyBreakChanceMultiplier(float chance, object pump)
         {
-            return chance * TurretHackerUpgrade.GetBreakChanceMultiplier();
+            try
+            {
+                if (!(pump is Component pumpComponent))
+                    return chance;
+
+                GrabbableObject grabbable = pumpComponent.GetComponent<GrabbableObject>();
+                if (grabbable == null
+                    || !ScavengerCompanyPatch.TryGetLastHolderClientId(grabbable, out ulong clientId))
+                {
+                    return chance;
+                }
+
+                int tier = UpgradeTierSync.GetTier(clientId, TurretHackerUpgrade.UPGRADE_ID);
+                return chance * TurretHackerUpgrade.GetBreakChanceMultiplier(tier);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[FieldMechanic] pump stall multiplier failed safely: {ex.Message}");
+                return chance;
+            }
         }
 
         private static Type CompanyType(string typeName)
@@ -129,8 +155,14 @@ namespace Y4NGZUpgrades.Patches
                 foreach (CodeInstruction instruction in instructions)
                 {
                     yield return instruction;
-                    if (getter != null && multiplier != null && instruction.Calls(getter))
-                        yield return new CodeInstruction(OpCodes.Call, multiplier);
+                    if (getter == null || multiplier == null || !instruction.Calls(getter))
+                        continue;
+
+                    // F-TECH-3: push the FuelPumpItem instance alongside the stall chance so the
+                    // helper can attribute the pump to the crewmate who set it up. ServerTickFill
+                    // is a plain instance method, so ldarg.0 is `this`.
+                    yield return new CodeInstruction(OpCodes.Ldarg_0);
+                    yield return new CodeInstruction(OpCodes.Call, multiplier);
                 }
             }
         }
@@ -149,7 +181,11 @@ namespace Y4NGZUpgrades.Patches
             private const string MSG_CAMERA_HACK = "Y4NGZFieldMechanic.CameraHackServerRpc";
 
             private static bool _handlersRegistered;
+            private static NetworkManager _registeredNetworkManager;
             private static float _cameraHackHold;
+            private static string _cameraPromptInteractLabel;
+            private static string _cameraPromptText;
+            private static float _nextCameraPromptRefresh;
 
             internal static void ResetLocalState()
             {
@@ -200,10 +236,7 @@ namespace Y4NGZUpgrades.Patches
                     return;
                 }
 
-                string interact = UpgradeInteractInput.DisplayLabel();
-                Y4ngzPromptOverlay.SetPersistentPrompt(
-                    CameraHackPromptKey,
-                    $"Disable camera: Hold [{interact}]");
+                Y4ngzPromptOverlay.SetPersistentPrompt(CameraHackPromptKey, ResolveCameraPromptText());
 
                 bool hackHeld = UpgradeInteractInput.IsHeld();
                 if (hackHeld)
@@ -214,44 +247,74 @@ namespace Y4NGZUpgrades.Patches
                         _cameraHackHold = 0f;
                         RequestCameraDisable(cameraIndex);
                         ClearCameraHackPrompt();
+                        return;
                     }
                 }
                 else
                 {
                     _cameraHackHold = Mathf.MoveTowards(_cameraHackHold, 0f, Time.deltaTime * 2f);
                 }
+
+                // F-TECH-2: the hold had no feedback at all between the prompt and the 1.2 s
+                // completion, and without Y4NGZUI it had no prompt either.
+                Y4ngzPromptOverlay.SetPersistentPromptProgress(
+                    CameraHackPromptKey,
+                    _cameraHackHold / TurretHackerUpgrade.HACK_HOLD_SECONDS);
+            }
+
+            private static string ResolveCameraPromptText()
+            {
+                // Rebuilt only when the bound Interact key changes: this runs every frame.
+                if (_cameraPromptText != null && Time.unscaledTime < _nextCameraPromptRefresh)
+                    return _cameraPromptText;
+
+                _nextCameraPromptRefresh = Time.unscaledTime + 0.5f;
+                string interact = UpgradeInteractInput.DisplayLabel();
+                if (_cameraPromptText == null
+                    || !string.Equals(interact, _cameraPromptInteractLabel, StringComparison.Ordinal))
+                {
+                    _cameraPromptInteractLabel = interact;
+                    _cameraPromptText = $"Disable camera: Hold [{interact}]";
+                }
+
+                return _cameraPromptText;
             }
 
             private static bool TryFindTargetedCamera(PlayerControllerB player, out int cameraIndex)
             {
                 cameraIndex = -1;
 
-                Camera camera = player.gameplayCamera != null ? player.gameplayCamera : Camera.main;
-                if (camera == null)
-                    return false;
+                // F-TECH-14: this used to allocate a fresh RaycastHit[] plus a comparison
+                // delegate and its closure every frame, for every player with level 1. It now
+                // shares the single non-alloc look raycast with the door and turret probes and
+                // scans for the nearest match, which is what Array.Sort was there to find.
+                float range = TurretHackerPatch.ResolveLookRange(player);
+                int hitCount = TurretHackerPatch.LookRaycast(player, range, out RaycastHit[] hits);
 
-                float range = player.grabDistance > 0f ? player.grabDistance : 4f;
-                Ray ray = new Ray(camera.transform.position, camera.transform.forward);
-                RaycastHit[] hits = Physics.RaycastAll(ray, range, ~0, QueryTriggerInteraction.Collide);
-                Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
-                for (int i = 0; i < hits.Length; i++)
+                Component nearestCamera = null;
+                float nearestDistance = float.MaxValue;
+                for (int i = 0; i < hitCount; i++)
                 {
-                    if (hits[i].collider == null)
+                    if (hits[i].collider == null || hits[i].distance >= nearestDistance)
                         continue;
 
                     Component cctvCamera = ResolveCameraComponent(hits[i].collider);
                     if (cctvCamera == null)
                         continue;
 
-                    int index = GetCameraIndex(cctvCamera);
-                    if (index < 0 || IsCameraDisabled(index))
-                        return false;
-
-                    cameraIndex = index;
-                    return true;
+                    nearestCamera = cctvCamera;
+                    nearestDistance = hits[i].distance;
                 }
 
-                return false;
+                if (nearestCamera == null)
+                    return false;
+
+                int index = GetCameraIndex(nearestCamera);
+                if (index < 0 || IsCameraDisabled(index))
+                    return false;
+
+                cameraIndex = index;
+                return true;
             }
 
             private static Component ResolveCameraComponent(Collider collider)
@@ -299,7 +362,16 @@ namespace Y4NGZUpgrades.Patches
 
             private static bool HostTryDisableCamera(int cameraIndex)
             {
-                return OptionalCctvBridge.TryDisableCamera(cameraIndex);
+                bool wasDisabled = OptionalCctvBridge.IsCameraDisabled(cameraIndex);
+                if (wasDisabled)
+                    return false;
+
+                bool providerAccepted = OptionalCctvBridge.TryDisableCamera(cameraIndex);
+                bool isDisabled = OptionalCctvBridge.IsCameraDisabled(cameraIndex);
+                return CctvStatisticsEventGuard.IsNewCameraDisable(
+                    wasDisabled,
+                    providerAccepted,
+                    isDisabled);
             }
 
 #pragma warning disable Harmony003 // Custom message serializers mutate FastBufferReader/FastBufferWriter by design.
@@ -311,7 +383,12 @@ namespace Y4NGZUpgrades.Patches
 
                 if (networkManager.IsServer)
                 {
-                    HostTryDisableCamera(cameraIndex);
+                    if (HostTryDisableCamera(cameraIndex))
+                    {
+                        CctvEmployeeStatisticsNetwork.RecordHostConfirmedDeviceHack(
+                            networkManager.LocalClientId,
+                            "camera." + cameraIndex);
+                    }
                     return;
                 }
 
@@ -330,21 +407,44 @@ namespace Y4NGZUpgrades.Patches
                 }
             }
 
+            /// <summary>
+            /// F-TECH-4: the latch used to be a bare bool that nothing ever cleared. Netcode
+            /// nulls the CustomMessagingManager on shutdown and builds a fresh one for the next
+            /// host/join, so hosting a second lobby in one session left the host deaf to every
+            /// client's camera hack (its own still worked, because RequestCameraDisable
+            /// short-circuits to HostTryDisableCamera when IsServer). Keying the latch on the
+            /// NetworkManager instance is the robust form of the TurretHackerPatch fix: it
+            /// re-registers exactly once per manager and never twice for the same one.
+            /// </summary>
             private static void RegisterNetworkHandlers()
             {
-                if (_handlersRegistered) return;
-                if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null) return;
-                if (!NetworkManager.Singleton.IsServer) return;
+                NetworkManager network = NetworkManager.Singleton;
+                CustomMessagingManager messaging = network?.CustomMessagingManager;
+                if (network == null || messaging == null) return;
+                if (!network.IsServer) return;
+                if (_handlersRegistered && ReferenceEquals(_registeredNetworkManager, network)) return;
 
                 try
                 {
-                    NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(MSG_CAMERA_HACK, OnCameraHackRequest);
+                    messaging.RegisterNamedMessageHandler(MSG_CAMERA_HACK, OnCameraHackRequest);
                     _handlersRegistered = true;
+                    _registeredNetworkManager = network;
                 }
                 catch (Exception ex)
                 {
+                    _handlersRegistered = false;
+                    _registeredNetworkManager = null;
                     Plugin.Log?.LogWarning($"[FieldMechanic] RegisterNamedMessageHandler failed: {ex.Message}");
                 }
+            }
+
+            [HarmonyPatch(typeof(GameNetworkManager), "Disconnect")]
+            [HarmonyPostfix]
+            private static void PostDisconnect()
+            {
+                _handlersRegistered = false;
+                _registeredNetworkManager = null;
+                _cameraHackHold = 0f;
             }
 
             private static void OnCameraHackRequest(ulong senderClientId, FastBufferReader reader)
@@ -366,7 +466,12 @@ namespace Y4NGZUpgrades.Patches
                 if (UpgradeTierSync.GetTier(senderClientId, TurretHackerUpgrade.UPGRADE_ID) < 1)
                     return;
 
-                HostTryDisableCamera(cameraIndex);
+                if (HostTryDisableCamera(cameraIndex))
+                {
+                    CctvEmployeeStatisticsNetwork.RecordHostConfirmedDeviceHack(
+                        senderClientId,
+                        "camera." + cameraIndex);
+                }
             }
 #pragma warning restore Harmony003
         }

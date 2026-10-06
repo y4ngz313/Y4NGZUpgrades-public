@@ -375,7 +375,7 @@ namespace Y4NGZUpgrades.Effects
                 _cameraRestoreBaselineMode = ResolveCameraRestoreBaselineMode(
                     out string configuredCameraBaseline,
                     out bool usedCameraBaselineFallback);
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerabaseline] mode_selected: " +
                     $"phase='session_begin' mode='{FormatCameraRestoreBaselineMode(_cameraRestoreBaselineMode)}' " +
                     $"configured='{configuredCameraBaseline}' fallback={usedCameraBaselineFallback} " +
@@ -579,7 +579,7 @@ namespace Y4NGZUpgrades.Effects
                     return;
 
                 _lookRigSuppressionLogged = true;
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.lookrig] suppression_started: " +
                     $"player={FormatPlayerForLog(Player)} " +
                     $"cameraLookRig1Captured={_lookRig1WeightCaptured} " +
@@ -617,7 +617,7 @@ namespace Y4NGZUpgrades.Effects
                     string.Equals(reason, "auto-finished", StringComparison.Ordinal);
                 if (!settledEnd)
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerabaseline] guard_skipped: " +
                         $"frame={Time.frameCount} player={FormatPlayerForLog(player)} " +
                         $"endReason='{reason}' reason='unsettled_end'.");
@@ -654,7 +654,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!ReferenceEquals(player, localPlayer))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerabaseline] guard_skipped: " +
                         $"frame={Time.frameCount} player={FormatPlayerForLog(player)} " +
                         $"endReason='{reason}' reason='not_local_player'.");
@@ -710,7 +710,7 @@ namespace Y4NGZUpgrades.Effects
                 {
                     var guard = player.gameplayCamera.gameObject.AddComponent<ParkourCameraPositionReleaseGuard>();
                     guard.Initialize(player.transform, player.gameplayCamera.transform, playerLocalPosition);
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerabaseline] guard_started: " +
                         $"frame={Time.frameCount} player={FormatPlayerForLog(player)} " +
                         $"mode='{FormatCameraRestoreBaselineMode(_cameraRestoreBaselineMode)}' " +
@@ -756,7 +756,7 @@ namespace Y4NGZUpgrades.Effects
                         CrossFadeFpArmsState(ResolveFpArmsEnterState(_kind));
                         CrossFadeLocalBodySlideState("SlideStart");
                     }
-                    Plugin.Log?.LogInfo("[Panic Slide] Slide animator controller was restored after another system replaced it during slide playback.");
+                    Plugin.Log?.LogDebug("[Panic Slide] Slide animator controller was restored after another system replaced it during slide playback.");
                 }
                 catch (Exception ex)
                 {
@@ -816,7 +816,7 @@ namespace Y4NGZUpgrades.Effects
                 _localSlideBodyModeInitialized = true;
                 _useGroundedLocalSlideBody = grounded;
                 _localSlideBodyModeReason = reason;
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.presentation] local_body_mode_selected: " +
                     $"player={FormatPlayerForLog(Player)} " +
                     $"mode='{(grounded ? "grounded_full_body" : "camera_composed_body")}' " +
@@ -993,7 +993,7 @@ namespace Y4NGZUpgrades.Effects
                     out string configuredRestoreStateMode,
                     out bool usedRestoreStateFallback);
                 string restoreStateModeLabel = FormatRestoreStateMode(restoreStateMode);
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.staterestore] restore_begin: " +
                     $"mode='{restoreStateModeLabel}' configured='{configuredRestoreStateMode}' " +
                     $"fallback={usedRestoreStateFallback} frame={Time.frameCount} " +
@@ -1053,7 +1053,7 @@ namespace Y4NGZUpgrades.Effects
                 }
 
                 animator.Update(0f);
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     $"[Panic Slide] Vanilla Animator rebind cleared movement pose residue " +
                     $"for player {FormatPlayerForLog(Player)}.");
             }
@@ -1154,7 +1154,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!ReferenceEquals(player, localPlayer))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerabaseline] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(player)} reason='not_local_player'.");
@@ -1247,7 +1247,7 @@ namespace Y4NGZUpgrades.Effects
                     return default;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerabaseline] captured: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(player)} " +
@@ -1267,7 +1267,7 @@ namespace Y4NGZUpgrades.Effects
             {
                 if (!(Plugin.SlidePostRestoreDiagnostics?.Value ?? false))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.postrestore] sampler_skipped: " +
                         $"frame={Time.frameCount} player={FormatPlayerForLog(Player)} reason='disabled'.");
                     return;
@@ -1307,7 +1307,7 @@ namespace Y4NGZUpgrades.Effects
             {
                 if (!(Plugin.SlideRestoreCameraRotation?.Value ?? true))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerarotation] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} reason='disabled'.");
@@ -1345,7 +1345,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!ReferenceEquals(player, localPlayer))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerarotation] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(player)} reason='not_local_player'.");
@@ -1420,7 +1420,7 @@ namespace Y4NGZUpgrades.Effects
                     return default;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerarotation] captured: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(player)} " +
@@ -1452,7 +1452,7 @@ namespace Y4NGZUpgrades.Effects
                         "reason='begin_pose_unavailable'.");
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerabaseline] restore_selected: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(Player)} mode='live' " +
@@ -1460,7 +1460,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!(Plugin.SlideRestoreCameraRotation?.Value ?? true))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerarotation] reapply_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} reason='disabled'.");
@@ -1554,7 +1554,7 @@ namespace Y4NGZUpgrades.Effects
                     return;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerarotation] reapplied: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(Player)} " +
@@ -1617,7 +1617,7 @@ namespace Y4NGZUpgrades.Effects
                 }
                 else
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.camerarotation] reapply_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} baseline='begin' reason='disabled'.");
@@ -1723,7 +1723,7 @@ namespace Y4NGZUpgrades.Effects
                     return;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.camerabaseline] restored: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(Player)} mode='begin' " +
@@ -1738,7 +1738,7 @@ namespace Y4NGZUpgrades.Effects
             {
                 if (!(Plugin.SlideRestoreVisorPose?.Value ?? true))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} reason='disabled'.");
@@ -1776,7 +1776,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!ReferenceEquals(player, localPlayer))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(player)} reason='not_local_player'.");
@@ -1873,7 +1873,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!captured.HasAnyRestoreEligiblePose)
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] capture_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(player)} " +
@@ -1881,7 +1881,7 @@ namespace Y4NGZUpgrades.Effects
                     return default;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.visor] captured: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(player)} " +
@@ -1931,7 +1931,7 @@ namespace Y4NGZUpgrades.Effects
             {
                 if (!(Plugin.SlideRestoreVisorPose?.Value ?? true))
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] reapply_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} reason='disabled'.");
@@ -2000,7 +2000,7 @@ namespace Y4NGZUpgrades.Effects
                     return;
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.visor] reapplied: " +
                     $"phase='{phase}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(Player)} " +
@@ -2030,7 +2030,7 @@ namespace Y4NGZUpgrades.Effects
 
                 if (!captured.UnderAnimatorHierarchy)
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] reapply_skipped: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} target='{targetName}' " +
@@ -2084,7 +2084,7 @@ namespace Y4NGZUpgrades.Effects
                 _visorHierarchyLogged = true;
                 try
                 {
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.visor] hierarchy: " +
                         $"phase='{phase}' frame={Time.frameCount} " +
                         $"player={FormatPlayerForLog(Player)} " +
@@ -2260,7 +2260,7 @@ namespace Y4NGZUpgrades.Effects
                         }
                     }
 
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide] RigBuilder zero-delta restore evaluation gate: " +
                         $"rebuilt={rebuilt} evaluated={evaluated} " +
                         $"evaluateMethodResolved={evaluateMethod != null} reason='{reason}' " +
@@ -2270,7 +2270,7 @@ namespace Y4NGZUpgrades.Effects
                 if (!_rigBuilderRebuildLogged)
                 {
                     _rigBuilderRebuildLogged = true;
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         $"[Panic Slide] Rebuilt {rebuilt} Animation Rigging RigBuilder(s) after {reason} for player {FormatPlayerForLog(Player)}.");
                 }
             }
@@ -2410,7 +2410,7 @@ namespace Y4NGZUpgrades.Effects
                             $"layer={i} hash={_savedStateHashes[i]} savedTime={_savedStateTimes[i]:0.######}");
                     }
 
-                    Plugin.Log?.LogInfo(
+                    Plugin.Log?.LogDebug(
                         "[Panic Slide.staterestore] fresh_states_skipped: " +
                         $"frame={Time.frameCount} player={FormatPlayerForLog(Player)} " +
                         $"savedStates=[{string.Join("; ", skippedStates)}].");
@@ -2433,7 +2433,7 @@ namespace Y4NGZUpgrades.Effects
                 {
                     if (_savedStateHashes[i] == 0)
                     {
-                        Plugin.Log?.LogInfo(
+                        Plugin.Log?.LogDebug(
                             "[Panic Slide.staterestore] layer_skipped: " +
                             $"mode='{FormatRestoreStateMode(restoreStateMode)}' frame={Time.frameCount} " +
                             $"player={FormatPlayerForLog(Player)} layer={i} hash=0 " +
@@ -2468,7 +2468,7 @@ namespace Y4NGZUpgrades.Effects
                     }
                 }
 
-                Plugin.Log?.LogInfo(
+                Plugin.Log?.LogDebug(
                     "[Panic Slide.staterestore] states_restored: " +
                     $"mode='{FormatRestoreStateMode(restoreStateMode)}' frame={Time.frameCount} " +
                     $"player={FormatPlayerForLog(Player)} restoredLayers={restoredLayers} " +
@@ -2777,7 +2777,7 @@ namespace Y4NGZUpgrades.Effects
             int sampleIndex = samplesWritten;
             samplesWritten++;
 
-            Plugin.Log?.LogInfo(
+            Plugin.Log?.LogDebug(
                 "[Panic Slide.postrestore] sample: " +
                 $"sample={sampleIndex} restoreFrame={restoreFrame} frame={Time.frameCount} player={playerLabel} " +
                 $"cameraContainerLocalPosition={DescribeLocalPosition(cameraContainerTransform)} " +

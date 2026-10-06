@@ -40,12 +40,16 @@ namespace Y4NGZUpgrades.Patches
 
             if (node.maxRange <= 0) return;
 
-            int tier = FieldOpticsUpgrade.GetTier();
-            if (tier <= 0) return;
+            // #435: gate on the multiplier, never on the rank. In LGU-preferred mode Field Optics
+            // keeps only the lamp and this multiplier is neutral, so the patch must not touch
+            // maxRange at all - the Mathf.Max floor below would otherwise still move a node whose
+            // maxRange sits at or below minRange.
+            float multiplier = FieldOpticsUpgrade.GetRangeMultiplier();
+            if (multiplier <= 1f) return;
 
             __state = node.maxRange;
             node.maxRange = Mathf.Max(node.minRange + 1,
-                Mathf.CeilToInt(node.maxRange * FieldOpticsUpgrade.GetRangeMultiplier()));
+                Mathf.CeilToInt(node.maxRange * multiplier));
         }
 
         [HarmonyPatch(typeof(HUDManager), "MeetsScanNodeRequirements")]
@@ -61,6 +65,13 @@ namespace Y4NGZUpgrades.Patches
         private static void ApplyTransporterCarryWeight(PlayerControllerB __instance)
         {
             if (!IsLocalPlayer(__instance)) return;
+
+            // F-ENF-8: at tier 0 the multiplier is 1.0, so this postfix used to own carryWeight for
+            // every player whether or not they bought Transporter - recomputing and reassigning it
+            // every frame, which silently stomps any other weight-affecting mod's modifier for no
+            // gain of our own. Own the field only while we are actually changing it.
+            int tier = TransporterUpgrade.GetTier();
+            if (tier <= 0) return;
 
             float penalty = GetCarriedItemWeightPenalty(__instance);
             float multiplier = TransporterUpgrade.GetCarryWeightMultiplier();
@@ -80,13 +91,18 @@ namespace Y4NGZUpgrades.Patches
             GrabbableObject attemptingGrab,
             ref int __result)
         {
-            if (!OptionalPluginCapabilities.NativeInventoryAvailable) return;
+            // F-ENF-10: NativeInventoryAvailable only means "HotbarPlus is absent". The slots (and
+            // therefore the two-handed limit that goes with them) only actually exist when the v81
+            // scroll-RPC IL contract validated, which is what NativeSlotsEnabled reports.
+            if (!ExtraSlotManager.NativeSlotsEnabled) return;
             if (__result == -1) return;
             if (!IsLocalPlayer(__instance)) return;
             if (attemptingGrab == null || attemptingGrab.itemProperties == null) return;
             if (!attemptingGrab.itemProperties.twoHanded) return;
 
-            int allowed = NativeInventoryModel.GetTwoHandedLimit(ExtraSlotUpgrade.GetTier());
+            // #435: the allowance, not the rank. The unique-only variant sells the same three
+            // hotbar ranks but never the second two-handed item, which is LGU Deeper Pockets'.
+            int allowed = NativeInventoryModel.GetTwoHandedLimit(ExtraSlotUpgrade.CanCarryTwoTwoHandedItems());
             if (CountTwoHandedItems(__instance) >= allowed)
                 __result = -1;
         }
@@ -100,6 +116,8 @@ namespace Y4NGZUpgrades.Patches
             __state = null;
             if (!CanRelaxTwoHandedHandsFull(__instance)) return;
             if (CountTwoHandedItems(__instance) >= 2) return;
+            // F-ENF-10: only a second TWO-HANDED item earns the relaxation.
+            if (!GrabTargetIsTwoHanded(__instance)) return;
 
             __state = new SlotSwitchScope(__instance);
         }
@@ -160,9 +178,66 @@ namespace Y4NGZUpgrades.Patches
         private static bool CanRelaxTwoHandedHandsFull(PlayerControllerB player)
         {
             return IsLocalPlayer(player)
-                && OptionalPluginCapabilities.NativeInventoryAvailable
+                // F-ENF-10: same gate correction as LimitTwoHandedInventory. Under the failed-IL
+                // path the inventory stays at four slots, so the relaxation must stay off too.
+                && ExtraSlotManager.NativeSlotsEnabled
                 && ExtraSlotUpgrade.CanCarryTwoTwoHandedItems()
                 && player.twoHanded;
+        }
+
+        /// <summary>
+        /// F-ENF-10: Deeper Pockets L3 promises "you can carry two two-handed items at once", not
+        /// "you can grab anything while your hands are full". Vanilla's BeginGrabObject bails on
+        /// `twoHanded` before it ever resolves the grabbed object, so clearing the flag in the
+        /// prefix also let a shotgun-carrying player scoop up one-handed scrap. The raycast below
+        /// mirrors vanilla's own so the relaxation only opens for a genuinely two-handed target;
+        /// it runs once per interact press, not per frame.
+        /// </summary>
+        private static bool GrabTargetIsTwoHanded(PlayerControllerB player)
+        {
+            if (player == null || player.gameplayCamera == null) return false;
+
+            Transform camera = player.gameplayCamera.transform;
+            RaycastHit hit;
+            if (!Physics.Raycast(new Ray(camera.position, camera.forward), out hit, player.grabDistance, GetInteractableObjectsMask()))
+                return false;
+
+            Collider collider = hit.collider;
+            if (collider == null || collider.gameObject.layer == 8 || !collider.CompareTag("PhysicsProp"))
+                return false;
+
+            GrabbableObject target = collider.transform.gameObject.GetComponent<GrabbableObject>();
+            return target != null && target.itemProperties != null && target.itemProperties.twoHanded;
+        }
+
+        // PlayerControllerB.interactableObjectsMask is private; read it once by reflection and fall
+        // back to the v81 literal so a field rename degrades to vanilla's mask rather than throwing.
+        private const int VanillaInteractableObjectsMask = 1073742656;
+        private static int _interactableObjectsMask;
+
+        private static int GetInteractableObjectsMask()
+        {
+            if (_interactableObjectsMask != 0) return _interactableObjectsMask;
+
+            _interactableObjectsMask = VanillaInteractableObjectsMask;
+            try
+            {
+                System.Reflection.FieldInfo field =
+                    AccessTools.Field(typeof(PlayerControllerB), "interactableObjectsMask");
+                PlayerControllerB local = GameNetworkManager.Instance?.localPlayerController;
+                if (field != null && field.FieldType == typeof(int) && local != null)
+                {
+                    int value = (int)field.GetValue(local);
+                    if (value != 0)
+                        _interactableObjectsMask = value;
+                }
+            }
+            catch (Exception error)
+            {
+                Plugin.Log?.LogWarning($"ScannerTransporterPatch: interactableObjectsMask probe failed ({error.Message}); using the v81 literal.");
+            }
+
+            return _interactableObjectsMask;
         }
 
         private static bool IsLocalPlayer(PlayerControllerB player)
@@ -191,7 +266,17 @@ namespace Y4NGZUpgrades.Patches
         private static float GetItemWeightPenalty(GrabbableObject item)
         {
             if (item == null || item.itemProperties == null) return 0f;
-            return Mathf.Max(0f, item.itemProperties.weight - 1f);
+            // F-ENF-8: vanilla accumulates the SIGNED (weight - 1f) - BeginGrabObject does
+            // `carryWeight = Clamp(carryWeight + (weight - 1f), 1f, 10f)` - so a sub-1.0-weight item
+            // subtracts. Clamping at zero made those items merely free instead of beneficial; the
+            // caller still applies vanilla's [1, 10] clamp to the total.
+            //
+            // Transporter recomputes the whole figure from scratch every frame, which makes it the
+            // last writer of carryWeight. LGU's Back Muscles reduce-weight mode rewrites the same
+            // vanilla arithmetic and writes the field absolutely on purchase, so the recomputation
+            // has to apply its per-item reduction too or it silently deletes that upgrade. In Back
+            // Muscles' other two modes - and with LGU absent - this is the unchanged value.
+            return LguEffectCompatibility.ComposeItemWeightPenalty(item.itemProperties.weight - 1f);
         }
 
         private static int CountTwoHandedItems(PlayerControllerB player)

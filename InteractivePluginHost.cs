@@ -29,15 +29,10 @@ namespace Y4NGZUpgrades.Interactive
 
         // The whole 'Crosshair' section moved to BetterArmory with the crosshair (#266).
 
-        public static ConfigEntry<bool> DangerFeedbackEnabled;
-        public static ConfigEntry<bool> DangerFeedbackDirectionalDamageEnabled;
-        public static ConfigEntry<bool> DangerFeedbackLowHealthEnabled;
-        public static ConfigEntry<bool> DangerFeedbackHeartbeatEnabled;
-        public static ConfigEntry<int> DangerFeedbackLowHealthThreshold;
 
         public static ConfigEntry<bool> WorldFeedbackEnabled;
-        // 'Interaction Reticle Enabled' moved to BetterArmory: the interaction cue is drawn by
-        // CombatReticleHud, which is the same object as the weapon crosshair (#266).
+        // 'Interaction Reticle Enabled' stays BetterArmory-owned: its provider supplies the value
+        // to Y4NGZUI, while the retained local renderer reads it on standalone installs.
         public static ConfigEntry<bool> WorldFeedbackScrapPickupEnabled;
         public static ConfigEntry<bool> WorldFeedbackHighValueGlintEnabled;
         public static ConfigEntry<bool> WorldFeedbackNearMissWhooshEnabled;
@@ -54,10 +49,11 @@ namespace Y4NGZUpgrades.Interactive
             Log = log;
             UiTheme.Initialize();
             GameplayUiVisibility.Initialize();
+            Y4ngzPromptOverlay.Initialize();
             GameplayHudMotion.Initialize();
-            // The local facade owns the standalone defaults and mirrors the
-            // Contracted theme when that optional provider is present. This side
-            // registers the gameplay hook that tints protected hotbar slots.
+            // The local facade owns standalone defaults, probes Y4NGZUI first, and retains the
+            // Contracted facade as compatibility fallback. This side registers the gameplay hook
+            // that tints protected hotbar slots.
             UiTheme.ProtectedSlotResolver = slot =>
                 DeathboundUpgrade.IsUnlocked() && slot == DeathboundUpgrade.PROTECTED_SLOT_INDEX;
             UiTheme.ThemeChanged += OnThemeChanged;
@@ -71,10 +67,10 @@ namespace Y4NGZUpgrades.Interactive
 
         internal static void Shutdown()
         {
-            // The reticle, its classifier and the crosshair signal bridge shut down inside
-            // BetterArmory now (#266).
-            DirectionalDamageHud.DestroyInstance();
-            PlayerDangerHud.DestroyInstance();
+            // BetterArmory shuts down its provider/fallback renderer, classifier, and signal
+            // bridge. Upgrades owns only the prompt/danger producer bridges here.
+            OptionalDangerHudBridge.Shutdown();
+            Y4ngzPromptOverlay.Shutdown();
             CommandNetPatch.ShutdownPresentation();
             UiTheme.ThemeChanged -= OnThemeChanged;
             GameplayUiVisibility.VisibilityChanged -= OnGameplayUiVisibilityChanged;
@@ -96,10 +92,9 @@ namespace Y4NGZUpgrades.Interactive
         private static void OnGameplayUiVisibilityChanged(bool visible)
         {
             Y4ngzPromptOverlay.SetPresentationVisible(visible);
-            // The ammo counter and the weapon reticle follow this from BetterArmory's own poll of
-            // GameplayUiVisibility across its theming bridge (#266, #267) rather than from here.
-            DirectionalDamageHud.SetPresentationVisible(visible);
-            PlayerDangerHud.SetPresentationVisible(visible);
+            // The ammo counter and selected reticle renderer also follow BetterArmory's poll of the
+            // Y4NGZUI-first visibility bridge (#266, #267).
+            OptionalDangerHudBridge.SetPresentationVisible(visible);
             CommandNetPatch.SetPresentationVisible(visible);
         }
 

@@ -26,10 +26,13 @@ namespace Y4NGZUpgrades
         /// <summary>
         /// True when <paramref name="creditedClientId"/> was credited INDIVIDUALLY by this event.
         ///
-        /// COVERAGE, and it is deliberately narrow: the marker is currently emitted by the survey
-        /// publisher alone. Newer personal counters use their own provider-specific attribution
-        /// seams (for example, the Blackout actor latch) or intentionally follow the provider's
-        /// crew-fallback semantics; they do not call this helper.
+        /// COVERAGE, and it is deliberately narrow: it needs an id that ends in the credited
+        /// player on BOTH paths, which today is the survey placement alone. The whistleblower and
+        /// breach-drill fan-outs carry the marker too (Company #1201), but their attributed ids
+        /// key on the subject and carry no player, so this would reject a real placement; those
+        /// counters gate on <see cref="IsCrewFanOut"/> instead. Newer personal counters use their
+        /// own provider-specific attribution seams (for example, the Blackout actor latch) or
+        /// intentionally follow the provider's crew-fallback semantics; they do not call this.
         ///
         /// So this is NOT a general "was this attributed" oracle, and must not be used as one. An
         /// unmarked fan-out id from some other kind reads as individually attributed here. Any
@@ -48,6 +51,19 @@ namespace Y4NGZUpgrades
                 return false;
 
             return eventId.IndexOf(CrewFanOutMarker, StringComparison.Ordinal) < 0;
+        }
+
+        /// <summary>
+        /// True when <paramref name="eventId"/> has the fan-out shape: the host credited it to a
+        /// participant because no actor was known, so it is not a personal act on any machine.
+        /// The gate for a personal counter whose attributed id carries no player suffix - the
+        /// breach drill (Company #1201). The event already reached this machine through the
+        /// local-player filter, so the marker is the only thing left to decide.
+        /// </summary>
+        internal static bool IsCrewFanOut(string eventId)
+        {
+            return !string.IsNullOrEmpty(eventId)
+                && eventId.IndexOf(CrewFanOutMarker, StringComparison.Ordinal) >= 0;
         }
     }
 }

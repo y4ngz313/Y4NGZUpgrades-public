@@ -9,10 +9,10 @@ namespace Y4NGZUpgrades
     /// Every read from Y4NGZUpgrades into Better Armory (#267), and the mirror image of Better
     /// Armory's own <c>UpgradesBridge</c>.
     ///
-    /// Neither assembly references the other, so all three of Better Armory's declared APIs —
-    /// <c>ArmoryPrizeApi</c> (LUCKY-8 prizes), <c>ArmoryAmmoReserveApi</c> (the Employee File's
-    /// AMMUNITION panel) and <c>ArmoryPresentationApi</c> (the held-item stow's presentation stop) —
-    /// are bound here by full type name, once, and cached. A member that cannot be resolved logs one
+    /// Neither assembly references the other. Better Armory's prize, ammo reserve, presentation
+    /// and optional weapon-hosting capabilities are bound here by full type name, once, and
+    /// cached. Capability results are read live so local settings remain authoritative.
+    /// A required member that cannot be resolved logs one
     /// warning for the session and then permanently returns the value that means "Better Armory is
     /// not here": empty pools, no prefab, a zero balance, nothing to stop. Every one of those is a
     /// legitimate state on an Upgrades-only install, which is why no caller needs a second code path.
@@ -27,6 +27,7 @@ namespace Y4NGZUpgrades
         private const string PrizeApiTypeName = "Y4NGZUpgrades.Weapons.ArmoryPrizeApi";
         private const string AmmoApiTypeName = "Y4NGZUpgrades.Weapons.ArmoryAmmoReserveApi";
         private const string PresentationApiTypeName = "Y4NGZUpgrades.Weapons.ArmoryPresentationApi";
+        private const string HostingApiTypeName = "Y4NGZUpgrades.Weapons.WeaponHostingApi";
 
         private static readonly string[] NoIds = new string[0];
         private static readonly Type[] OneString = { typeof(string) };
@@ -149,6 +150,33 @@ namespace Y4NGZUpgrades
 
             try { method.Invoke(null, new object[] { player }); }
             catch (Exception ex) { Warn("StopPresentationForHeldItemStow", ex); }
+        }
+
+        // -- Incoming firearm resistance (upgrade descriptions) ---------------------------------
+
+        private static readonly Lazy<Func<bool>> IncomingFirearmResistance = new Lazy<Func<bool>>(() =>
+        {
+            Type type = FindType(HostingApiTypeName);
+            MethodInfo method = type?.GetMethod(
+                "IsIncomingFirearmResistanceAvailable",
+                BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+            // Older Better Armory versions legitimately lack this optional capability.
+            return method?.ReturnType == typeof(bool)
+                ? (Func<bool>)Delegate.CreateDelegate(typeof(Func<bool>), method)
+                : null;
+        });
+
+        internal static bool SupportsIncomingFirearmResistance
+        {
+            get
+            {
+                try { return IncomingFirearmResistance.Value?.Invoke() ?? false; }
+                catch (Exception ex)
+                {
+                    Warn("IsIncomingFirearmResistanceAvailable", ex);
+                    return false;
+                }
+            }
         }
 
         // -- Plumbing ----------------------------------------------------------------------------

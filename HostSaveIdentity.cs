@@ -121,6 +121,20 @@ namespace Y4NGZUpgrades
                     Plugin.Log?.LogWarning(
                         "[HostSaveIdentity] Host never sent a save identity; falling back to this " +
                         "client's own save scope (host is probably running an older build).");
+
+                    // F-INFRA-2: the fallback is a store-scope change like any other. Without this
+                    // the stores stay pointed at nothing - StartOfRound.Start already tried and
+                    // failed - and every upgrade reads level 0 for the whole lobby. The latch makes
+                    // the re-entrant SaveKey calls the re-point makes observe the decision above.
+                    mutatingStores = true;
+                    try
+                    {
+                        RepointLiveStores();
+                    }
+                    finally
+                    {
+                        mutatingStores = false;
+                    }
                 }
 
                 return HostSaveScope.UseLocalSave;
@@ -358,6 +372,11 @@ namespace Y4NGZUpgrades
             TryRun(() => Y4NGZUpgradeManager.SwitchToCurrentSave(), "upgrade re-point");
             TryRun(PlayerLevelStore.Reload, "player-level re-point");
             TryRun(EmployeeStatistics.SwitchToCurrentSave, "employee-file re-point");
+            // F-INFRA-3: whatever tiers the host has cached for this client were published from the
+            // ConnectClientToPlayerObject postfix, while the store was still unpointed - i.e. six
+            // zeros. SwitchToCurrentSave now raises UpgradesChanged on a real scope change, but a
+            // re-point that lands on the same key must re-publish too, so say it explicitly here.
+            TryRun(Patches.UpgradeTierSync.BroadcastLocalTiers, "upgrade tier re-broadcast");
             // BetterArmory's ammo reserve re-points off this event (#266).
             TryRun(SaveIdentityApi.RaiseStoresRepointed, "cross-plugin store re-point");
         }
@@ -490,6 +509,21 @@ namespace Y4NGZUpgrades
             }
             finally
             {
+                // F-INFRA-10: vanilla Disconnect has already run SaveGame(), so the ES3 file a
+                // pending identity was reserved for now exists on disk. Resolve once more - that is
+                // what promotes the reserved GUID into the file - before the reservation is
+                // dropped. Otherwise the next boot mints a fresh GUID, the old row becomes an
+                // orphan and SaveDataLifecycle.ReconcileOrphans deletes the session's progress.
+                try
+                {
+                    SaveKey.TryGetCurrent(out _);
+                }
+                catch (Exception e)
+                {
+                    Plugin.Log?.LogWarning(
+                        $"[HostSaveIdentity] pending save identity could not be promoted: {e.Message}");
+                }
+
                 SaveKey.ClearPendingIdentities();
             }
         }

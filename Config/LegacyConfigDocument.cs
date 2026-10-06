@@ -76,6 +76,11 @@ namespace Y4NGZUpgrades.Config
             {
                 parsed = single;
             }
+            // Match BepInEx's Enum.Parse semantics, including numeric values already valid in config.
+            else if (type.IsEnum && Enum.TryParse(type, raw, true, out object member))
+            {
+                parsed = member;
+            }
             else
             {
                 return false;

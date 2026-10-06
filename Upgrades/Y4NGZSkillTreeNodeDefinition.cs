@@ -17,7 +17,8 @@ namespace Y4NGZUpgrades.Upgrades
             string displayName = null,
             string prerequisiteUpgradeId = null,
             IEnumerable<string> prerequisiteUpgradeIds = null,
-            IEnumerable<string> connectionUpgradeIds = null)
+            IEnumerable<string> connectionUpgradeIds = null,
+            bool flatCatalog = false)
         {
             UpgradeId = Y4NGZUpgradeDefinition.NormalizeId(upgradeId);
             TreeClass = treeClass;
@@ -28,6 +29,7 @@ namespace Y4NGZUpgrades.Upgrades
                 ? UpgradeId
                 : Y4NGZUpgradeDefinition.NormalizeId(iconKey);
             GateRequirement = Math.Max(0, gateRequirement);
+            FlatCatalog = flatCatalog;
             DisplayName = string.IsNullOrWhiteSpace(displayName)
                 ? upgradeId ?? string.Empty
                 : displayName;
@@ -56,6 +58,13 @@ namespace Y4NGZUpgrades.Upgrades
         public int Row { get; }
         public string IconKey { get; }
         public int GateRequirement { get; }
+
+        /// <summary>
+        /// This node lives in the flat Augments catalog instead of its class tree (#435): no
+        /// branch lines, no class-investment gate, and it contributes nothing to class
+        /// investment. Its authored tier stays put - that is price and placement metadata.
+        /// </summary>
+        public bool FlatCatalog { get; }
         public string DisplayName { get; }
         public string PrerequisiteUpgradeId { get; }
         public IReadOnlyList<string> PrerequisiteUpgradeIds { get; }

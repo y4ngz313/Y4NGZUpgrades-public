@@ -42,6 +42,13 @@ namespace Y4NGZUpgrades
             = Array.Empty<ProgressionReportSource>();
 
         /// <summary>
+        /// #1201: the crew-award XP inside <see cref="LastRoundBreakdown"/>'s awarded total that
+        /// no report line and no remainder shows - the crew amounts handed to Company plus the
+        /// <c>crew.</c> sources. The standalone composer subtracts it from its remainder.
+        /// </summary>
+        internal static int LastRoundHiddenXp { get; private set; }
+
+        /// <summary>
         /// The finalized round sequence the report-source snapshot describes. Zero invalidates
         /// the snapshot on disabled, abandoned, or newly started rounds.
         /// </summary>
@@ -737,6 +744,45 @@ namespace Y4NGZUpgrades
         }
 
         /// <summary>
+        /// Pays the LOCAL player for restoring Ship Systems power at the battery socket (#459).
+        /// The host already decided the restore counts - power was down, and the restorer did not
+        /// break the battery - and delivered it here, on the actor's own machine. This side owns
+        /// the actor's config: the enable switch, the two amounts and the per-round cap.
+        /// <paramref name="eventKey"/> is the host's per-restore identity, so a replayed delivery
+        /// cannot pay or burn a capped slot twice.
+        /// </summary>
+        internal static void RecordShipBatteryRestore(bool usedApparatus, string eventKey)
+        {
+            Config.ProgressionSettings config = Plugin.ProgressionConfig;
+            if (!IsEnabled() || config.ShipBatteryEnabled.Value == false || !_latch.Active || _latch.Finalized
+                || string.IsNullOrWhiteSpace(eventKey) || _round.ShipBatteryRestoreKeys.Contains(eventKey))
+                return;
+
+            int xp = ShipBatteryXpPolicy.ComputeRestoreXp(
+                usedApparatus,
+                config.ShipBatteryReplaceXp.Value,
+                config.ShipBatteryApparatusDockXp.Value,
+                _round.ShipBatteryRestoresPaid,
+                config.ShipBatteryMaxPerRound.Value);
+            if (xp <= 0)
+            {
+                LogDebug($"Ship battery restore '{eventKey}' declined at {_round.ShipBatteryRestoresPaid}/{config.ShipBatteryMaxPerRound.Value}.");
+                return;
+            }
+
+            _round.ShipBatteryRestoreKeys.Add(eventKey);
+            _round.ShipBatteryRestoresPaid++;
+            _round.ShipBatteryXp = AddClamped(_round.ShipBatteryXp, xp);
+            _round.AddReportSource(
+                usedApparatus ? "ship.apparatus.docked" : "ship.battery.replaced",
+                usedApparatus ? ProgressionReportSourceKind.ShipApparatusDocked : ProgressionReportSourceKind.ShipBatteryReplaced,
+                string.Empty,
+                count: 1,
+                amount: xp);
+            LogDebug($"Ship battery restore '{eventKey}' apparatus={usedApparatus} xp={xp} ({_round.ShipBatteryRestoresPaid}/{config.ShipBatteryMaxPerRound.Value}).");
+        }
+
+        /// <summary>
         /// DISCOVERY bucket only. GrabItem fires only on the grabbing player's own machine
         /// (GrabItemOnClient is owner-only, and vanilla scrap does not set syncGrabFunction),
         /// so first-lift here means "first lift this peer saw", not a crew-wide first lift.
@@ -765,12 +811,15 @@ namespace Y4NGZUpgrades
                 return;
 
             _round.ScrapPickupXp += xp;
+            // #456: one discovery line per round, carrying the haul's credits. The report amount
+            // is the sum of the same per-item awards the XP bar was paid, so the two reconcile.
             _round.AddReportSource(
-                "scrap.discovered." + NormalizeReportKeyPart(GetItemName(item)),
+                "scrap.discovered",
                 ProgressionReportSourceKind.ScrapDiscovered,
-                GetItemName(item),
+                string.Empty,
                 count: 1,
-                amount: xp);
+                amount: xp,
+                value: Mathf.Max(0, item.scrapValue));
             LogDebug($"Scrap first pickup '{GetItemName(item)}' value={item.scrapValue} xp={xp}.");
         }
 
@@ -807,8 +856,10 @@ namespace Y4NGZUpgrades
                 return;
 
             _round.MonsterKillXp += xp;
+            // #456: one kill line per round. The enemy name survives while the round killed one
+            // type; a second type collapses the subject so the line reads "Killed 3 monsters".
             _round.AddReportSource(
-                "monster.killed." + NormalizeReportKeyPart(GetEnemyName(enemy)),
+                "monster.killed",
                 ProgressionReportSourceKind.MonsterKill,
                 GetEnemyName(enemy),
                 count: 1,
@@ -817,8 +868,8 @@ namespace Y4NGZUpgrades
         }
 
         /// <summary>
-        /// Base XP for completing a contract: 20% (configurable) of the completing player's rank
-        /// XP width, times the per-contract-type multiplier.
+        /// Base XP for completing a contract: a fraction (10% by default) of the completing
+        /// player's rank XP width, times the per-contract-type multiplier.
         ///
         /// The width is read from the rank the player held AT ROUND START, pinned in
         /// <see cref="BeginRound"/>. Rank XP only ever moves in FinalizeRound, so at event time
@@ -826,6 +877,12 @@ namespace Y4NGZUpgrades
         /// payout - a player who crosses a rank boundary on this round's XP is still paid the
         /// completion award of the rank they actually did the contract in, whatever order the
         /// buckets happen to settle in.
+        ///
+        /// #457: it is also PARTICIPATION-gated. Company fans the outcome out to the whole crew,
+        /// so without this a player who stayed in the ship all round - or joined late - collected
+        /// the same completion award as the crew that ran the contract. Taking part means
+        /// entering the facility or earning contract act XP; both are recorded during the round,
+        /// and the outcome event is priced at round end, so the answer is already complete here.
         ///
         /// The result is BASE contract XP. It goes into the same round contract bucket as every
         /// other contract award and is scaled by the moon risk multiplier exactly once, at
@@ -837,10 +894,62 @@ namespace Y4NGZUpgrades
             if (config == null || !config.IsContractSourceEnabled("ContractCompleted"))
                 return 0;
 
+            if (!ProgressionEconomyMath.IsEligibleForContractCompletionXp(
+                    LocalPlayerEnteredFacility(),
+                    _round.ContractActXp > 0))
+            {
+                LogDebug("Contract completion declined: the local player entered no facility and earned no act XP.");
+                return 0;
+            }
+
             return ProgressionEconomyMath.ComputeContractCompletionXp(
                 RankCatalog.GetRankWidth(ResolveCompletionRankIndex()),
                 config.ContractCompletionRankWidthFraction.Value,
                 config.GetContractCompletedMultiplier(contractType));
+        }
+
+        /// <summary>
+        /// The price of one contract ACT (#457). A kind the rebalance does not scale - the small
+        /// repeatable credits, and anything a newer Company publishes - is paid its flat award
+        /// unchanged.
+        ///
+        /// The rank basis is the completion award's, so the actor's act and the crew's completion
+        /// share are always quoted against the same band.
+        /// </summary>
+        internal static int GetContractActXp(string eventKind, int flatXp)
+        {
+            Config.ProgressionSettings config = Plugin.ProgressionConfig;
+            if (config == null || flatXp <= 0 || !ContractActCatalog.TryGet(eventKind, out ContractActCatalog.Row row))
+                return flatXp;
+
+            float fraction = row.Scaling == ContractActCatalog.ActScaling.Headline
+                ? config.ContractHeadlineRankWidthFraction.Value
+                : config.ContractStepRankWidthFraction.Value;
+            return ProgressionEconomyMath.ComputeContractActXp(
+                flatXp, RankCatalog.GetRankWidth(ResolveCompletionRankIndex()), fraction);
+        }
+
+        /// <summary>
+        /// The Payload piloting ceiling for this round (#457): piloting pays per second, so the
+        /// rank band raises the CAP rather than the rate.
+        /// </summary>
+        internal static int GetPayloadPilotMaxXp()
+        {
+            Config.ProgressionSettings config = Plugin.ProgressionConfig;
+            if (config == null)
+                return 0;
+
+            return ProgressionEconomyMath.ComputePayloadPilotCap(
+                config.PayloadPilotMaxXp.Value,
+                RankCatalog.GetRankWidth(ResolveCompletionRankIndex()),
+                config.ContractHeadlineRankWidthFraction.Value);
+        }
+
+        private static bool LocalPlayerEnteredFacility()
+        {
+            PlayerControllerB local = GameNetworkManager.Instance?.localPlayerController
+                ?? StartOfRound.Instance?.localPlayerController;
+            return local != null && _round.FacilityEntrants.Contains(local.actualClientId);
         }
 
         /// <summary>
@@ -872,7 +981,7 @@ namespace Y4NGZUpgrades
         /// </summary>
         internal static bool AddContractXp(string key, string label, int amount, bool oncePerRound)
         {
-            return AddContractXp(key, label, amount, oncePerRound, eventKind: null);
+            return AddContractXp(key, label, amount, oncePerRound, eventKind: null, crewWide: false);
         }
 
         /// <summary>
@@ -886,8 +995,13 @@ namespace Y4NGZUpgrades
         /// names no event — still occupies a bucket, under the empty key. It maps to no line and
         /// is never reported, but it must stay in the reconciliation input or its share of the
         /// scaled total would be spread over the lines that ARE reported and overstate them.
+        ///
+        /// #1201: <paramref name="crewWide"/> is Company's per-occurrence <c>CrewWide</c> flag - a
+        /// crew award every player in the round received. It only moves the award into a separate
+        /// reporting bucket, so the report can hide it; payout, source gating and the #457
+        /// participation gate still read the plain kind.
         /// </summary>
-        internal static bool AddContractXp(string key, string label, int amount, bool oncePerRound, string eventKind)
+        internal static bool AddContractXp(string key, string label, int amount, bool oncePerRound, string eventKind, bool crewWide)
         {
             if (!IsEnabled()
                 || Plugin.ProgressionConfig?.IsContractSourceEnabled(eventKind) != true
@@ -900,6 +1014,12 @@ namespace Y4NGZUpgrades
                 return false;
 
             _round.ContractXp += amount;
+            _round.AddContractXpForKind(ProgressionReportLineKeys.ContractBucket(eventKind, crewWide), amount);
+            // #457: the completion gate asks whether this player took part. Only a NAMED act kind
+            // answers that: the outcome awards are the thing being gated, and the unnamed public
+            // API bucket names no event and could have been granted to a ship-sitter.
+            if (ContractActCatalog.CountsAsParticipation(eventKind))
+                _round.ContractActXp += amount;
             LogDebug($"Contract XP '{label ?? resolvedKey}' +{amount}.");
             return true;
         }
@@ -916,7 +1036,7 @@ namespace Y4NGZUpgrades
         /// </summary>
         internal static void AddCappedContractXp(string key, string label, int xpPerCredit, string capBucket, int maxPerRound)
         {
-            AddCappedContractXp(key, label, xpPerCredit, capBucket, maxPerRound, eventKind: null);
+            AddCappedContractXp(key, label, xpPerCredit, capBucket, maxPerRound, eventKind: null, crewWide: false);
         }
 
         /// <inheritdoc cref="AddCappedContractXp(string,string,int,string,int)"/>
@@ -926,7 +1046,8 @@ namespace Y4NGZUpgrades
             int xpPerCredit,
             string capBucket,
             int maxPerRound,
-            string eventKind)
+            string eventKind,
+            bool crewWide)
         {
             string resolvedKey = string.IsNullOrWhiteSpace(key) ? label : key;
             if (string.IsNullOrWhiteSpace(resolvedKey))
@@ -944,7 +1065,7 @@ namespace Y4NGZUpgrades
             // The bucket advances only on a real payment, so a duplicate event id -- the client
             // replay channel overlapping the live mirror -- cannot consume a capped slot, and
             // neither can an award refused because the round is over or progression is disabled.
-            if (!AddContractXp(resolvedKey, label, amount, oncePerRound: true, eventKind))
+            if (!AddContractXp(resolvedKey, label, amount, oncePerRound: true, eventKind, crewWide))
                 return;
 
             _round.CappedContractCredits[bucket] = paid + 1;
@@ -1007,6 +1128,7 @@ namespace Y4NGZUpgrades
                 _round.SurvivalXp,
                 _round.MainframeHackXp,
                 _round.ClutchXp,
+                _round.ShipBatteryXp,
                 _round.ContractXp,
                 _round.BodyRetrievalXp);
             int contractAwarded = ProgressionEconomyMath.ScaleContractXp(_round.ContractXp, _round.MoonMultiplier);
@@ -1018,6 +1140,7 @@ namespace Y4NGZUpgrades
                 _round.SurvivalXp,
                 _round.MainframeHackXp,
                 _round.ClutchXp,
+                _round.ShipBatteryXp,
                 _round.ContractXp,
                 _round.BodyRetrievalXp,
                 _round.MoonMultiplier);
@@ -1041,6 +1164,7 @@ namespace Y4NGZUpgrades
                 SurvivalXp = _round.SurvivalXp,
                 MainframeHackXp = _round.MainframeHackXp,
                 ClutchXp = _round.ClutchXp,
+                ShipBatteryXp = _round.ShipBatteryXp,
                 ContractXp = _round.ContractXp,
                 ContractXpAwarded = contractAwarded,
                 BodyRetrievalXp = _round.BodyRetrievalXp,
@@ -1055,9 +1179,33 @@ namespace Y4NGZUpgrades
                 CurrencyGranted = currencyGranted
             };
 
-            AddFinalizedReportSources(bodyAwarded, contractAwarded);
+            // #392: each contract act's share of the scaled bucket goes to the report line
+            // Company already writes for that act; only what maps to no Company line stays on
+            // this plugin's contract note. Recorded from inside the payout, which the latch
+            // admits once per round, so Company's summing sink is never double-fed - and this
+            // runs a frame or more before Company reads it (FillEndGameStats prefix or the
+            // RoundEnded handler; Company reads on the frame after FillEndGameStats).
+            IReadOnlyList<KeyValuePair<string, int>> companyLines = ProgressionReportLineKeys.BuildContractLineAmounts(
+                _round.ContractXpKindOrder,
+                _round.ContractXpByKind,
+                contractAwarded);
+            int contractDecoratedByCompany = CompanyReportXpBridge.Record(
+                ProgressionPerformanceReportUi.GetLocalPlayerIndex(),
+                companyLines,
+                out int crewWideHandedToCompany);
+            if (contractDecoratedByCompany > 0)
+                LogDebug($"Handed {contractDecoratedByCompany} of {contractAwarded} contract XP to Company's report lines ({companyLines.Count} line(s)).");
+            AddFinalizedReportSources(bodyAwarded, Mathf.Max(0, contractAwarded - contractDecoratedByCompany));
             LastRoundReportSources = _round.BuildReportSources();
+            LastRoundHiddenXp = crewWideHandedToCompany + ProgressionReportNotePlan.SumCrewWide(LastRoundReportSources);
             LastRoundReportSequence = LastRoundBreakdown.RoundSequence;
+            int localReportSlot = ProgressionPerformanceReportUi.GetLocalPlayerIndex();
+            CompanyReportXpBridge.RecordSources(localReportSlot,
+                LastRoundReportSources, awarded, LastRoundReportSequence);
+            // #458: the same presentation to the crew, so every report shows this player's own
+            // lines on this player's row. Presentation only; nothing here changes the payout.
+            Patches.ProgressionReportShareNetwork.PublishLocal(localReportSlot, awarded,
+                LastRoundReportSources, LastRoundReportSequence, companyLines);
 
             _latch.CompleteFinalize();
             Save();
@@ -1094,6 +1242,7 @@ namespace Y4NGZUpgrades
         private static void ClearLastRoundReportLines()
         {
             LastRoundReportSources = Array.Empty<ProgressionReportSource>();
+            LastRoundHiddenXp = 0;
             LastRoundReportSequence = 0;
         }
 
@@ -1121,7 +1270,7 @@ namespace Y4NGZUpgrades
             if (log == null)
                 return string.Empty;
 
-            return $"XP +{log.AwardedTotal}  FOUND +{log.ScrapPickupXp} | SCRAP +{log.ScrapDeliveredXp} | KILLS +{log.MonsterKillXp} | SURV +{log.SurvivalXp} | HACK +{log.MainframeHackXp} | CLUTCH +{log.ClutchXp} | BODIES +{log.BodyRetrievalXpAwarded} ({log.BodyRetrievalXp} x{log.MoonMultiplier:0.##}) | CONTRACT +{log.ContractXpAwarded} ({log.ContractXp} x{log.MoonMultiplier:0.##})";
+            return $"XP +{log.AwardedTotal}  FOUND +{log.ScrapPickupXp} | SCRAP +{log.ScrapDeliveredXp} | KILLS +{log.MonsterKillXp} | SURV +{log.SurvivalXp} | HACK +{log.MainframeHackXp} | CLUTCH +{log.ClutchXp} | BATTERY +{log.ShipBatteryXp} | BODIES +{log.BodyRetrievalXpAwarded} ({log.BodyRetrievalXp} x{log.MoonMultiplier:0.##}) | CONTRACT +{log.ContractXpAwarded} ({log.ContractXp} x{log.MoonMultiplier:0.##})";
         }
 
         private static RoundXpBreakdown BuildEmptyBreakdown()
@@ -1139,7 +1288,12 @@ namespace Y4NGZUpgrades
             };
         }
 
-        private static void AddFinalizedReportSources(int bodyAwarded, int contractAwarded)
+        /// <summary>
+        /// <paramref name="contractUnreported"/> is the contract XP no Company line carries
+        /// (#392): the crew-wide outcome award and API awards, or the whole bucket when Company
+        /// is not loaded. Zero writes no contract note at all.
+        /// </summary>
+        private static void AddFinalizedReportSources(int bodyAwarded, int contractUnreported)
         {
             PlayerControllerB local = GameNetworkManager.Instance?.localPlayerController
                 ?? StartOfRound.Instance?.localPlayerController;
@@ -1178,14 +1332,29 @@ namespace Y4NGZUpgrades
                     amount: _round.ClutchXp);
             }
 
-            if (contractAwarded > 0)
+            if (contractUnreported > 0)
             {
-                _round.AddReportSource(
-                    "contract.objectives",
-                    ProgressionReportSourceKind.Contract,
-                    "Completed contract work",
-                    count: 1,
-                    amount: contractAwarded);
+                // Retain the exact per-kind shares used by the amount bridge. No second
+                // rounding pass.
+                var raw = new int[_round.ContractXpKindOrder.Count];
+                for (int i = 0; i < raw.Length; i++) raw[i] = _round.ContractXpByKind[_round.ContractXpKindOrder[i]];
+                int[] scaled = ProgressionEconomyMath.DistributeScaledXp(raw, LastRoundBreakdown.ContractXpAwarded);
+                int remaining = contractUnreported;
+                for (int i = 0; i < raw.Length && remaining > 0; i++)
+                {
+                    string kind = _round.ContractXpKindOrder[i];
+                    if (ProgressionReportLineKeys.MapEventKindToLineKey(kind) != null) continue;
+                    int amount = Math.Min(scaled[i], remaining);
+                    if (amount <= 0) continue;
+                    // #1201: a crew-award outcome goes out as crew.contract.<kind>, which the
+                    // report keeps out of its lines and its remainder.
+                    _round.AddReportSource(ProgressionReportLineKeys.ContractSourceKey(kind), ProgressionReportSourceKind.Contract,
+                        ProgressionReportLineKeys.OutcomeLabel(kind), 1, amount);
+                    remaining -= amount;
+                }
+                if (remaining > 0)
+                    _round.AddReportSource("contract.other", ProgressionReportSourceKind.Contract,
+                        "Other contract work", 1, remaining);
             }
         }
 
@@ -1275,9 +1444,8 @@ namespace Y4NGZUpgrades
                 return 0;
 
             int attributedValue = 0;
+            int deliveredCount = 0;
             var counted = new HashSet<ulong>();
-            var groups = new List<DeliveredScrapReportGroup>();
-            var groupsByKey = new Dictionary<string, DeliveredScrapReportGroup>(StringComparer.Ordinal);
             GrabbableObject[] scrap = UnityEngine.Object.FindObjectsOfType<GrabbableObject>();
             for (int i = 0; i < scrap.Length; i++)
             {
@@ -1299,44 +1467,26 @@ namespace Y4NGZUpgrades
                     continue;
                 }
 
-                int value = Mathf.Max(0, item.scrapValue);
-                attributedValue = AddClamped(attributedValue, value);
-
-                string itemName = GetItemName(item);
-                string reportKey = NormalizeReportKeyPart(itemName);
-                if (!groupsByKey.TryGetValue(reportKey, out DeliveredScrapReportGroup group))
-                {
-                    group = new DeliveredScrapReportGroup(reportKey, itemName);
-                    groupsByKey.Add(reportKey, group);
-                    groups.Add(group);
-                }
-
-                group.Count = AddClamped(group.Count, 1);
-                group.Value = AddClamped(group.Value, value);
+                attributedValue = AddClamped(attributedValue, Mathf.Max(0, item.scrapValue));
+                deliveredCount = AddClamped(deliveredCount, 1);
             }
 
             int xp = Mathf.CeilToInt(
                 attributedValue * Mathf.Max(0f, Plugin.ProgressionConfig.ScrapDeliveredXpPerValue.Value));
             xp = Mathf.Max(0, xp);
 
-            if (xp > 0 && groups.Count > 0)
+            // #456: one delivery line per round, stating the haul's credits. The XP is rounded
+            // once over the whole attributed value, so the line carries exactly what was paid
+            // and no per-item division can drift away from the bar.
+            if (xp > 0 && deliveredCount > 0)
             {
-                var weights = new int[groups.Count];
-                for (int i = 0; i < groups.Count; i++)
-                    weights[i] = groups[i].Value;
-
-                int[] amounts = ProgressionEconomyMath.DistributeScaledXp(weights, xp);
-                for (int i = 0; i < groups.Count; i++)
-                {
-                    if (amounts[i] <= 0)
-                        continue;
-                    _round.AddReportSource(
-                        "scrap.delivered." + groups[i].Key,
-                        ProgressionReportSourceKind.ScrapDelivered,
-                        groups[i].Name,
-                        groups[i].Count,
-                        amounts[i]);
-                }
+                _round.AddReportSource(
+                    "scrap.delivered",
+                    ProgressionReportSourceKind.ScrapDelivered,
+                    string.Empty,
+                    deliveredCount,
+                    xp,
+                    attributedValue);
             }
 
             LogDebug($"Individual delivered scrap value={attributedValue} xp={xp}.");
@@ -1678,30 +1828,6 @@ namespace Y4NGZUpgrades
             return (int)total;
         }
 
-        private static string NormalizeReportKeyPart(string value)
-        {
-            value = string.IsNullOrWhiteSpace(value) ? "unknown" : value.Trim().ToLowerInvariant();
-            var result = new StringBuilder(value.Length);
-            bool separator = false;
-            for (int i = 0; i < value.Length; i++)
-            {
-                char character = value[i];
-                if (char.IsLetterOrDigit(character))
-                {
-                    if (separator && result.Length > 0)
-                        result.Append('-');
-                    result.Append(character);
-                    separator = false;
-                }
-                else
-                {
-                    separator = true;
-                }
-            }
-
-            return result.Length == 0 ? "unknown" : result.ToString();
-        }
-
         private static ulong GetNetworkKey(Component component)
         {
             return NetworkObjectKey.For(component);
@@ -1723,28 +1849,15 @@ namespace Y4NGZUpgrades
                 Plugin.Log?.LogInfo("[Progression] " + message);
         }
 
-        private sealed class DeliveredScrapReportGroup
-        {
-            internal readonly string Key;
-            internal readonly string Name;
-            internal int Count;
-            internal int Value;
-
-            internal DeliveredScrapReportGroup(string key, string name)
-            {
-                Key = key;
-                Name = name;
-            }
-        }
-
         private sealed class ReportSourceAccumulator
         {
             internal readonly string Key;
             internal readonly ProgressionReportSourceKind Kind;
-            internal readonly string Subject;
             internal readonly int Order;
+            internal string Subject;
             internal int Count;
             internal int Amount;
+            internal int Value;
 
             internal ReportSourceAccumulator(
                 string key,
@@ -1771,7 +1884,16 @@ namespace Y4NGZUpgrades
             internal int SurvivalMinutesForReport = 1;
             internal int MainframeHackXp;
             internal int ClutchXp;
+            /// <summary>Ship Systems battery restores paid to the local player (#459).</summary>
+            internal int ShipBatteryXp;
+            internal int ShipBatteryRestoresPaid;
+            internal readonly HashSet<string> ShipBatteryRestoreKeys = new HashSet<string>(StringComparer.Ordinal);
             internal int ContractXp;
+            /// <summary>
+            /// The part of <see cref="ContractXp"/> earned by ACTS rather than by a contract
+            /// outcome; the participation half of the #457 completion gate.
+            /// </summary>
+            internal int ContractActXp;
             /// <summary>Base body-retrieval XP, computed at finalize (#219).</summary>
             internal int BodyRetrievalXp;
             internal string MoonRisk = "C";
@@ -1787,6 +1909,32 @@ namespace Y4NGZUpgrades
             internal readonly HashSet<ulong> FacilityEntrants = new HashSet<ulong>();
             internal readonly Dictionary<ulong, float> LastEnemyHitByLocalPlayer = new Dictionary<ulong, float>();
             internal readonly HashSet<string> ContractXpKeys = new HashSet<string>();
+
+            /// <summary>
+            /// #392: raw contract XP per published event kind, in first-award order, so finalize
+            /// can divide the scaled bucket back across the kinds and hand each act's share to
+            /// Company's report line for it. The scalar <see cref="ContractXp"/> stays the
+            /// payout authority; this is a reporting view of the same numbers. The order list
+            /// keeps the largest-remainder division deterministic. The empty key is the "no
+            /// kind named" bucket (the public AwardContractXp surface): it takes its share of
+            /// the division and reaches no line. #1201: a crew award is bucketed apart from the
+            /// same kind's own acts, under <see cref="ProgressionReportLineKeys.ContractBucket"/>'s
+            /// <c>crew.</c> key, so its share reaches the report as hidden XP.
+            /// </summary>
+            internal readonly List<string> ContractXpKindOrder = new List<string>();
+            internal readonly Dictionary<string, int> ContractXpByKind =
+                new Dictionary<string, int>(StringComparer.Ordinal);
+
+            internal void AddContractXpForKind(string bucket, int amount)
+            {
+                if (amount <= 0)
+                    return;
+
+                bucket = bucket == null ? string.Empty : bucket.Trim();
+                if (!ContractXpByKind.TryGetValue(bucket, out int existing))
+                    ContractXpKindOrder.Add(bucket);
+                ContractXpByKind[bucket] = AddClamped(existing, amount);
+            }
             /// <summary>Occurrences already PAID per count-capped contract bucket (#194).</summary>
             internal readonly Dictionary<string, int> CappedContractCredits =
                 new Dictionary<string, int>(StringComparer.Ordinal);
@@ -1808,29 +1956,43 @@ namespace Y4NGZUpgrades
             private readonly Dictionary<string, ReportSourceAccumulator> _reportSources =
                 new Dictionary<string, ReportSourceAccumulator>(StringComparer.Ordinal);
 
+            /// <summary>
+            /// Folds one award into its category line (#456). A second, different subject under
+            /// the same key clears the subject: the category kept a name only while every award
+            /// in it was the same thing ("Killed 2 thumpers"), and reads generically once the
+            /// round mixed them ("Killed 3 monsters"). <paramref name="value"/> accumulates the
+            /// credits a haul line states.
+            /// </summary>
             internal void AddReportSource(
                 string key,
                 ProgressionReportSourceKind kind,
                 string subject,
                 int count,
-                int amount)
+                int amount,
+                int value = 0)
             {
                 if (amount <= 0 || string.IsNullOrWhiteSpace(key))
                     return;
 
+                string resolvedSubject = subject?.Trim() ?? string.Empty;
                 if (!_reportSources.TryGetValue(key, out ReportSourceAccumulator source))
                 {
                     source = new ReportSourceAccumulator(
                         key,
                         kind,
-                        subject?.Trim() ?? string.Empty,
+                        resolvedSubject,
                         _reportSourceOrder.Count);
                     _reportSources.Add(key, source);
                     _reportSourceOrder.Add(source);
                 }
+                else if (!string.Equals(source.Subject, resolvedSubject, StringComparison.OrdinalIgnoreCase))
+                {
+                    source.Subject = string.Empty;
+                }
 
                 source.Count = AddClamped(source.Count, count);
                 source.Amount = AddClamped(source.Amount, amount);
+                source.Value = AddClamped(source.Value, value);
             }
 
             internal IReadOnlyList<ProgressionReportSource> BuildReportSources()
@@ -1845,7 +2007,8 @@ namespace Y4NGZUpgrades
                         source.Subject,
                         source.Count,
                         source.Amount,
-                        source.Order);
+                        source.Order,
+                        source.Value);
                 }
 
                 return result;

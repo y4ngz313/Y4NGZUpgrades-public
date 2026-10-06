@@ -18,6 +18,36 @@ using Y4NGZUpgrades.Upgrades;
 
 namespace Y4NGZUpgrades.Patches
 {
+    /// <summary>
+    /// F-TABLET-18: single source for the MAINFRAME cooldowns and the Company presence gate.
+    /// FieldTabletMainframeNet enforces the cooldowns host-side and FieldTabletScreenRuntime
+    /// mirrors them for the row UI; they used to be declared twice, which is a drift hazard
+    /// (change one and the UI and the host disagree about when a row comes back).
+    /// </summary>
+    internal static class FieldTabletCooldowns
+    {
+        internal const float CameraDisableSeconds = 20f;
+        internal const float LockdownSeconds = 30f;
+        internal const float TrapsDisableSeconds = 90f;
+        // The alarm rows had no cooldown at all, so a held Enter spammed SetAlarmServerRpc at
+        // input rate (F-TABLET-10). Short by design: this is a spam guard, not a gameplay gate.
+        internal const float AlarmSeconds = 2f;
+
+        private static bool? _companyPresent;
+
+        /// <summary>
+        /// Every Company read behind this gate reaches CctvSupportApi or MainframeSupport, which
+        /// Y4NGZCompany#393 moved into LethalCCTV.dll. Gating on com.y4ngz.company would let those
+        /// JIT with the CCTV plugin absent, so the gate has to name the CCTV plugin.
+        /// </summary>
+        internal static bool IsCompanyPresent()
+        {
+            if (!_companyPresent.HasValue)
+                _companyPresent = OptionalPluginCapabilities.LethalCctv;
+            return _companyPresent.Value;
+        }
+    }
+
     [HarmonyPatch]
     internal static class FieldOperationsTabletPatch
     {
@@ -53,6 +83,7 @@ namespace Y4NGZUpgrades.Patches
         private static bool _networkHandlersRegistered;
         private static bool _missingManifestLogged;
         private static bool _startFailureLogged;
+        private static bool _hardwareOfflineTipShown;
         private static bool _savedDisableInteract;
         private static bool _savedDisableInteractValue;
         private static bool _wallRaiseActive;
@@ -80,6 +111,20 @@ namespace Y4NGZUpgrades.Patches
 
         internal static bool IsTabletActive => _activeHandle.IsValid
             && LCInteractionAnimationAPI.IsInteractionActive(_activeHandle);
+
+        internal static bool IsTabletActiveForPlayer(PlayerControllerB player)
+        {
+            if (player == null)
+                return false;
+            if (IsLocalPlayer(player))
+                return IsTabletActive;
+
+            return RemoteHandles.TryGetValue(
+                    player.playerClientId,
+                    out InteractionAnimationHandle handle)
+                && handle.IsValid
+                && LCInteractionAnimationAPI.IsInteractionActive(handle);
+        }
 
         internal static void Initialize()
         {
@@ -140,23 +185,31 @@ namespace Y4NGZUpgrades.Patches
             if (!IsLocalPlayer(__instance))
                 return;
 
+            long perfStartedAt = FieldTabletPerfMeter.Timestamp();
+            UpdateLocalPlayer(__instance);
+            FieldTabletPerfMeter.AddPatchUpdate(perfStartedAt);
+        }
+
+        // The Update postfix body, split out so PostPlayerUpdate can time every return path.
+        private static void UpdateLocalPlayer(PlayerControllerB player)
+        {
             RegisterNetworkHandlers();
-            ClearInactiveHandle(__instance);
+            ClearInactiveHandle(player);
             ClearInactiveRemoteHandles();
             bool togglePressed = Gui.UpgradeInput.WasPressed(Gui.Plugin.Keybinds?.FieldTablet);
-            UpdateTabletPrompt(__instance);
-            FieldTabletScreenRuntime.TickUplinkState(__instance);
+            UpdateTabletPrompt(player);
+            FieldTabletScreenRuntime.TickUplinkState(player);
 
             if (togglePressed)
-                ToggleTablet(__instance);
+                ToggleTablet(player);
 
             if (!IsTabletActive)
                 return;
 
             MaintainTabletNearFocus();
-            __instance.disableInteract = true;
-            UpdateTabletRaise(__instance);
-            FieldTabletScreenRuntime.UpdateActive(__instance, FireTabletActionGesture);
+            player.disableInteract = true;
+            UpdateTabletRaise(player);
+            FieldTabletScreenRuntime.UpdateActive(player, FireTabletActionGesture);
         }
 
         [HarmonyPatch(typeof(PlayerControllerB), "LateUpdate")]
@@ -166,10 +219,13 @@ namespace Y4NGZUpgrades.Patches
             if (!IsLocalPlayer(__instance))
                 return;
 
+            long perfStartedAt = FieldTabletPerfMeter.Timestamp();
             ApplyTabletArmsOffset(__instance);
-            if (IsTabletActive)
+            bool held = IsTabletActive;
+            if (held)
                 FieldTabletAudio.FollowBoundAnchor();
             UpdateLocalThirdPersonPresentation(__instance);
+            FieldTabletPerfMeter.EndPatchFrame(perfStartedAt, held);
         }
 
         /// <summary>
@@ -407,18 +463,19 @@ namespace Y4NGZUpgrades.Patches
             TryStartTablet(player);
         }
 
-        private static string _cachedTabletPath;
-        private static string _cachedTabletPreviousPath;
-        private static string _cachedTabletNextPath;
-        private static string _cachedTabletUpPath;
-        private static string _cachedTabletDownPath;
-        private static string _cachedTabletActivatePath;
-        private static string _cachedTabletPrimaryPath;
-        private static string _cachedTabletBackPath;
-        private static string[] _cachedIdlePrompt;
-        private static string[] _cachedCommandPrompt;
-        private static string[] _cachedActivePrompt;
-        private static string[] _cachedActiveHackPrompt;
+        // Republish cadence for an unchanged block. Y4NGZUI's ResetSession drops every producer
+        // block, so a producer that only published on change would stay gone after a reset.
+        private const float PromptRepublishSeconds = 0.5f;
+
+        private static readonly FieldTabletPromptPlan PromptPlan = new FieldTabletPromptPlan();
+        // EffectivePath per tablet binding, compared each frame so the display labels (which
+        // allocate) are resolved again only after a rebind.
+        private static readonly string[] CachedTabletBindingPaths = new string[10];
+        private static bool _tabletLabelsResolved;
+        private static bool _tabletPromptPublished;
+        private static string[] _publishedTabletPrompt;
+        private static string _publishedCursorTip;
+        private static float _nextTabletPromptRepublishAt;
 
         private static void UpdateTabletPrompt(PlayerControllerB player)
         {
@@ -429,76 +486,88 @@ namespace Y4NGZUpgrades.Patches
                 || player.inTerminalMenu
                 || (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen))
             {
-                Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PromptKey);
-                Y4ngzPromptOverlay.SetCursorTipOverride(null);
+                if (_tabletPromptPublished)
+                    ClearTabletPrompt();
                 return;
             }
 
             Gui.IngameKeybinds keybinds = Gui.Plugin.Keybinds;
-            string tabletPath = Gui.UpgradeInput.EffectivePath(keybinds?.FieldTablet);
-            string previousPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletPreviousTab);
-            string nextPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletNextTab);
-            string upPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletUp);
-            string downPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletDown);
-            string activatePath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletActivate);
-            string primaryPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletPrimaryAction);
-            string backPath = Gui.UpgradeInput.EffectivePath(keybinds?.TabletBack);
-            if (_cachedIdlePrompt == null
-                || !string.Equals(_cachedTabletPath, tabletPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletPreviousPath, previousPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletNextPath, nextPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletUpPath, upPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletDownPath, downPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletActivatePath, activatePath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletPrimaryPath, primaryPath, StringComparison.Ordinal)
-                || !string.Equals(_cachedTabletBackPath, backPath, StringComparison.Ordinal))
+            if (TabletBindingPathsChanged(keybinds))
             {
-                _cachedTabletPath = tabletPath;
-                _cachedTabletPreviousPath = previousPath;
-                _cachedTabletNextPath = nextPath;
-                _cachedTabletUpPath = upPath;
-                _cachedTabletDownPath = downPath;
-                _cachedTabletActivatePath = activatePath;
-                _cachedTabletPrimaryPath = primaryPath;
-                _cachedTabletBackPath = backPath;
-
-                string tablet = Gui.UpgradeInput.DisplayLabel(keybinds?.FieldTablet, "Y");
-                string tabs = Gui.UpgradeInput.DisplayPair(
-                    keybinds?.TabletPreviousTab, "LEFT", keybinds?.TabletNextTab, "RIGHT");
-                string select = Gui.UpgradeInput.DisplayPair(
-                    keybinds?.TabletUp, "UP", keybinds?.TabletDown, "DOWN");
-                string activate = Gui.UpgradeInput.DisplayLabel(keybinds?.TabletActivate, "ENTER");
-                string splice = Gui.UpgradeInput.DisplayPair(
-                    keybinds?.TabletActivate, "ENTER", keybinds?.TabletPrimaryAction, "LMB");
-                string back = Gui.UpgradeInput.DisplayLabel(keybinds?.TabletBack, "BKSP");
-                string stow = $"Tablet: [{tablet}] Stow";
-                string navigation = $"[{tabs}] Tabs  [{select}] Select";
-                _cachedIdlePrompt = new[] { $"Tablet: [{tablet}]" };
-                _cachedCommandPrompt = new[] { stow, $"[{select}] Select", $"[{activate}] Execute", $"[{back}] Back" };
-                _cachedActivePrompt = new[] { stow, navigation, $"[{activate}] Activate", $"[{back}] Back" };
-                _cachedActiveHackPrompt = new[] { stow, navigation, $"[{splice}] Splice", $"[{back}] Back" };
+                PromptPlan.SetLabels(new FieldTabletPromptLabels(
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.FieldTablet, "Y"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletPreviousTab, "LEFT"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletNextTab, "RIGHT"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletUp, "UP"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletDown, "DOWN"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletActivate, "ENTER"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletPrimaryAction, "LMB"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletBack, "BKSP"),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletZoomIn, "="),
+                    Gui.UpgradeInput.DisplayLabel(keybinds?.TabletZoomOut, "-")));
             }
 
-            if (!IsTabletActive)
-            {
-                Y4ngzPromptOverlay.SetPostPlayerMenuPromptLines(PromptKey, _cachedIdlePrompt);
-                Y4ngzPromptOverlay.SetCursorTipOverride(null);
-                return;
-            }
-
+            bool active = IsTabletActive;
+            string[] block = PromptPlan.GetLines(active
+                ? FieldTabletScreenRuntime.PromptState
+                : FieldTabletPromptState.Stowed);
             // Nothing can be interacted with or grabbed while the tablet is out, so any hover cue
             // vanilla still produces would be a lie. Say what the player actually has to do.
-            Y4ngzPromptOverlay.SetCursorTipOverride(StowTabletCursorTip);
+            string cursorTip = active ? StowTabletCursorTip : null;
 
-            if (FieldTabletScreenRuntime.IsCommandScreenOpen)
-            {
-                Y4ngzPromptOverlay.SetPostPlayerMenuPromptLines(PromptKey, _cachedCommandPrompt);
+            float now = Time.unscaledTime;
+            if (_tabletPromptPublished
+                && ReferenceEquals(block, _publishedTabletPrompt)
+                && string.Equals(cursorTip, _publishedCursorTip, StringComparison.Ordinal)
+                && now < _nextTabletPromptRepublishAt)
                 return;
-            }
 
-            Y4ngzPromptOverlay.SetPostPlayerMenuPromptLines(
-                PromptKey,
-                FieldTabletScreenRuntime.HasHackableTarget ? _cachedActiveHackPrompt : _cachedActivePrompt);
+            _tabletPromptPublished = true;
+            _publishedTabletPrompt = block;
+            _publishedCursorTip = cursorTip;
+            _nextTabletPromptRepublishAt = now + PromptRepublishSeconds;
+            Y4ngzPromptOverlay.SetPostPlayerMenuPromptLines(PromptKey, block);
+            // The held tablet's controls must not fade on the fallback stack; the stowed cue does.
+            // Holding and stowing always change the block, so this runs on every transition.
+            Y4ngzPromptOverlay.SetPostPlayerMenuPromptHoldOpen(PromptKey, active);
+            Y4ngzPromptOverlay.SetCursorTipOverride(cursorTip);
+        }
+
+        private static void ClearTabletPrompt()
+        {
+            // Clearing the key also drops its hold-open on the fallback stack.
+            Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PromptKey);
+            Y4ngzPromptOverlay.SetCursorTipOverride(null);
+            _tabletPromptPublished = false;
+            _publishedTabletPrompt = null;
+            _publishedCursorTip = null;
+            _nextTabletPromptRepublishAt = 0f;
+        }
+
+        private static bool TabletBindingPathsChanged(Gui.IngameKeybinds keybinds)
+        {
+            bool changed = !_tabletLabelsResolved;
+            changed |= TabletBindingPathChanged(0, keybinds?.FieldTablet);
+            changed |= TabletBindingPathChanged(1, keybinds?.TabletPreviousTab);
+            changed |= TabletBindingPathChanged(2, keybinds?.TabletNextTab);
+            changed |= TabletBindingPathChanged(3, keybinds?.TabletUp);
+            changed |= TabletBindingPathChanged(4, keybinds?.TabletDown);
+            changed |= TabletBindingPathChanged(5, keybinds?.TabletActivate);
+            changed |= TabletBindingPathChanged(6, keybinds?.TabletPrimaryAction);
+            changed |= TabletBindingPathChanged(7, keybinds?.TabletBack);
+            changed |= TabletBindingPathChanged(8, keybinds?.TabletZoomIn);
+            changed |= TabletBindingPathChanged(9, keybinds?.TabletZoomOut);
+            _tabletLabelsResolved = true;
+            return changed;
+        }
+
+        private static bool TabletBindingPathChanged(int index, InputAction action)
+        {
+            string path = Gui.UpgradeInput.EffectivePath(action);
+            if (string.Equals(CachedTabletBindingPaths[index], path, StringComparison.Ordinal))
+                return false;
+            CachedTabletBindingPaths[index] = path;
+            return true;
         }
 
         private static void TryStartTablet(PlayerControllerB player)
@@ -510,10 +579,16 @@ namespace Y4NGZUpgrades.Patches
             if (!EnsurePackRegistered())
             {
                 Plugin.Log?.LogWarning("[Field Tablet] Animation pack is not ready.");
+                ShowHardwareOfflineTip();
                 return;
             }
             if (!TryPocketHeldItem(player))
                 return;
+
+            // The tablet and fists both own the live-body presenter. Release a local fist
+            // session before requesting the tablet so its model, input, and server state cannot
+            // keep running behind the tablet screen.
+            NativeFistsPatch.InterruptForTablet(player);
 
             var request = new InteractionAnimationRequest
             {
@@ -531,6 +606,7 @@ namespace Y4NGZUpgrades.Patches
                     _startFailureLogged = true;
                     Plugin.Log?.LogWarning("[Field Tablet] start rejected: " + reason);
                 }
+                ShowHardwareOfflineTip();
                 return;
             }
 
@@ -542,6 +618,28 @@ namespace Y4NGZUpgrades.Patches
             FieldTabletAudio.QueueEquip();
             SaveAndSuppressInteractInput(player);
             SendTabletState(MsgTabletStart);
+        }
+
+        /// <summary>
+        /// F-TABLET-6: a failed open used to be log-only, so a player with the upgrade bought and
+        /// the Interactions manifest missing pressed Y and got absolute silence. One tip per
+        /// session is enough to point them at the log without nagging on every press.
+        /// </summary>
+        private static void ShowHardwareOfflineTip()
+        {
+            if (_hardwareOfflineTipShown)
+                return;
+
+            // Review pass: the latch used to be set before the tip was shown, so a first failed
+            // open while HUDManager.Instance was still null had its tip swallowed by the
+            // null-conditional AND burned the one-shot for the rest of the session - exactly the
+            // silence this finding is about. Latch only once a tip has actually been delivered.
+            HUDManager hud = HUDManager.Instance;
+            if (hud == null)
+                return;
+
+            _hardwareOfflineTipShown = true;
+            hud.DisplayTip("Field Operations", "Tablet hardware offline - see BepInEx log");
         }
 
         private static void BeginTabletExit(PlayerControllerB player)
@@ -591,8 +689,7 @@ namespace Y4NGZUpgrades.Patches
             RestoreInteractInput(player);
             // Disconnect and end-of-game tear down without another PostPlayerUpdate, so the
             // takeover has to be released here rather than left for the prompt refresh.
-            Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PromptKey);
-            Y4ngzPromptOverlay.SetCursorTipOverride(null);
+            ClearTabletPrompt();
             _nextActionIndex = 1;
             _wallRaiseActive = false;
             _wallHitDistance = WallRaiseExitDistance;
@@ -809,6 +906,8 @@ namespace Y4NGZUpgrades.Patches
             try
             {
                 reader.ReadValueSafe(out ulong playerClientId);
+                if (!TryAuthenticateTabletState(senderClientId, requireTier: true, ref playerClientId))
+                    return;
                 ApplyRemoteTabletStart(playerClientId);
                 RelayTabletStateIfHost(MsgTabletStart, senderClientId, playerClientId);
             }
@@ -823,6 +922,10 @@ namespace Y4NGZUpgrades.Patches
             try
             {
                 reader.ReadValueSafe(out ulong playerClientId);
+                // Stop is not tier-gated: a player who loses the upgrade mid-round still has to be
+                // able to put the tablet away on every observer.
+                if (!TryAuthenticateTabletState(senderClientId, requireTier: false, ref playerClientId))
+                    return;
                 ApplyRemoteTabletStop(playerClientId);
                 RelayTabletStateIfHost(MsgTabletStop, senderClientId, playerClientId);
             }
@@ -830,6 +933,30 @@ namespace Y4NGZUpgrades.Patches
             {
                 Plugin.Log?.LogDebug("[Field Tablet] malformed stop message: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// F-TABLET-14: the host never trusts the payload-supplied player id. It resolves the
+        /// sender's own <c>PlayerControllerB</c> by <c>actualClientId</c> (house pattern, see
+        /// UpgradeTierSync) and overwrites the id with that player's slot, so a client can only
+        /// ever present its own tablet - a forged id used to fake a crew member holding one, which
+        /// also blocked that player's Native Fists on every observer. On a non-host client the
+        /// message arrives from the server, which already validated it, so it is taken as-is.
+        /// </summary>
+        private static bool TryAuthenticateTabletState(ulong senderClientId, bool requireTier, ref ulong playerClientId)
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            if (network == null || !network.IsServer)
+                return true;
+
+            PlayerControllerB sender = ResolvePlayerByActualClientId(senderClientId);
+            if (sender == null)
+                return false;
+            if (requireTier && UpgradeTierSync.GetTier(senderClientId, FieldOperationsUpgrade.UPGRADE_ID) < 1)
+                return false;
+
+            playerClientId = sender.playerClientId;
+            return true;
         }
 
         private static void RelayTabletStateIfHost(string messageName, ulong senderClientId, ulong playerClientId)
@@ -883,20 +1010,26 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
+        // F-TABLET-11: hoisted out of the method body. This runs from PlayerControllerB.Update for
+        // the local player whenever any remote player has a tablet out, whether or not the local
+        // player does, so a per-frame allocation here is a per-frame allocation for the whole crew.
+        private static readonly List<ulong> StaleRemoteHandles = new List<ulong>();
+
         private static void ClearInactiveRemoteHandles()
         {
             if (RemoteHandles.Count == 0)
                 return;
 
-            var stale = new List<ulong>();
+            StaleRemoteHandles.Clear();
             foreach (KeyValuePair<ulong, InteractionAnimationHandle> pair in RemoteHandles)
             {
                 if (!pair.Value.IsValid || !LCInteractionAnimationAPI.IsInteractionActive(pair.Value))
-                    stale.Add(pair.Key);
+                    StaleRemoteHandles.Add(pair.Key);
             }
 
-            for (int i = 0; i < stale.Count; i++)
-                RemoteHandles.Remove(stale[i]);
+            for (int i = 0; i < StaleRemoteHandles.Count; i++)
+                RemoteHandles.Remove(StaleRemoteHandles[i]);
+            StaleRemoteHandles.Clear();
         }
 
         private static void StopAllRemoteTablets(InteractionAnimationStopReason reason)
@@ -919,6 +1052,24 @@ namespace Y4NGZUpgrades.Patches
             {
                 PlayerControllerB player = players[i];
                 if (player != null && player.playerClientId == playerClientId)
+                    return player;
+            }
+            return null;
+        }
+
+        private static PlayerControllerB ResolvePlayerByActualClientId(ulong actualClientId)
+        {
+            PlayerControllerB[] players = StartOfRound.Instance?.allPlayerScripts;
+            if (players == null)
+                return null;
+
+            for (int i = 0; i < players.Length; i++)
+            {
+                PlayerControllerB player = players[i];
+                // No isPlayerControlled predicate: matches NativeFistsPatch.ResolvePlayer, so a
+                // legitimate start arriving while the sender's player object is still settling
+                // (late join) is authenticated rather than dropped.
+                if (player != null && player.actualClientId == actualClientId)
                     return player;
             }
             return null;
@@ -1062,21 +1213,31 @@ namespace Y4NGZUpgrades.Patches
         internal const byte ActionLockdownBegin = 1;
         internal const byte ActionLockdownEnd = 2;
         internal const byte ActionTraps = 3;
+        // F-TABLET-4: camera and alarm used to have no action code at all, because the host never
+        // replied on those paths. Append-only: never renumber an existing code.
+        internal const byte ActionCamera = 4;
+        internal const byte ActionAlarm = 5;
+
+        // F-TABLET-4: every host rejection now names itself, so the client can say why instead of
+        // printing "SENT" over a request that was silently dropped. Append-only.
+        internal const byte ReasonNone = 0;
+        internal const byte ReasonNoTier = 1;
+        internal const byte ReasonCooldown = 2;
+        internal const byte ReasonNoCompany = 3;
+        internal const byte ReasonNotHacked = 4;
+        internal const byte ReasonRefused = 5;
 
         internal const byte AlarmOpOff = 0;
         internal const byte AlarmOpOn = 1;
         internal const byte AlarmOpSilence = 2;
 
-        // Host-enforced cooldowns (mirrored client-side for UI only).
-        private const float CameraDisableCooldownSeconds = 20f;
-        private const float LockdownCooldownSeconds = 30f;
-        private const float TrapsDisableCooldownSeconds = 90f;
         private const float TrapDisableFallbackSeconds = 12f;
 
         private static bool _handlersRegistered;
         private static float _hostCameraReadyAt;
         private static float _hostLockdownReadyAt;
         private static float _hostTrapsReadyAt;
+        private static float _hostAlarmReadyAt;
         private static readonly List<PendingTrapReenable> PendingReenables = new List<PendingTrapReenable>();
 
         private struct PendingTrapReenable
@@ -1098,10 +1259,53 @@ namespace Y4NGZUpgrades.Patches
         private static void PostDisconnect()
         {
             _handlersRegistered = false;
+            ClearHostState();
+        }
+
+        /// <summary>
+        /// Per-round reset (RoundLifecycle.RoundStarted, every peer). The host cooldowns and the
+        /// direct-RPC re-enable queue used to clear only on disconnect, so a cooldown or a
+        /// still-disabled trap carried into the next round. The host first restores every trap it
+        /// still holds disabled (a trap from the previous level is already destroyed and skipped),
+        /// then forgets both; every peer drops its tablet cooldown mirrors with it.
+        /// </summary>
+        internal static void OnRoundStarted()
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            if (network != null && network.IsServer)
+            {
+                int failures = 0;
+                string firstError = null;
+                for (int i = 0; i < PendingReenables.Count; i++)
+                {
+                    PendingTrapReenable pending = PendingReenables[i];
+                    if (pending.Trap == null)
+                        continue;
+                    try
+                    {
+                        ToggleTrap(pending.Trap, pending.Kind, enable: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures++;
+                        firstError ??= ex.Message;
+                    }
+                }
+                if (failures > 0)
+                    Plugin.Log?.LogDebug("[Field Tablet] round-start trap re-enable failed for " + failures + " trap(s): " + firstError);
+            }
+
+            ClearHostState();
+            FieldTabletScreenRuntime.ResetMainframeCooldownMirrors();
+        }
+
+        private static void ClearHostState()
+        {
             PendingReenables.Clear();
             _hostCameraReadyAt = 0f;
             _hostLockdownReadyAt = 0f;
             _hostTrapsReadyAt = 0f;
+            _hostAlarmReadyAt = 0f;
         }
 
         // Host tick for the direct-RPC fallback re-enables (objects without a
@@ -1280,15 +1484,33 @@ namespace Y4NGZUpgrades.Patches
         private static void HandleCameraDisable(ulong senderClientId, int cameraId)
         {
             if (!SenderHasFieldOperations(senderClientId))
+            {
+                SendActionResult(senderClientId, ActionCamera, success: false, 0f, 0, ReasonNoTier);
                 return;
+            }
             float now = Time.unscaledTime;
             if (now < _hostCameraReadyAt)
+            {
+                SendActionResult(senderClientId, ActionCamera, success: false, _hostCameraReadyAt - now, 0, ReasonCooldown);
                 return;
-            if (!IsCompanyPresent())
+            }
+            if (!FieldTabletCooldowns.IsCompanyPresent())
+            {
+                SendActionResult(senderClientId, ActionCamera, success: false, 0f, 0, ReasonNoCompany);
                 return;
+            }
 
-            _hostCameraReadyAt = now + CameraDisableCooldownSeconds;
-            HostTryDisableCamera(cameraId);
+            bool ok = HostTryDisableCamera(cameraId);
+            if (ok)
+                CctvEmployeeStatisticsNetwork.RecordHostConfirmedDeviceHack(
+                    senderClientId,
+                    "camera." + cameraId);
+            // Only burn the shared cooldown on a shutdown that actually landed, so a miss (a stale
+            // camera id from a client whose list has not caught up) does not lock the crew out.
+            if (ok)
+                _hostCameraReadyAt = now + FieldTabletCooldowns.CameraDisableSeconds;
+            SendActionResult(senderClientId, ActionCamera, ok,
+                ok ? FieldTabletCooldowns.CameraDisableSeconds : 0f, 0, ok ? ReasonNone : ReasonRefused);
         }
 
         private static void OnAlarmRequest(ulong senderClientId, FastBufferReader reader)
@@ -1308,19 +1530,65 @@ namespace Y4NGZUpgrades.Patches
             HandleAlarm(senderClientId, op);
         }
 
+        /// <summary>
+        /// F-TABLET-10: the alarm path had neither a cooldown nor a host-side check that the
+        /// mainframe had actually been hacked - the "NEEDS HACK" lock was client-side row state
+        /// only, and MainframeSupport.SetAlarmServerRpc is RequireOwnership = false, so a held
+        /// Enter or a modified client could toggle the facility alarm at input rate.
+        /// </summary>
         private static void HandleAlarm(ulong senderClientId, byte op)
         {
-            if (!SenderHasFieldOperations(senderClientId) || !IsCompanyPresent())
+            if (!SenderHasFieldOperations(senderClientId))
+            {
+                SendActionResult(senderClientId, ActionAlarm, success: false, 0f, op, ReasonNoTier);
                 return;
+            }
+            if (!FieldTabletCooldowns.IsCompanyPresent())
+            {
+                SendActionResult(senderClientId, ActionAlarm, success: false, 0f, op, ReasonNoCompany);
+                return;
+            }
+            float now = Time.unscaledTime;
+            if (now < _hostAlarmReadyAt)
+            {
+                SendActionResult(senderClientId, ActionAlarm, success: false, _hostAlarmReadyAt - now, op, ReasonCooldown);
+                return;
+            }
+            // Silencing an alarm is the reactive half and stays available; arming or disarming the
+            // facility alarm is what the mainframe hack pays for.
+            if (op != AlarmOpSilence && !HostIsMainframeHacked())
+            {
+                SendActionResult(senderClientId, ActionAlarm, success: false, 0f, op, ReasonNotHacked);
+                return;
+            }
 
+            // The cooldown is burned whether or not the op lands: F-TABLET-10's whole point is that
+            // SetAlarmServerRpc is RequireOwnership = false, so a refused request must still cost
+            // the sender its rate limit.
+            _hostAlarmReadyAt = now + FieldTabletCooldowns.AlarmSeconds;
+            bool ok;
             try
             {
-                HostApplyAlarmOp(op);
+                // Review pass: this used to be `HostApplyAlarmOp(op);` followed by an
+                // unconditional success result. The bridge swallowed a missing MainframeSupport
+                // and every reflection failure, so the catch below was unreachable and the client
+                // printed ALARM SET while the facility alarm never moved.
+                ok = HostApplyAlarmOp(op);
             }
             catch (Exception ex)
             {
                 Plugin.Log?.LogWarning("[Field Tablet] alarm op failed: " + ex.Message);
+                ok = false;
             }
+
+            if (!ok)
+            {
+                Plugin.Log?.LogWarning(
+                    "[Field Tablet] alarm op refused: no live MainframeSupport, or its alarm RPC did not resolve.");
+            }
+
+            SendActionResult(senderClientId, ActionAlarm, ok,
+                ok ? FieldTabletCooldowns.AlarmSeconds : 0f, op, ok ? ReasonNone : ReasonRefused);
         }
 
         private static void OnLockdownRequest(ulong senderClientId, FastBufferReader reader)
@@ -1342,20 +1610,28 @@ namespace Y4NGZUpgrades.Patches
 
         private static void HandleLockdown(ulong senderClientId, bool begin)
         {
+            byte action = begin ? ActionLockdownBegin : ActionLockdownEnd;
             if (!SenderHasFieldOperations(senderClientId))
+            {
+                SendActionResult(senderClientId, action, success: false, 0f, 0, ReasonNoTier);
                 return;
+            }
             float now = Time.unscaledTime;
             if (now < _hostLockdownReadyAt)
-                return;
-            if (!IsCompanyPresent())
             {
-                SendActionResult(senderClientId, begin ? ActionLockdownBegin : ActionLockdownEnd, success: false, 0f, 0);
+                SendActionResult(senderClientId, action, success: false, _hostLockdownReadyAt - now, 0, ReasonCooldown);
+                return;
+            }
+            if (!FieldTabletCooldowns.IsCompanyPresent())
+            {
+                SendActionResult(senderClientId, action, success: false, 0f, 0, ReasonNoCompany);
                 return;
             }
 
-            _hostLockdownReadyAt = now + LockdownCooldownSeconds;
+            _hostLockdownReadyAt = now + FieldTabletCooldowns.LockdownSeconds;
             bool ok = HostTryLockdown(begin);
-            SendActionResult(senderClientId, begin ? ActionLockdownBegin : ActionLockdownEnd, ok, 0f, 0);
+            SendActionResult(senderClientId, action, ok, FieldTabletCooldowns.LockdownSeconds, 0,
+                ok ? ReasonNone : ReasonRefused);
         }
 
         private static void OnTrapsDisableRequest(ulong senderClientId, FastBufferReader reader)
@@ -1375,44 +1651,65 @@ namespace Y4NGZUpgrades.Patches
         private static void HandleTrapsDisable(ulong senderClientId)
         {
             if (!SenderHasFieldOperations(senderClientId))
+            {
+                SendActionResult(senderClientId, ActionTraps, success: false, 0f, 0, ReasonNoTier);
                 return;
+            }
             float now = Time.unscaledTime;
             if (now < _hostTrapsReadyAt)
+            {
+                SendActionResult(senderClientId, ActionTraps, success: false, _hostTrapsReadyAt - now, 0, ReasonCooldown);
                 return;
+            }
 
-            _hostTrapsReadyAt = now + TrapsDisableCooldownSeconds;
+            _hostTrapsReadyAt = now + FieldTabletCooldowns.TrapsDisableSeconds;
 
             int affected = 0;
             float maxDuration = 0f;
+            SweepTraps<Turret>(0, "turret", turret => turret.turretActive, ref affected, ref maxDuration);
+            SweepTraps<Landmine>(1, "landmine", mine => !mine.hasExploded, ref affected, ref maxDuration);
+            SweepTraps<SpikeRoofTrap>(2, "spike trap", spikes => true, ref affected, ref maxDuration);
+
+            SendActionResult(senderClientId, ActionTraps, affected > 0, maxDuration, affected,
+                affected > 0 ? ReasonNone : ReasonRefused);
+        }
+
+        // One sweep per trap kind, guarded per trap and around the Find: one bad trap or one
+        // failing sweep used to abort every sweep after it. Failures are counted, not logged per
+        // trap; a sweep that had any logs one warning with the count and the first message.
+        private static void SweepTraps<T>(byte kind, string label, Func<T, bool> isArmed, ref int affected, ref float maxDuration)
+            where T : Component
+        {
+            int failures = 0;
+            string firstError = null;
             try
             {
-                Turret[] turrets = UnityEngine.Object.FindObjectsOfType<Turret>();
-                for (int i = 0; i < turrets.Length; i++)
+                T[] traps = UnityEngine.Object.FindObjectsByType<T>(FindObjectsSortMode.None);
+                for (int i = 0; i < traps.Length; i++)
                 {
-                    if (turrets[i] != null && turrets[i].turretActive && DisableTrapVanillaStyle(turrets[i], 0, ref maxDuration))
-                        affected++;
-                }
-
-                Landmine[] mines = UnityEngine.Object.FindObjectsOfType<Landmine>();
-                for (int i = 0; i < mines.Length; i++)
-                {
-                    if (mines[i] != null && !mines[i].hasExploded && DisableTrapVanillaStyle(mines[i], 1, ref maxDuration))
-                        affected++;
-                }
-
-                SpikeRoofTrap[] spikes = UnityEngine.Object.FindObjectsOfType<SpikeRoofTrap>();
-                for (int i = 0; i < spikes.Length; i++)
-                {
-                    if (spikes[i] != null && DisableTrapVanillaStyle(spikes[i], 2, ref maxDuration))
-                        affected++;
+                    T trap = traps[i];
+                    if (trap == null)
+                        continue;
+                    try
+                    {
+                        if (isArmed(trap) && DisableTrapVanillaStyle(trap, kind, ref maxDuration))
+                            affected++;
+                    }
+                    catch (Exception ex)
+                    {
+                        failures++;
+                        firstError ??= ex.Message;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogWarning("[Field Tablet] traps disable sweep failed: " + ex.Message);
+                failures++;
+                firstError ??= ex.Message;
             }
 
-            SendActionResult(senderClientId, ActionTraps, affected > 0, maxDuration, affected);
+            if (failures > 0)
+                Plugin.Log?.LogWarning("[Field Tablet] traps disable " + label + " sweep: " + failures + " failure(s), first: " + firstError);
         }
 
         private static bool DisableTrapVanillaStyle(Component trap, byte kind, ref float maxDuration)
@@ -1461,7 +1758,9 @@ namespace Y4NGZUpgrades.Patches
 
         // - Result feedback -
 
-        private static void SendActionResult(ulong targetClientId, byte action, bool success, float value, int count)
+        // F-TABLET-4: `reason` is appended to the existing action/success/value/count payload
+        // (append-only wire format - nothing before it moved or changed meaning).
+        private static void SendActionResult(ulong targetClientId, byte action, bool success, float value, int count, byte reason)
         {
             NetworkManager network = NetworkManager.Singleton;
             if (network == null)
@@ -1469,20 +1768,21 @@ namespace Y4NGZUpgrades.Patches
 
             if (targetClientId == network.LocalClientId)
             {
-                FieldTabletScreenRuntime.OnMainframeActionResult(action, success, value, count);
+                FieldTabletScreenRuntime.OnMainframeActionResult(action, success, value, count, reason);
                 return;
             }
 
             CustomMessagingManager messaging = network.CustomMessagingManager;
             if (messaging == null)
                 return;
-            // action(1) + success(1) + value(4) + count(1)
-            using (var writer = new FastBufferWriter(sizeof(byte) * 3 + sizeof(float), Allocator.Temp))
+            // action(1) + success(1) + value(4) + count(1) + reason(1)
+            using (var writer = new FastBufferWriter(sizeof(byte) * 4 + sizeof(float), Allocator.Temp))
             {
                 writer.WriteValueSafe(action);
                 writer.WriteValueSafe(success ? (byte)1 : (byte)0);
                 writer.WriteValueSafe(value);
                 writer.WriteValueSafe((byte)Mathf.Clamp(count, 0, byte.MaxValue));
+                writer.WriteValueSafe(reason);
                 messaging.SendNamedMessage(MsgActionResult, targetClientId, writer);
             }
         }
@@ -1495,7 +1795,10 @@ namespace Y4NGZUpgrades.Patches
                 reader.ReadValueSafe(out byte success);
                 reader.ReadValueSafe(out float value);
                 reader.ReadValueSafe(out byte count);
-                FieldTabletScreenRuntime.OnMainframeActionResult(action, success != 0, value, count);
+                byte reason = ReasonNone;
+                if (reader.TryBeginRead(sizeof(byte)))
+                    reader.ReadValue(out reason);
+                FieldTabletScreenRuntime.OnMainframeActionResult(action, success != 0, value, count, reason);
             }
             catch (Exception ex)
             {
@@ -1503,23 +1806,26 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
-        // - Company calls (non-inlined behind the presence gate, FieldMechanic idiom) -
+        // - Company calls (non-inlined behind FieldTabletCooldowns.IsCompanyPresent, FieldMechanic
+        //   idiom: the reads below only JIT once the gate has said the CCTV plugin is loaded) -
 
-        private static bool? _companyPresent;
-
-        private static bool IsCompanyPresent()
+        private static bool HostIsMainframeHacked()
         {
-            // Every non-inlined call below reaches CctvSupportApi or MainframeSupport, which
-            // Y4NGZCompany#393 moved into LethalCCTV.dll. Gating on com.y4ngz.company would let
-            // these JIT with the CCTV plugin absent.
-            if (!_companyPresent.HasValue)
-                _companyPresent = OptionalPluginCapabilities.LethalCctv;
-            return _companyPresent.Value;
+            return OptionalCctvBridge.IsMainframeHacked;
         }
 
         private static bool HostTryDisableCamera(int cameraId)
         {
-            return OptionalCctvBridge.TryDisableCamera(cameraId);
+            bool wasDisabled = OptionalCctvBridge.IsCameraDisabled(cameraId);
+            if (wasDisabled)
+                return false;
+
+            bool providerAccepted = OptionalCctvBridge.TryDisableCamera(cameraId);
+            bool isDisabled = OptionalCctvBridge.IsCameraDisabled(cameraId);
+            return CctvStatisticsEventGuard.IsNewCameraDisable(
+                wasDisabled,
+                providerAccepted,
+                isDisabled);
         }
 
         private static bool HostTryLockdown(bool begin)
@@ -1527,9 +1833,9 @@ namespace Y4NGZUpgrades.Patches
             return OptionalCctvBridge.TrySetLockdown(begin);
         }
 
-        private static void HostApplyAlarmOp(byte op)
+        private static bool HostApplyAlarmOp(byte op)
         {
-            OptionalCctvBridge.ApplyAlarmOperation(op, AlarmOpSilence);
+            return OptionalCctvBridge.ApplyAlarmOperation(op, AlarmOpSilence);
         }
     }
 }

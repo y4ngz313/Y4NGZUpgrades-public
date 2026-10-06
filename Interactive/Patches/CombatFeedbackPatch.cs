@@ -42,7 +42,7 @@ namespace Y4NGZUpgrades.Interactive.Patches
             if (Time.unscaledTime < _nextFeedbackSampleTime) return;
             _nextFeedbackSampleTime = Time.unscaledTime + FeedbackSampleInterval;
 
-            PlayerDangerHud.UpdatePlayerState(__instance);
+            OptionalDangerHudBridge.UpdatePlayerState(__instance);
         }
 
         [HarmonyPatch(typeof(EnemyAI), "OnCollideWithPlayer")]
@@ -64,11 +64,11 @@ namespace Y4NGZUpgrades.Interactive.Patches
             if (__instance == null || __instance != GameNetworkManager.Instance?.localPlayerController) return;
             if (damageNumber <= 0) return;
 
-            PlayerDangerHud.PulseDamage(damageNumber);
+            OptionalDangerHudBridge.PulseDamage(damageNumber);
 
             Vector3 sourcePosition;
             if (TryResolveDamageSource(__instance, fallDamage, causeOfDeath, out sourcePosition))
-                DirectionalDamageHud.ShowFromWorldPosition(__instance, sourcePosition, damageNumber);
+                OptionalDangerHudBridge.ShowDirectionalDamage(__instance, sourcePosition, damageNumber);
         }
 
         // Per-round reset, dispatched by RoundLifecycle.RoundStarted. It used to postfix
@@ -78,8 +78,7 @@ namespace Y4NGZUpgrades.Interactive.Patches
             _lastPotentialDamageSource = null;
             _lastPotentialDamageSourceTime = -999f;
             _nextFeedbackSampleTime = 0f;
-            DirectionalDamageHud.DestroyInstance();
-            PlayerDangerHud.DestroyInstance();
+            OptionalDangerHudBridge.DestroyInstances();
         }
 
         [HarmonyPatch(typeof(StartOfRound), "EndOfGame")]
@@ -89,8 +88,7 @@ namespace Y4NGZUpgrades.Interactive.Patches
             _lastPotentialDamageSource = null;
             _lastPotentialDamageSourceTime = -999f;
             _nextFeedbackSampleTime = 0f;
-            DirectionalDamageHud.DestroyInstance();
-            PlayerDangerHud.DestroyInstance();
+            OptionalDangerHudBridge.DestroyInstances();
         }
 
         private static bool TryResolveDamageSource(

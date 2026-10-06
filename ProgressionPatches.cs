@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Reflection;
 using GameNetcodeStuff;
 using HarmonyLib;
+using Unity.Netcode;
 using UnityEngine;
+using Y4NGZUpgrades.Patches;
 using Y4NGZUpgrades.Gui;
 
 namespace Y4NGZUpgrades
@@ -405,11 +407,11 @@ namespace Y4NGZUpgrades
                 {
                     case "DefuseCorrectWire":
                         amount = Plugin.ProgressionConfig.DefuseCorrectWireXp.Value;
-                        label = "Correct Defuse wire";
+                        label = "Cut the correct wire";
                         break;
                     case "DefuseCorrectCode":
                         amount = Plugin.ProgressionConfig.DefuseCorrectCodeXp.Value;
-                        label = "Correct Defuse code";
+                        label = "Entered the defuse code";
                         EmployeeStatistics.RecordBombDefused(eventId);
                         break;
                     case "PayloadPilotSeconds":
@@ -421,24 +423,24 @@ namespace Y4NGZUpgrades
                         amount = ProgressionEconomyMath.ComputePayloadPilotXp(
                             seconds,
                             Plugin.ProgressionConfig.PayloadPilotXpPerSecond.Value,
-                            Plugin.ProgressionConfig.PayloadPilotMaxXp.Value);
-                        label = $"Payload piloting {seconds:0.#}s";
+                            ProgressionManager.GetPayloadPilotMaxXp());
+                        label = $"Piloted the cart {seconds:0.#}s";
                         break;
                     case "WhistleblowerSighted":
                         amount = config.WhistleblowerDiscoveryXp.Value;
                         label = TryGetProperty(__0, "Count", out int sighting) && sighting > 0
-                            ? $"Whistleblower sighting {sighting}"
-                            : "Whistleblower sighted";
+                            ? $"Spotted the Whistleblower ({sighting})"
+                            : "Spotted the Whistleblower";
                         break;
                     case "WhistleblowerNeutralized":
                         amount = config.WhistleblowerKillXp.Value;
-                        label = "Whistleblower neutralized";
+                        label = "Killed the Whistleblower";
                         break;
                     case "SurveyDronePlaced":
                         amount = config.SurveyDronePlacedXp.Value;
                         label = string.IsNullOrWhiteSpace(sourceLabel)
-                            ? "Survey drone planted"
-                            : $"Survey drone planted ({sourceLabel})";
+                            ? "Planted a survey beacon"
+                            : $"Planted a survey beacon ({sourceLabel})";
                         // XP may be paid on a crew-wide fan-out; a PERSONAL LIFETIME counter may
                         // not. "You planted 40 beacons" has to mean this player planted them, so
                         // the statistic is gated on the event being individually attributed while
@@ -446,11 +448,24 @@ namespace Y4NGZUpgrades
                         if (ContractEventAttribution.IsIndividuallyAttributed(eventId, playerClientId))
                             EmployeeStatistics.RecordSurveyBeaconPlaced(eventId);
                         break;
+                    // #392 (Company #794): one credit per restored breaker zone, to the player
+                    // who flipped it. Each zone has its own event id, so the once-per-round
+                    // dedupe pays every zone and a partial restore on a failed round pays too.
+                    case "BlackoutBreakerRestored":
+                        amount = config.BlackoutBreakerZoneRestoredXp.Value;
+                        label = string.IsNullOrWhiteSpace(sourceLabel)
+                            ? "Restored the breaker box"
+                            : $"Restored the breaker box ({sourceLabel})";
+                        break;
                     case "BlackoutAuditRestored":
                         amount = config.BlackoutBreakerRestoredXp.Value;
-                        label = string.IsNullOrWhiteSpace(sourceLabel)
-                            ? "Blackout power restored"
-                            : $"Blackout restored ({sourceLabel})";
+                        // Company words the lever path as its own act and merges every other
+                        // source into the breaker line (Y4NGZCompany#1202).
+                        label = sourceLabel != null && sourceLabel.IndexOf("lever", StringComparison.OrdinalIgnoreCase) >= 0
+                            ? "Pulled the audit lever"
+                            : string.IsNullOrWhiteSpace(sourceLabel)
+                                ? "Restored the breaker box"
+                                : $"Restored the breaker box ({sourceLabel})";
                         // Multi-zone restorations are counted at Contracted's per-breaker seam.
                         // This event is the only seam used by the single-breaker fallback path.
                         if (string.Equals(sourceLabel, "single breaker box", StringComparison.OrdinalIgnoreCase))
@@ -458,25 +473,29 @@ namespace Y4NGZUpgrades
                         break;
                     case "ShadowRaidDrillAttached":
                         amount = config.BlacksiteDrillPlacedXp.Value;
-                        label = "Breach drill mounted";
-                        EmployeeStatistics.RecordDrillPlaced(eventId);
+                        label = "Mounted the breach drill";
+                        // Company #1201: an unattributed drill fans out as '.crew.{player}' copies,
+                        // one per participant, and each now reaches its own machine. XP may ride
+                        // that payout; the personal lifetime counter may not.
+                        if (!ContractEventAttribution.IsCrewFanOut(eventId))
+                            EmployeeStatistics.RecordDrillPlaced(eventId);
                         break;
                     case "ShadowRaidDrillCompleted":
                         amount = config.ShadowRaidDrillCompletedXp.Value;
-                        label = "Breach container drilled";
+                        label = "Cracked the container";
                         break;
                     case "PestControlCompleted":
                         amount = config.PestControlCompletedXp.Value;
                         bool hasCompletedCount = TryGetProperty(__0, "Count", out int specimens);
                         label = hasCompletedCount && specimens > 1
-                            ? $"Specimens contained ({specimens})"
-                            : "Specimen contained";
+                            ? $"Trapped {specimens} specimens"
+                            : "Trapped a specimen";
                         break;
                     case "WasteDisposalCompleted":
                         amount = config.WasteDisposalCompletedXp.Value;
                         label = TryGetProperty(__0, "Count", out int burned) && burned > 1
-                            ? $"Waste incinerated ({burned})"
-                            : "Waste incinerated";
+                            ? $"Fired the incinerator ({burned})"
+                            : "Fired the incinerator";
                         break;
                     // ---- kinds added by Company #406 / consumed for #194 ----
                     // Per LIVING participant, once per wave: the publisher credits only players
@@ -484,13 +503,13 @@ namespace Y4NGZUpgrades
                     case "ContainmentBreachWaveSurvived":
                         amount = config.ContainmentWaveSurvivedXp.Value;
                         label = string.IsNullOrWhiteSpace(sourceLabel)
-                            ? "Breach wave survived"
-                            : $"Breach {sourceLabel} survived";
+                            ? "Survived the wave"
+                            : $"Survived {sourceLabel}";
                         EmployeeStatistics.RecordContainmentWaveSurvived(eventId);
                         break;
                     case "ShadowRaidHardDriveRecovered":
                         amount = config.ShadowRaidHardDriveXp.Value;
-                        label = "Hard drive recovered";
+                        label = "Recovered the hard drive";
                         break;
                     // The two count-capped kinds. Both objectives re-arm on a timer, so the event
                     // id dedupe alone leaves them unbounded: the malfunction can be repaired
@@ -499,8 +518,8 @@ namespace Y4NGZUpgrades
                     case "WasteDisposalRepaired":
                         amount = config.WasteDisposalRepairedXp.Value;
                         label = TryGetProperty(__0, "Count", out int repairIndex) && repairIndex > 1
-                            ? $"Incinerator repaired ({repairIndex})"
-                            : "Incinerator repaired";
+                            ? $"Fixed the incinerator ({repairIndex})"
+                            : "Fixed the incinerator";
                         capBucket = "wastedisposal.repair";
                         capMaxPerRound = config.WasteDisposalRepairMaxPerRound.Value;
                         break;
@@ -510,8 +529,8 @@ namespace Y4NGZUpgrades
                         // drop can take several specimens at once.
                         bool hasCaptureCount = TryGetProperty(__0, "Count", out int captureNumber);
                         label = hasCaptureCount && captureNumber > 1
-                            ? $"Specimen captured ({captureNumber})"
-                            : "Specimen captured";
+                            ? $"Trapped {captureNumber} specimens"
+                            : "Trapped a specimen";
                         capBucket = "pestcontrol.capture";
                         capMaxPerRound = config.PestControlCaptureMaxPerRound.Value;
                         break;
@@ -528,8 +547,19 @@ namespace Y4NGZUpgrades
                             : $"{contractType} contract failed";
                         break;
                     default:
-                        return;
+                        if (!LguContractXpCatalog.TryGet(kind, out LguContractXpCatalog.Award lguAward)
+                            || !config.LguObjectiveXp.TryGetValue(kind, out var configuredXp))
+                            return;
+                        amount = configuredXp.Value;
+                        label = lguAward.Label;
+                        break;
                 }
+
+                // #457: the acts the rebalance scales are re-priced against the actor's own rank
+                // band here, once, after the switch has resolved the flat award. Every other kind
+                // - the count-capped credits, the contract outcomes, anything a newer Company
+                // publishes - passes through unchanged.
+                amount = ProgressionManager.GetContractActXp(kind, amount);
 
                 // AddContractXp requires the round latch to still be Active, so the end-of-round
                 // ordering matters and is load-bearing (#194). Verified against the shipped
@@ -544,10 +574,14 @@ namespace Y4NGZUpgrades
                 // ran, and it is already a fallback for a round that reported nothing.
                 // The kind rides along so the award can be reported against the note line
                 // Company writes for that objective (#220). It never affects the payout.
+                // #1201: CrewWide is additive like ContractType/SourceLabel. An older Company
+                // declares no such property, so it reads back false and every award is reported
+                // as the player's own, exactly as before.
+                bool crewWide = TryGetProperty(__0, "CrewWide", out bool crewWideFlag) && crewWideFlag;
                 if (capBucket != null)
-                    ProgressionManager.AddCappedContractXp(eventId, label, amount, capBucket, capMaxPerRound, kind);
+                    ProgressionManager.AddCappedContractXp(eventId, label, amount, capBucket, capMaxPerRound, kind, crewWide);
                 else
-                    ProgressionManager.AddContractXp(eventId, label, amount, oncePerRound: true, kind);
+                    ProgressionManager.AddContractXp(eventId, label, amount, oncePerRound: true, kind, crewWide);
             }
 
             private static bool IsLocalPlayer(ulong playerClientId)
@@ -721,11 +755,82 @@ namespace Y4NGZUpgrades
                     if (target is Component component)
                     {
                         ProgressionManager.RecordMainframeHacked(component);
-                        EmployeeStatistics.RecordDeviceHacked(target);
                     }
                 }
                 catch
                 {
+                }
+            }
+        }
+
+        // MainframeSupport is optional and uses a RequireOwnership=false RPC. The client-side
+        // hacking-overlay callback above is still the progression hook, but it cannot prove that
+        // the server accepted the action. This host-side patch is the employee-statistics hook.
+        [HarmonyPatch]
+        internal static class LethalCctvConfirmedMainframeHackPatch
+        {
+            private static MethodBase _target;
+            private static PropertyInfo _isHackedProperty;
+
+            private static bool Prepare()
+            {
+                if (!OptionalPluginCapabilities.LethalCctv)
+                    return false;
+
+                Type mainframeType = Type.GetType(
+                    "Y4NGZCompany.Facility.Mainframe.MainframeSupport, LethalCCTV",
+                    throwOnError: false);
+                _target = mainframeType?.GetMethod(
+                    "MarkHackedServerRpc",
+                    BindingFlags.Instance | BindingFlags.Public);
+                _isHackedProperty = mainframeType?.GetProperty(
+                    "IsHacked",
+                    BindingFlags.Instance | BindingFlags.Public);
+                return _target != null && _isHackedProperty != null;
+            }
+
+            private static MethodBase TargetMethod()
+            {
+                return _target;
+            }
+
+            [HarmonyPrefix]
+            private static void Prefix(object __instance, out bool __state)
+            {
+                __state = IsServer() && IsHacked(__instance);
+            }
+
+            [HarmonyPostfix]
+            private static void Postfix(object __instance, ServerRpcParams __0, bool __state)
+            {
+                if (__state || !IsServer() || !IsHacked(__instance))
+                    return;
+
+                Component mainframe = __instance as Component;
+                if (mainframe == null)
+                    return;
+
+                CctvEmployeeStatisticsNetwork.RecordHostConfirmedDeviceHack(
+                    __0.Receive.SenderClientId,
+                    "mainframe." + NetworkObjectKey.For(mainframe));
+            }
+
+            private static bool IsServer()
+            {
+                return NetworkManager.Singleton != null && NetworkManager.Singleton.IsServer;
+            }
+
+            private static bool IsHacked(object mainframe)
+            {
+                try
+                {
+                    return _isHackedProperty != null
+                           && _isHackedProperty.GetValue(mainframe) is bool hacked
+                           && hacked;
+                }
+                catch
+                {
+                    return false;
                 }
             }
         }

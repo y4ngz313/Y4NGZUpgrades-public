@@ -11,7 +11,9 @@ namespace Y4NGZUpgrades.Patches
     internal static class SquadSightPatch
     {
         private const float TargetRefreshInterval = 0.20f;
-        private const int ScannerLineOfSightMask = 134217984;
+        // Room + Colliders, the same mask the vanilla scanner uses for line of sight.
+        // Internal so ForemanPingPatch's occlusion test uses the identical mask (F-FOREMAN-A-9).
+        internal const int ScannerLineOfSightMask = 134217984;
         private const float FogOutlineDistance = 10f;
 
         private static readonly Dictionary<Component, GameObject> ActiveOutlines =
@@ -144,9 +146,22 @@ namespace Y4NGZUpgrades.Patches
 
         private static bool FogLikelyObscures(PlayerControllerB localPlayer, float distance)
         {
-            if (localPlayer == null || !localPlayer.isInsideFactory) return false;
-            if (RoundManager.Instance == null || RoundManager.Instance.indoorFog == null) return false;
-            return RoundManager.Instance.indoorFog.gameObject.activeSelf && distance >= FogOutlineDistance;
+            if (localPlayer == null || distance < FogOutlineDistance) return false;
+
+            if (localPlayer.isInsideFactory)
+            {
+                if (RoundManager.Instance == null || RoundManager.Instance.indoorFog == null) return false;
+                return RoundManager.Instance.indoorFog.gameObject.activeSelf;
+            }
+
+            // F-FOREMAN-A-16: the catalog promises "walls or fog", but only RoundManager's
+            // interior fog volume was ever consulted, so a foggy moon - the one place a player
+            // expects the outline - never produced one outdoors. The ship interior is excluded
+            // because the weather volume does not reach inside it.
+            if (localPlayer.isInHangarShipRoom || localPlayer.isInElevator) return false;
+
+            return TimeOfDay.Instance != null
+                && TimeOfDay.Instance.currentLevelWeather == LevelWeatherType.Foggy;
         }
 
         private static Vector3 ResolvePlayerCenter(PlayerControllerB player)

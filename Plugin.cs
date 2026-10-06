@@ -12,6 +12,7 @@ using Y4NGZUpgrades.Upgrades;
 namespace Y4NGZUpgrades
 {
     [BepInPlugin(Guid, Name, Version)]
+    [BepInDependency("com.y4ngz.ui", BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency("com.y4ngz.company", BepInDependency.DependencyFlags.SoftDependency)]
     // Ship Systems owns fuel, power, layout and monitor-row integrations after Y4NGZCompany#613.
     // Keep load ordering soft so Upgrades remains independently installable.
@@ -30,15 +31,41 @@ namespace Y4NGZUpgrades
     [BepInDependency("com.github.teamxiaolan.dawnlib", BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency("me.swipez.melonloader.morecompany", BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency("FlipMods.TooManyEmotes", BepInDependency.DependencyFlags.SoftDependency)]
+    // Late Game Upgrades (#435). Soft, but declared so BepInEx chainloads it first: the bridge
+    // reads its live per-upgrade configuration while building the catalog in Awake, which only
+    // exists once MoreShipUpgrades' own Awake has run.
+    [BepInDependency("com.malco.lethalcompany.moreshipupgrades", BepInDependency.DependencyFlags.SoftDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         public const string Guid = "com.y4ngz.upgrades";
         public const string Name = "Y4NGZUpgrades";
-        public const string Version = "1.0.0";
+        public const string Version = "1.2.0";
 
         internal static Plugin Instance { get; private set; }
         internal static ManualLogSource Log { get; private set; }
         internal static ProgressionSettings ProgressionConfig { get; private set; }
+        internal static bool PurchasesCostTokens => ProgressionConfig?.PurchasesCostTokens?.Value != false;
+
+        /// <summary>
+        /// Which catalog supplies the effects the native tree and Late Game Upgrades both offer
+        /// (#435). NativePreferred until the config is bound, and for any value outside the enum.
+        /// </summary>
+        internal static LguUpgradeMode LguUpgradeMode
+        {
+            get
+            {
+                LguUpgradeMode mode = ProgressionConfig?.LguMode?.Value ?? LguUpgradeMode.NativePreferred;
+                return Enum.IsDefined(typeof(LguUpgradeMode), mode) ? mode : LguUpgradeMode.NativePreferred;
+            }
+        }
+
+        /// <summary>
+        /// Late Game Upgrades installed and integrated into the player menu (#493), fixed at
+        /// startup because the switch is restart-only. The policy, the catalog and the bridge read
+        /// only this, so switched off they take exactly the path an install without Late Game
+        /// Upgrades takes. False until <see cref="Awake"/> has bound the config.
+        /// </summary>
+        internal static bool LguIntegrationActive { get; private set; }
 
         private static ConfigEntry<string> _legacyShadowStepKeybind;
         private static ConfigEntry<string> _legacyPingKeybind;
@@ -46,6 +73,10 @@ namespace Y4NGZUpgrades
         private static ConfigEntry<string> _legacyCommandNetKeybind;
         private static ConfigEntry<string> _legacyWorklightBeaconKeybind;
         private static ConfigEntry<string> _legacyDronePointerCommandKeybind;
+        public static ConfigEntry<int> DroneFlameDamagePerTick;
+        public static ConfigEntry<int> DroneFlameTicksPerBurst;
+        public static ConfigEntry<float> DroneFlameCooldownSeconds;
+        public static ConfigEntry<int> DroneGrenadeDamage;
         public static ConfigEntry<float> TabletPullInMeters;
         public static ConfigEntry<float> TabletPullUpMeters;
         public static ConfigEntry<float> TabletRaisedPullInMeters;
@@ -105,6 +136,11 @@ namespace Y4NGZUpgrades
             ProgressionConfig = new ProgressionSettings(
                 Y4NGZConfigFiles.Progression,
                 Y4NGZConfigFiles.XpSources);
+            bool lguInstalled = OptionalPluginCapabilities.IsLoaded(OptionalPluginCapabilities.LateGameUpgradesGuid);
+            LguIntegrationActive = NativeUpgradeFamilies.IntegrationActive(
+                lguInstalled, ProgressionConfig.IntegrateLgu.Value);
+            if (lguInstalled && !LguIntegrationActive)
+                Log.LogInfo("[LGU] Integrate LGU Into Player Menu is off: Late Game Upgrades keeps its own store and the player menu treats it as absent.");
             // Hosts every session-lifetime component and coroutine that must outlive scenes, player
             // objects and BepInEx_Manager itself (#211, #313).
             Y4NGZPersistentRunner.Ensure();
@@ -122,6 +158,10 @@ namespace Y4NGZUpgrades
             Y4NGZUpgrades.Gui.Plugin.Initialize(Y4NGZConfigFiles.PlayerMenu, Logger, sessionHost);
             MigrateLegacyKeybinds();
             RefreshReservedKeyNames();
+            // Before the catalog: the bridge decides which Late Game Upgrades rows exist and how
+            // many ranks each one sells, and its readiness is the LateGameUpgrades provider flag.
+            _harmony = new Harmony(Guid);
+            LguUpgradeBridge.Initialize(_harmony);
             Y4NGZUpgradeCatalog.RegisterDefaults();
             Effects.MovementPlayerAnimationRuntimeAssets.Prewarm();
 
@@ -135,19 +175,76 @@ namespace Y4NGZUpgrades
 
             // Must run before PatchAll: RoundLifecycle's hooks can fire as soon as they exist.
             RoundLifecycle.Install();
-            _harmony = new Harmony(Guid);
-            _harmony.PatchAll(typeof(ProgressionPatches).Assembly);
+            ApplyPatchClasses();
             Y4NGZUpgrades.Patches.ExtraSlotManager.Initialize();
             Y4NGZUpgrades.Patches.FieldOperationsTabletPatch.Initialize();
             Y4NGZUpgrades.Patches.ChameleonCompanyPatch.Initialize();
             Y4NGZUpgrades.Patches.ScavengerCompanyPatch.Initialize();
             Y4NGZUpgrades.Patches.QuotaGuardCompanyPatch.Initialize();
+            RetireDeeperPocketsIfNativeInventoryFailed();
 
             // The entire weapon block - dev spawn hosts, creature blood, impact tints, VFX
             // diagnostics, ballistics toggle, bullet-hole decals, visual/FP-prop config and weapon
             // registration - moved to BetterArmory.Plugin.Awake (#266).
 
             Log.LogMessage($"{Name} v{Version} loaded. Native progression enabled.");
+        }
+
+        /// <summary>
+        /// Applies one patch class at a time (F-INFRA-1). HarmonyX's <c>PatchAll(Assembly)</c> is a
+        /// bare <c>foreach</c> with no per-type try/catch and <c>PatchClassProcessor.Patch()</c>
+        /// rethrows as a <c>HarmonyException</c>, so a single class that cannot apply - a transpiler
+        /// whose IL shape is gone, a <c>TargetMethod()</c> that resolves to null (the 2026-07-30
+        /// incident documented in ProgressionPatches) - aborts every class after it in metadata
+        /// order AND the rest of <see cref="Awake"/>. That reads to the player as "nothing works".
+        /// The summary line is the one-line grep target for a bug report.
+        /// </summary>
+        private static void ApplyPatchClasses()
+        {
+            int applied = 0;
+            int failed = 0;
+            foreach (Type type in AccessTools.GetTypesFromAssembly(typeof(ProgressionPatches).Assembly))
+            {
+                try
+                {
+                    System.Collections.Generic.List<System.Reflection.MethodInfo> patched =
+                        _harmony.CreateClassProcessor(type).Patch();
+                    if (patched != null && patched.Count > 0)
+                        applied++;
+                }
+                catch (Exception exception)
+                {
+                    failed++;
+                    Log.LogError(
+                        $"[Y4NGZUpgrades] Patch class '{type.FullName}' could not be applied; its hooks "
+                        + $"are inactive and every other patch is unaffected: {exception}");
+                }
+            }
+
+            Log.LogMessage($"[Y4NGZUpgrades] Applied {applied} patch classes, {failed} failed.");
+        }
+
+        /// <summary>
+        /// F-ENF-1. The Deeper Pockets catalog row gates on the NativeInventory provider, but the
+        /// flag that actually turns extra slots on is the v81 slot-RPC IL contract validated by
+        /// ExtraSlotPatch's transpiler - which only runs during patching, i.e. after the catalog was
+        /// built. If that contract failed, the row has to leave the catalog too; otherwise the
+        /// player spends three tier-3 tokens on a node that can never grant a slot.
+        /// <see cref="Y4NGZUpgradeCatalog.RegisterDefaults"/> is idempotent (it opens with
+        /// ClearDefinitions and re-binds the same config keys, which BepInEx returns unchanged), so
+        /// a second pass is safe.
+        /// </summary>
+        private static void RetireDeeperPocketsIfNativeInventoryFailed()
+        {
+            if (!OptionalPluginCapabilities.NativeInventoryAvailable
+                || Y4NGZUpgrades.Patches.ExtraSlotManager.NativeSlotsEnabled)
+            {
+                return;
+            }
+
+            OptionalPluginCapabilities.SuppressNativeInventory(
+                "the v81 slot-switch IL contract did not validate during patching");
+            Y4NGZUpgradeCatalog.RegisterDefaults();
         }
 
         /// <summary>
@@ -195,6 +292,9 @@ namespace Y4NGZUpgrades
             RunShutdownStep("extra slots", Y4NGZUpgrades.Patches.ExtraSlotManager.Shutdown);
             RunShutdownStep("player menu", Y4NGZUpgrades.Gui.Plugin.Shutdown);
             RunShutdownStep("interactive systems", Y4NGZUpgrades.Interactive.Plugin.Shutdown);
+            // Before UnpatchSelf so the bridge removes its own Late Game Upgrades hooks and stops
+            // its settle coroutine while its state is still addressable.
+            RunShutdownStep("Late Game Upgrades bridge", LguUpgradeBridge.Shutdown);
 
             Harmony harmony = _harmony;
             _harmony = null;
@@ -226,11 +326,18 @@ namespace Y4NGZUpgrades
         public static float GetTabletScreenWidth() => ClampConfig(TabletScreenWidth, 0.21328f, 0.04f, 0.60f);
         public static float GetTabletScreenHeight() => ClampConfig(TabletScreenHeight, 0.14803f, 0.03f, 0.40f);
         public static bool GetTabletScreenCalibration() => TabletScreenCalibration != null && TabletScreenCalibration.Value;
+        public static int GetDroneFlameDamagePerTick() => ClampConfig(DroneFlameDamagePerTick, 1, 1, 10);
+        public static int GetDroneFlameTicksPerBurst() => ClampConfig(DroneFlameTicksPerBurst, 2, 1, 10);
+        public static float GetDroneFlameCooldownSeconds() => ClampConfig(DroneFlameCooldownSeconds, 6.5f, 1f, 60f);
+        public static int GetDroneGrenadeDamage() => ClampConfig(DroneGrenadeDamage, 3, 1, 20);
         private void BindCustomUpgradeConfig()
         {
+            // F-SHADOW-3: G is vanilla's DiscardHeldObject key, so the out-of-the-box cloak key
+            // also threw the player's scrap on the floor. Keep this in step with
+            // Gui.IngameKeybinds.ShadowStep (<Keyboard>/x).
             _legacyShadowStepKeybind = BindUpgradeSetting(
-                "shadow_step", "Controls", "Activation Key", "g",
-                "Key used to activate Shadow Step at level 3. Use a Unity Input System key name.",
+                "shadow_step", "Controls", "Activation Key", "x",
+                "Key used to activate Shadow Step at any level. Use a Unity Input System key name.",
                 "Keybinds", "Shadow Step Key");
             _legacyPingKeybind = BindUpgradeSetting(
                 "ping", "Controls", "Activation Key", "q",
@@ -268,6 +375,28 @@ namespace Y4NGZUpgrades
                 "courier_drone", "Controls", "Pointer Command", "MiddleButton",
                 "Button used for Courier Drone pointer commands. Mouse values: MiddleButton, RightButton, ForwardButton, or BackButton; keyboard values use Unity Input System key names.",
                 "Courier Drone", "DronePointerCommandKeybind");
+
+            Y4NGZConfigScope droneConfig = Y4NGZConfigFiles.Upgrade("courier_drone");
+            DroneFlameDamagePerTick = Y4NGZConfigFiles.BindMigrated(
+                droneConfig, "Combat", "Flame Damage Per Tick", 1,
+                new ConfigDescription(
+                    "Enemy damage per flame tick. Host's value applies. Old fixed value 1.",
+                    new AcceptableValueRange<int>(1, 10)));
+            DroneFlameTicksPerBurst = Y4NGZConfigFiles.BindMigrated(
+                droneConfig, "Combat", "Flame Ticks Per Burst", 2,
+                new ConfigDescription(
+                    "Damage ticks per flame burst. The first tick lands at once; the rest follow at intervals of 1.2 s divided by this value (default 2: ticks at 0 s and 0.6 s). Host's value applies. Old fixed value 3.",
+                    new AcceptableValueRange<int>(1, 10)));
+            DroneFlameCooldownSeconds = Y4NGZConfigFiles.BindMigrated(
+                droneConfig, "Combat", "Flame Cooldown Seconds", 6.5f,
+                new ConfigDescription(
+                    "Seconds between flame bursts. Host's value applies. Old fixed value 5.",
+                    new AcceptableValueRange<float>(1f, 60f)));
+            DroneGrenadeDamage = Y4NGZConfigFiles.BindMigrated(
+                droneConfig, "Combat", "Grenade Damage", 3,
+                new ConfigDescription(
+                    "Enemy damage per grenade explosion within 4.5 m. Host's value applies. Old fixed value 6 (vanilla landmine).",
+                    new AcceptableValueRange<int>(1, 20)));
 
             Y4NGZConfigScope tabletConfig = Y4NGZConfigFiles.Upgrade("field_operations");
             TabletPullInMeters = BindTabletSetting(
@@ -386,6 +515,12 @@ namespace Y4NGZUpgrades
             return Mathf.Clamp(value, min, max);
         }
 
+        private static int ClampConfig(ConfigEntry<int> entry, int fallback, int min, int max)
+        {
+            int value = entry != null ? entry.Value : fallback;
+            return Mathf.Clamp(value, min, max);
+        }
+
 
 
         private static Vector3 ParseVec(string s, Vector3 fallback)
@@ -421,6 +556,8 @@ namespace Y4NGZUpgrades
             }
 
             Y4NGZConfigFiles.RetireBindings(
+                "input-menu",
+                "legacy control setting(s); controls now live in the in-game keybind menu",
                 _legacyShadowStepKeybind,
                 _legacyPingKeybind,
                 _legacyFieldTabletKeybind,

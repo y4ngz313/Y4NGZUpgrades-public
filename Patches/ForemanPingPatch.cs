@@ -8,7 +8,6 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using Y4NGZUpgrades.Effects;
 using Y4NGZUpgrades.Interactive;
-using Y4NGZUpgrades.Interactive.Hud;
 using Y4NGZUpgrades.Upgrades;
 
 #pragma warning disable Harmony003
@@ -23,16 +22,23 @@ namespace Y4NGZUpgrades.Patches
         private const string MSG_REVIVE_RESULT = "ForemanPing_InspireResult";
         private const string MSG_REVIVE_SYNC = "ForemanPing_Revive";
         private const string MSG_POINT_SYNC = "ForemanPing_Point";
-        private const string PROMPT_KEY = "foreman_ping";
         private const int POINT_EMOTE_ID = 2;
         private const float POINT_DURATION = 1.0f;
-        private const float POINT_FADE_SECONDS = 0.08f;
+        private const float POINT_RAISE_SECONDS = 0.14f;
+        private const float POINT_RETURN_SECONDS = 0.20f;
         private const string STOW_REASON = "foreman-ping-point";
         // Backstop for a pointing layer that never finishes fading out.
         private const float POINT_STOW_TIMEOUT_SECONDS = 4f;
         private const float TARGET_SPHERE_RADIUS = 0.75f;
         private const float TARGET_MAX_ANGLE = 22f;
         private const float TARGET_NETWORK_FALLBACK_RADIUS = 4f;
+        // F-FOREMAN-A-19: melee that routes through a ServerRpc -> ClientRpc round trip
+        // (Nutcracker's leg kick) can land well after OnCollideWithPlayer on a laggy link,
+        // so the contact window has to outlive one RTT rather than a single physics step.
+        private const float ENEMY_CONTACT_WINDOW_SECONDS = 1.5f;
+        // Location marker idle bob, so a static world marker still reads as "placed just now".
+        private const float LOCATION_MARKER_BOB_SPEED = 2.2f;
+        private const float LOCATION_MARKER_BOB_HEIGHT = 0.12f;
 
         private enum MarkKind
         {
@@ -51,7 +57,9 @@ namespace Y4NGZUpgrades.Patches
             NoResponse = 1,
             AlreadyUsed = 2,
             InvalidTarget = 3,
-            OutOfRange = 4
+            OutOfRange = 4,
+            // Append-only: the server's own retry stamp rejected the request (F-FOREMAN-A-2).
+            OnCooldown = 5
         }
 
         private struct PingTarget
@@ -78,6 +86,9 @@ namespace Y4NGZUpgrades.Patches
         {
             internal float Until;
             internal float Weight;
+            internal float BlendFrom;
+            internal float BlendTarget;
+            internal float BlendStartedAt;
             internal HeldItemStowHandle Stow;
         }
 
@@ -86,15 +97,24 @@ namespace Y4NGZUpgrades.Patches
         private static readonly Dictionary<int, RemotePointState> RemotePointStates = new Dictionary<int, RemotePointState>();
         private static HeldItemStowHandle _localPointStow;
         private static readonly HashSet<ulong> InspireUsedThisRoundByClient = new HashSet<ulong>();
+        // F-FOREMAN-A-2: server-side retry stamp per client, so a modified client that ignores
+        // its own cooldown cannot re-roll the 50% every frame.
+        private static readonly Dictionary<ulong, float> InspireRetryAtByClient = new Dictionary<ulong, float>();
+        // F-FOREMAN-A-19: keyed per enemy instead of a single "most recent" slot, so a second
+        // enemy touching the player cannot evict the marked one out of the window.
+        private static readonly Dictionary<EnemyAI, float> RecentEnemyContacts = new Dictionary<EnemyAI, float>();
+        private static readonly List<EnemyAI> ExpiredContactBuffer = new List<EnemyAI>();
 
         private static float _nextPingTime;
         private static float _nextInspireTime;
+        private static float _nextInspireTipTime;
         private static bool _handlersRegistered;
         private static bool _pointingLayerActive;
         private static float _localPointUntil;
         private static float _localPointWeight;
-        private static EnemyAI _recentContactEnemy;
-        private static float _recentContactExpiresAt;
+        private static float _localPointBlendFrom;
+        private static float _localPointBlendTarget;
+        private static float _localPointBlendStartedAt;
 
         // Per-round reset, dispatched by RoundLifecycle.RoundStarted. It used to postfix
         // StartOfRound.StartGame, which never runs on a client (#214).
@@ -103,15 +123,21 @@ namespace Y4NGZUpgrades.Patches
             RegisterNetworkHandlers();
             _nextPingTime = 0f;
             _nextInspireTime = 0f;
+            _nextInspireTipTime = 0f;
             ClearServerInspireUses();
             _pointingLayerActive = false;
             _localPointUntil = 0f;
             _localPointWeight = 0f;
+            _localPointBlendFrom = 0f;
+            _localPointBlendTarget = 0f;
+            _localPointBlendStartedAt = 0f;
             _localPointStow.Dispose();
             _localPointStow = default;
             RemotePointStates.Clear();
             MarkedEnemies.Clear();
             MarkedPlayers.Clear();
+            RecentEnemyContacts.Clear();
+            LocationMarker.DestroyAll();
         }
 
         [HarmonyPatch(typeof(StartOfRound), "EndOfGame")]
@@ -119,16 +145,21 @@ namespace Y4NGZUpgrades.Patches
         private static void PostEndOfGame()
         {
             _nextInspireTime = 0f;
+            _nextInspireTipTime = 0f;
             ClearServerInspireUses();
             _pointingLayerActive = false;
             _localPointUntil = 0f;
             _localPointWeight = 0f;
+            _localPointBlendFrom = 0f;
+            _localPointBlendTarget = 0f;
+            _localPointBlendStartedAt = 0f;
             _localPointStow.Dispose();
             _localPointStow = default;
             RemotePointStates.Clear();
             MarkedEnemies.Clear();
             MarkedPlayers.Clear();
-            Y4ngzPromptOverlay.ClearPersistentPrompt(PROMPT_KEY);
+            RecentEnemyContacts.Clear();
+            LocationMarker.DestroyAll();
         }
 
         [HarmonyPatch(typeof(GameNetworkManager), "Disconnect")]
@@ -136,7 +167,11 @@ namespace Y4NGZUpgrades.Patches
         private static void PostDisconnect()
         {
             _nextInspireTime = 0f;
+            _nextInspireTipTime = 0f;
             InspireUsedThisRoundByClient.Clear();
+            InspireRetryAtByClient.Clear();
+            RecentEnemyContacts.Clear();
+            LocationMarker.DestroyAll();
             _handlersRegistered = false;
         }
 
@@ -144,7 +179,10 @@ namespace Y4NGZUpgrades.Patches
         {
             NetworkManager network = NetworkManager.Singleton;
             if (network == null || network.IsServer)
+            {
                 InspireUsedThisRoundByClient.Clear();
+                InspireRetryAtByClient.Clear();
+            }
         }
 
         [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
@@ -170,7 +208,6 @@ namespace Y4NGZUpgrades.Patches
                     return;
                 }
 
-                UpdatePrompt(player);
                 UpdateLocalPointingLayer(player, advanceWeight: true);
 
                 if (!Gui.UpgradeInput.WasPressed(Gui.Plugin.Keybinds?.ForemanPing))
@@ -188,9 +225,13 @@ namespace Y4NGZUpgrades.Patches
                 if (Time.time < _nextPingTime)
                     return;
 
+                // F-FOREMAN-A-10: only a ping that actually produced a mark charges the 3s
+                // cooldown. Aiming at nothing used to cost a silent three-second lockout.
+                if (!TryHandlePing(player))
+                    return;
+
                 _nextPingTime = Time.time + PingUpgrade.COOLDOWN_SECONDS;
                 PulsePointing(player);
-                TryHandlePing(player);
             }
             catch (Exception ex)
             {
@@ -224,8 +265,30 @@ namespace Y4NGZUpgrades.Patches
             if (player == null || player != local)
                 return;
 
-            _recentContactEnemy = __instance;
-            _recentContactExpiresAt = Time.time + 0.4f;
+            PruneExpiredContacts();
+            RecentEnemyContacts[__instance] = Time.time + ENEMY_CONTACT_WINDOW_SECONDS;
+        }
+
+        // Runs per physics contact, not per frame, and reuses a static buffer so the wider
+        // window does not trade a bug for allocation churn.
+        private static void PruneExpiredContacts()
+        {
+            if (RecentEnemyContacts.Count <= 0)
+                return;
+
+            float now = Time.time;
+            ExpiredContactBuffer.Clear();
+            foreach (KeyValuePair<EnemyAI, float> pair in RecentEnemyContacts)
+            {
+                if (now < pair.Value && pair.Key != null)
+                    continue;
+
+                ExpiredContactBuffer.Add(pair.Key);
+            }
+
+            for (int i = 0; i < ExpiredContactBuffer.Count; i++)
+                RecentEnemyContacts.Remove(ExpiredContactBuffer[i]);
+            ExpiredContactBuffer.Clear();
         }
 
         internal static float GetMarkedTeammateDamageReduction(PlayerControllerB player)
@@ -248,13 +311,22 @@ namespace Y4NGZUpgrades.Patches
 
         internal static float GetRecentMarkedEnemyDamageReduction()
         {
-            if (_recentContactEnemy == null || Time.time >= _recentContactExpiresAt)
+            if (RecentEnemyContacts.Count <= 0)
                 return 0f;
 
-            if (!IsEnemyMarked(_recentContactEnemy))
-                return 0f;
+            // Dictionary<K,V> has a struct enumerator, so this stays allocation-free on the
+            // damage path. First marked, still-fresh contact wins.
+            float now = Time.time;
+            foreach (KeyValuePair<EnemyAI, float> pair in RecentEnemyContacts)
+            {
+                if (now >= pair.Value || pair.Key == null)
+                    continue;
 
-            return PingUpgrade.ENEMY_DAMAGE_REDUCTION;
+                if (IsEnemyMarked(pair.Key))
+                    return PingUpgrade.ENEMY_DAMAGE_REDUCTION;
+            }
+
+            return 0f;
         }
 
         private static bool IsEnemyMarked(EnemyAI enemy)
@@ -291,19 +363,24 @@ namespace Y4NGZUpgrades.Patches
             return PingUpgrade.IsUnlocked() || InspireUpgrade.IsUnlocked();
         }
 
-        private static void TryHandlePing(PlayerControllerB player)
+        /// <summary>Returns true only when a mark was actually produced (F-FOREMAN-A-10).</summary>
+        private static bool TryHandlePing(PlayerControllerB player)
         {
             if (!PingUpgrade.IsUnlocked())
-                return;
+                return false;
 
             if (TryFindPingTarget(player, out PingTarget target))
             {
                 ApplyMark(target, PingUpgrade.GetTier(), fromNetwork: false);
                 BroadcastMark(target, PingUpgrade.GetTier());
-                return;
+                return true;
             }
 
-            Plugin.Log?.LogDebug("ForemanPingPatch: no valid ping target; ignoring ping without location marker.");
+            // With the Location fallback in place this is only reachable when there is no camera
+            // or nothing at all in front of the player; say so instead of failing silently.
+            HUDManager.Instance?.DisplayTip("PING", "Nothing to mark.", isWarning: true);
+            Plugin.Log?.LogDebug("ForemanPingPatch: no valid ping target and no location fallback.");
+            return false;
         }
 
         private static bool TryHandleInspire(PlayerControllerB player)
@@ -315,14 +392,22 @@ namespace Y4NGZUpgrades.Patches
             if (body == null || body.playerScript == null)
                 return false;
 
+            // F-FOREMAN-A-10: on cooldown the press used to be swallowed, so a player standing
+            // near any corpse could not ping at all. Fall through to the normal ping instead,
+            // with a throttled tip explaining why no revive was attempted.
             if (Time.time < _nextInspireTime)
             {
-                int remainingSeconds = Mathf.CeilToInt(_nextInspireTime - Time.time);
-                HUDManager.Instance?.DisplayTip(
-                    "INSPIRE",
-                    $"Ready in {remainingSeconds}s.",
-                    isWarning: true);
-                return true;
+                if (Time.time >= _nextInspireTipTime)
+                {
+                    _nextInspireTipTime = Time.time + 5f;
+                    int remainingSeconds = Mathf.CeilToInt(_nextInspireTime - Time.time);
+                    HUDManager.Instance?.DisplayTip(
+                        "INSPIRE",
+                        $"Ready in {remainingSeconds}s.",
+                        isWarning: true);
+                }
+
+                return false;
             }
 
             int playerId = (int)body.playerScript.playerClientId;
@@ -395,6 +480,16 @@ namespace Y4NGZUpgrades.Patches
 
             if (candidates.Count <= 0)
             {
+                // F-FOREMAN-A-3: MarkKind.Location was declared, scored and coloured but never
+                // constructed, so pinging a wall, a floor or any unrecognised object was a silent
+                // no-op. Fall back to a world marker on whatever the ray actually hit.
+                if (TryBuildLocationTarget(ray, rayHits, out target))
+                {
+                    Plugin.Log?.LogDebug(
+                        $"ForemanPingPatch: no object target; falling back to location marker at {target.Position}.");
+                    return true;
+                }
+
                 Plugin.Log?.LogDebug(
                     $"ForemanPingPatch: target resolution missed. rayHits={rayHits.Length}, sphereHits={sphereHits.Length}");
                 return false;
@@ -405,6 +500,43 @@ namespace Y4NGZUpgrades.Patches
             target = best.Target;
             Plugin.Log?.LogDebug(
                 $"ForemanPingPatch: target={target.Kind}:{target.Label} source={best.Source} collider={DescribeCollider(best.Collider)} distance={best.Distance:F1} angle={best.Angle:F1} root={(target.Root != null ? target.Root.name : "null")} net={target.NetworkObjectId}");
+            return true;
+        }
+
+        /// <summary>
+        /// F-FOREMAN-A-3: the Location half of "Mark a location, or outline ...". Uses the first
+        /// solid thing the aim ray hit; the mark message already carries a position and
+        /// ResolveNetworkTarget already tolerates a null root, so this replicates like any other
+        /// mark and every peer spawns its own marker object.
+        /// </summary>
+        private static bool TryBuildLocationTarget(Ray ray, RaycastHit[] rayHits, out PingTarget target)
+        {
+            target = default;
+
+            // rayHits was already distance-sorted by AddPingCandidates.
+            for (int i = 0; i < rayHits.Length; i++)
+            {
+                Collider collider = rayHits[i].collider;
+                if (collider == null || collider.isTrigger)
+                    continue;
+
+                target = BuildTarget(MarkKind.Location, null, 0UL, -1, rayHits[i].point, "location");
+                return true;
+            }
+
+            // Nothing solid within reach: drop the marker at the far end of the aim ray so the
+            // press still communicates a direction rather than doing nothing.
+            RaycastHit blocking;
+            Vector3 point = Physics.Raycast(
+                ray,
+                out blocking,
+                PingUpgrade.TARGET_RANGE,
+                SquadSightPatch.ScannerLineOfSightMask,
+                QueryTriggerInteraction.Ignore)
+                ? blocking.point
+                : ray.origin + ray.direction * PingUpgrade.TARGET_RANGE;
+
+            target = BuildTarget(MarkKind.Location, null, 0UL, -1, point, "location");
             return true;
         }
 
@@ -451,6 +583,13 @@ namespace Y4NGZUpgrades.Patches
                 if (angle > TARGET_MAX_ANGLE)
                     continue;
 
+                // F-FOREMAN-A-9: both casts collect every hit and TryResolveTarget simply skips
+                // geometry, so a wall never blocked anything - Ping doubled as an 80m through-wall
+                // radar and Ping L2's damage cut could be pre-applied to an unseen enemy. Same mask
+                // the vanilla scanner (and SquadSightPatch) uses for line of sight.
+                if (!HasLineOfSight(ray.origin, aimPoint, resolved.Root, collider))
+                    continue;
+
                 float sourcePenalty = source == "ray" ? 0f : 3f;
                 float score = distance + angle * 1.75f + KindScorePenalty(resolved.Kind) + sourcePenalty;
                 candidates.Add(new PingCandidate
@@ -463,6 +602,30 @@ namespace Y4NGZUpgrades.Patches
                     Source = source
                 });
             }
+        }
+
+        /// <summary>
+        /// Mirrors <c>SquadSightPatch.HasReliableDirectVisibility</c>: the candidate is visible
+        /// when nothing on the line-of-sight mask sits between the camera and it, or when the
+        /// only thing hit belongs to the candidate itself.
+        /// </summary>
+        private static bool HasLineOfSight(Vector3 origin, Vector3 aimPoint, GameObject root, Collider candidate)
+        {
+            RaycastHit blocking;
+            if (!Physics.Linecast(
+                    origin,
+                    aimPoint,
+                    out blocking,
+                    SquadSightPatch.ScannerLineOfSightMask,
+                    QueryTriggerInteraction.Ignore))
+            {
+                return true;
+            }
+
+            if (blocking.collider == null || blocking.collider == candidate)
+                return true;
+
+            return root != null && blocking.collider.transform.IsChildOf(root.transform);
         }
 
         private static bool TryResolveTarget(Collider collider, Vector3 hitPoint, out PingTarget target)
@@ -497,6 +660,58 @@ namespace Y4NGZUpgrades.Patches
                 GameObject root = ResolveRenderableRoot(entrance.gameObject, entrance.gameObject);
                 string label = entrance.entranceId == 0 ? "main entrance" : "fire exit";
                 target = BuildTarget(MarkKind.Entrance, root, entrance.NetworkObjectId, -1, ResolveRendererCenter(root, ResolveEntranceCenter(entrance)), label);
+                return true;
+            }
+
+            // F-FOREMAN-A-3: turrets, mines and spike traps are neither EnemyAI nor
+            // GrabbableObject, so no branch could ever reach them - MarkKind.Trap was dead.
+            if (TryResolveTrap(collider, out target))
+                return true;
+
+            // F-FOREMAN-A-3: levers, doors and terminals likewise. Checked last so an entrance
+            // (which carries its own InteractTrigger) still resolves as an entrance.
+            InteractTrigger interact = collider.GetComponentInParent<InteractTrigger>();
+            if (interact != null)
+            {
+                GameObject root = ResolveRenderableRoot(interact.gameObject, interact.gameObject);
+                target = BuildTarget(
+                    MarkKind.Interactable,
+                    root,
+                    interact.NetworkObjectId,
+                    -1,
+                    ResolveRendererCenter(root, interact.transform.position),
+                    string.IsNullOrWhiteSpace(interact.hoverTip) ? "interactable" : interact.hoverTip);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveTrap(Collider collider, out PingTarget target)
+        {
+            target = default;
+
+            Turret turret = collider.GetComponentInParent<Turret>();
+            if (turret != null)
+            {
+                GameObject root = ResolveRenderableRoot(turret.gameObject, turret.gameObject);
+                target = BuildTarget(MarkKind.Trap, root, turret.NetworkObjectId, -1, ResolveRendererCenter(root, turret.transform.position), "turret");
+                return true;
+            }
+
+            Landmine mine = collider.GetComponentInParent<Landmine>();
+            if (mine != null && !mine.hasExploded)
+            {
+                GameObject root = ResolveRenderableRoot(mine.gameObject, mine.gameObject);
+                target = BuildTarget(MarkKind.Trap, root, mine.NetworkObjectId, -1, ResolveRendererCenter(root, mine.transform.position), "landmine");
+                return true;
+            }
+
+            SpikeRoofTrap spikes = collider.GetComponentInParent<SpikeRoofTrap>();
+            if (spikes != null)
+            {
+                GameObject root = ResolveRenderableRoot(spikes.gameObject, spikes.gameObject);
+                target = BuildTarget(MarkKind.Trap, root, spikes.NetworkObjectId, -1, ResolveRendererCenter(root, spikes.transform.position), "spike trap");
                 return true;
             }
 
@@ -559,65 +774,67 @@ namespace Y4NGZUpgrades.Patches
                     OutlineChannelFor(target.Kind),
                     PingUpgrade.MARK_DURATION,
                     UpgradeOutlineSource.Ping);
-                Plugin.Log?.LogInfo(
+                // WP12: one line per mark at Info spammed the log at the 3 s ping cadence for
+                // every crew member; marks are routine, so this is diagnostic only.
+                Plugin.Log?.LogDebug(
                     $"ForemanPingPatch: mark {(fromNetwork ? "recv" : "local")} kind={target.Kind} label={target.Label} root={target.Root.name} shown={shown} net={target.NetworkObjectId} player={target.PlayerId}");
+                return;
             }
-            else
-            {
-                Plugin.Log?.LogInfo(
-                    $"ForemanPingPatch: mark {(fromNetwork ? "recv" : "local")} kind={target.Kind} label={target.Label} had no root; no marker spawned.");
-            }
+
+            // F-FOREMAN-A-3: an outline needs renderers, so a Location mark (and any object mark
+            // whose root did not survive replication) gets a spawned world marker instead.
+            LocationMarker.Spawn(target.Position, OutlineChannelFor(target.Kind), PingUpgrade.MARK_DURATION);
+            Plugin.Log?.LogDebug(
+                $"ForemanPingPatch: mark {(fromNetwork ? "recv" : "local")} kind={target.Kind} label={target.Label} had no root; spawned world marker at {target.Position}.");
         }
 
-        internal static void MarkTeammateFromCommandNet(PlayerControllerB player)
+        // WP12 dead-code sweep: MarkTeammateFromCommandNet(PlayerControllerB) is deleted. It was
+        // the pre-F-FOREMAN-B-3 mark-and-rebroadcast entry point; CommandNetPatch now calls only
+        // MarkTeammateFromCommandNetLocal, which CommandNetChecks asserts.
+
+        /// <summary>
+        /// F-FOREMAN-B-3: the receive-only half of the Command Net damage mark. Command
+        /// Net's damage notice is already fanned out to every client and gated on the receiver
+        /// owning level 2, so each eligible player paints their own outline; re-broadcasting a mark
+        /// from every receiver amplified O(N^2) and, because the mark receive path has no ownership
+        /// check, painted the outline on players who own neither upgrade.
+        /// F-FOREMAN-B-12: <paramref name="outlineSeconds"/> lets Command Net source its advertised
+        /// 5 s from its own constant instead of inheriting whatever Ping's MARK_DURATION is tuned
+        /// to. Pass 0 to keep the Ping duration.
+        /// </summary>
+        internal static void MarkTeammateFromCommandNetLocal(PlayerControllerB damaged, float outlineSeconds = 0f)
         {
-            if (player == null)
+            if (damaged == null)
                 return;
 
             PingTarget target = BuildTarget(
                 MarkKind.Player,
-                player.gameObject,
-                ResolveNetworkObjectId(player.gameObject),
-                (int)player.playerClientId,
-                ResolvePlayerCenter(player),
+                damaged.gameObject,
+                ResolveNetworkObjectId(damaged.gameObject),
+                (int)damaged.playerClientId,
+                ResolvePlayerCenter(damaged),
                 "damaged teammate");
 
             ApplyMark(target, pingTier: 2, fromNetwork: true);
-            BroadcastMark(target, pingTier: 2);
+
+            if (outlineSeconds > 0f && target.Root != null)
+            {
+                OutlineEffectBridge.Show(
+                    target.Root,
+                    OutlineChannelFor(MarkKind.Player),
+                    outlineSeconds,
+                    UpgradeOutlineSource.Ping);
+            }
         }
 
-        private static void UpdatePrompt(PlayerControllerB player)
+        // PurchaseMenu owns the one-shot activation tooltip.  These are intentionally small
+        // read-only hooks so it uses the live binding without recreating the old persistent HUD.
+        internal static bool IsPingUnlockedForTooltip() => PingUpgrade.IsUnlocked();
+
+        internal static string GetPingBindingLabelForTooltip()
         {
-            if (!PingUpgrade.IsUnlocked())
-            {
-                Y4ngzPromptOverlay.ClearPersistentPrompt(PROMPT_KEY);
-                return;
-            }
-
-            bool gated = player == null
-                || player.isPlayerDead
-                || player.isTypingChat
-                || player.inTerminalMenu
-                || (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen);
-            if (gated)
-            {
-                Y4ngzPromptOverlay.ClearPersistentPrompt(PROMPT_KEY);
-                return;
-            }
-
-            string bindingPath = Gui.UpgradeInput.EffectivePath(Gui.Plugin.Keybinds?.ForemanPing);
-            if (_cachedPromptText == null || !string.Equals(_cachedPromptPath, bindingPath, StringComparison.Ordinal))
-            {
-                _cachedPromptPath = bindingPath;
-                string label = Gui.UpgradeInput.DisplayLabel(Gui.Plugin.Keybinds?.ForemanPing, "Q");
-                _cachedPromptText = $"[{label}] to ping";
-            }
-
-            Y4ngzPromptOverlay.SetPersistentPrompt(PROMPT_KEY, _cachedPromptText);
+            return Gui.UpgradeInput.DisplayLabel(Gui.Plugin.Keybinds?.ForemanPing, "Q");
         }
-
-        private static string _cachedPromptText;
-        private static string _cachedPromptPath;
 
         private static void PulsePointing(PlayerControllerB player)
         {
@@ -637,10 +854,10 @@ namespace Y4NGZUpgrades.Patches
 
             _localPointUntil = Time.time + POINT_DURATION;
             _pointingLayerActive = true;
-            _localPointWeight = 1f;
+            SetLocalPointBlendTarget(1f);
             Animator animator = player.playerBodyAnimator;
             animator.SetInteger("emoteNumber", POINT_EMOTE_ID);
-            ApplyPointingLayer(player, animator, _localPointWeight);
+            ApplyPointingLayer(player, animator, EvaluateLocalPointWeight());
             BroadcastPointing(player, POINT_DURATION);
         }
 
@@ -655,15 +872,20 @@ namespace Y4NGZUpgrades.Patches
             {
                 animator.SetInteger("emoteNumber", POINT_EMOTE_ID);
                 _pointingLayerActive = true;
+                SetLocalPointBlendTarget(1f);
             }
 
             if (!_pointingLayerActive && _localPointWeight <= 0f)
                 return;
 
+            if (!shouldPoint)
+                SetLocalPointBlendTarget(0f);
+
+            float weight = EvaluateLocalPointWeight();
             if (advanceWeight)
-                _localPointWeight = shouldPoint ? 1f : MovePointWeight(_localPointWeight, 0f);
-            ApplyPointingLayer(player, animator, _localPointWeight);
-            if (advanceWeight && !shouldPoint && _localPointWeight <= 0.001f)
+                _localPointWeight = weight;
+            ApplyPointingLayer(player, animator, weight);
+            if (advanceWeight && !shouldPoint && weight <= 0.001f)
             {
                 _localPointWeight = 0f;
                 _pointingLayerActive = false;
@@ -682,8 +904,7 @@ namespace Y4NGZUpgrades.Patches
             RemotePointState state;
             RemotePointStates.TryGetValue(playerId, out state);
             state.Until = Time.time + Mathf.Clamp(duration, 0.1f, POINT_DURATION + 0.25f);
-            if (state.Weight < 1f)
-                state.Weight = 1f;
+            SetRemotePointBlendTarget(ref state, 1f);
             if (!state.Stow.IsActive)
             {
                 state.Stow = HeldItemStowService.Begin(
@@ -708,12 +929,20 @@ namespace Y4NGZUpgrades.Patches
             Animator animator = player.playerBodyAnimator;
             bool shouldPoint = Time.time < state.Until;
             if (shouldPoint)
+            {
                 animator.SetInteger("emoteNumber", POINT_EMOTE_ID);
+                SetRemotePointBlendTarget(ref state, 1f);
+            }
+            else
+            {
+                SetRemotePointBlendTarget(ref state, 0f);
+            }
 
+            float weight = EvaluateRemotePointWeight(state);
             if (advanceWeight)
-                state.Weight = shouldPoint ? 1f : MovePointWeight(state.Weight, 0f);
-            ApplyPointingLayer(player, animator, state.Weight);
-            if (advanceWeight && !shouldPoint && state.Weight <= 0.001f)
+                state.Weight = weight;
+            ApplyPointingLayer(player, animator, weight);
+            if (advanceWeight && !shouldPoint && weight <= 0.001f)
             {
                 animator.SetInteger("emoteNumber", 0);
                 ApplyPointingLayer(player, animator, 0f);
@@ -733,10 +962,50 @@ namespace Y4NGZUpgrades.Patches
             return players[playerId];
         }
 
-        private static float MovePointWeight(float current, float target)
+        private static void SetLocalPointBlendTarget(float target)
         {
-            float step = POINT_FADE_SECONDS > 0f ? Time.deltaTime / POINT_FADE_SECONDS : 1f;
-            return Mathf.MoveTowards(current, target, Mathf.Clamp01(step));
+            target = Mathf.Clamp01(target);
+            if (Mathf.Approximately(_localPointBlendTarget, target))
+                return;
+            _localPointWeight = EvaluateLocalPointWeight();
+            _localPointBlendFrom = _localPointWeight;
+            _localPointBlendTarget = target;
+            _localPointBlendStartedAt = Time.time;
+        }
+
+        private static float EvaluateLocalPointWeight()
+        {
+            float duration = _localPointBlendTarget >= _localPointBlendFrom
+                ? POINT_RAISE_SECONDS
+                : POINT_RETURN_SECONDS;
+            return ForemanPingGestureMath.Evaluate(
+                _localPointBlendFrom,
+                _localPointBlendTarget,
+                Time.time - _localPointBlendStartedAt,
+                duration);
+        }
+
+        private static void SetRemotePointBlendTarget(ref RemotePointState state, float target)
+        {
+            target = Mathf.Clamp01(target);
+            if (Mathf.Approximately(state.BlendTarget, target))
+                return;
+            state.Weight = EvaluateRemotePointWeight(state);
+            state.BlendFrom = state.Weight;
+            state.BlendTarget = target;
+            state.BlendStartedAt = Time.time;
+        }
+
+        private static float EvaluateRemotePointWeight(RemotePointState state)
+        {
+            float duration = state.BlendTarget >= state.BlendFrom
+                ? POINT_RAISE_SECONDS
+                : POINT_RETURN_SECONDS;
+            return ForemanPingGestureMath.Evaluate(
+                state.BlendFrom,
+                state.BlendTarget,
+                Time.time - state.BlendStartedAt,
+                duration);
         }
 
         private static void ApplyPointingLayer(PlayerControllerB player, Animator animator, float weight)
@@ -910,7 +1179,14 @@ namespace Y4NGZUpgrades.Patches
 
             player.isPlayerDead = false;
             player.isPlayerControlled = true;
-            player.health = 100;
+            // This stands in for vanilla's StartOfRound.ReviveDeadPlayers, whose health literal an
+            // external provider may rewrite - LGU's Stimpack restores its flat health exactly
+            // there. Reviving to the bare literal would delete that health until the next round.
+            // The composition deliberately starts from vanilla's 100, not our own raised maximum:
+            // a Foreman revive has never granted Resilience's extra health and still does not.
+            player.health = LguEffectCompatibility.TryComposeMaxHealth(100, out int revivedHealth)
+                ? revivedHealth
+                : 100;
             player.criticallyInjured = false;
             player.hasBeenCriticallyInjured = false;
             player.bleedingHeavily = false;
@@ -927,8 +1203,40 @@ namespace Y4NGZUpgrades.Patches
             player.overrideGameOverSpectatePivot = null;
             player.hasBegunSpectating = false;
             player.setPositionOfDeadPlayer = false;
-            player.isInElevator = false;
-            player.isInHangarShipRoom = false;
+
+            // F-FOREMAN-A-4: the rest of what vanilla's StartOfRound.ReviveDeadPlayers resets.
+            // Without these a player who died sinking came back permanently crawling (and still
+            // sinking), a two-handed carry stayed flagged, and blood stayed smeared on the visor.
+            player.ResetPlayerBloodObjects(true);
+            player.enemyWaitingForBodyRagdoll = null;
+            player.overridePoisonValue = false;
+            player.clampLooking = false;
+            player.inVehicleAnimation = false;
+            player.ResetZAndXRotation();
+            player.activatingItem = false;
+            player.twoHanded = false;
+            player.inShockingMinigame = false;
+            player.freeRotationInInteractAnimation = false;
+            player.disableSyncInAnimation = false;
+            player.inAnimationWithEnemy = null;
+            player.holdingWalkieTalkie = false;
+            player.speakingToWalkieTalkie = false;
+            player.isSinking = false;
+            player.isUnderwater = false;
+            player.sinkingValue = 0f;
+            player.parentedToElevatorLastFrame = false;
+            if (player.statusEffectAudio != null)
+                player.statusEffectAudio.Stop();
+            if (player.nightVisionRadar != null)
+                player.nightVisionRadar.enabled = false;
+            if (player.helmetLight != null)
+                player.helmetLight.enabled = false;
+            player.DisableJetpackControlsLocally();
+            StartOfRound.Instance.SetPlayerObjectExtrapolate(enable: false);
+
+            // F-FOREMAN-A-4: these were hardcoded to false regardless of where the body actually
+            // lay, so reviving someone inside the ship desynced every isInHangarShipRoom check.
+            ApplyRevivePositionFlags(player, revivePosition);
 
             if (player.thisController != null)
                 player.thisController.enabled = true;
@@ -960,6 +1268,12 @@ namespace Y4NGZUpgrades.Patches
 
             if (player.IsOwner)
             {
+                // F-FOREMAN-A-4: vanilla only resets these on the owner - they are the movement
+                // state that made a quicksand death revive into a permanent crawl.
+                player.hinderedMultiplier = 1f;
+                player.isMovementHindered = 0;
+                player.sourcesCausingSinking = 0;
+
                 HUDManager hud = HUDManager.Instance;
                 if (hud != null)
                 {
@@ -967,12 +1281,174 @@ namespace Y4NGZUpgrades.Patches
                     hud.gameOverAnimator.SetTrigger("revive");
                     hud.UpdateHealthUI(player.health, hurtPlayer: false);
                     hud.SetCracksOnVisor(100f);
+                    if (hud.gasHelmetAnimator != null)
+                        hud.gasHelmetAnimator.SetBool("gasEmitting", false);
                 }
             }
             else if (GameNetworkManager.Instance?.localPlayerController != null
                      && GameNetworkManager.Instance.localPlayerController.isPlayerDead)
             {
                 HUDManager.Instance?.UpdateBoxesSpectateUI();
+            }
+        }
+
+        /// <summary>
+        /// F-FOREMAN-A-4: derive the location flags from where the body actually lies. Vanilla's
+        /// revive always lands in the ship and so can hardcode them; an Inspire revive happens at
+        /// the corpse, which may be in the ship, outdoors, or in the interior.
+        /// </summary>
+        private static void ApplyRevivePositionFlags(PlayerControllerB player, Vector3 revivePosition)
+        {
+            StartOfRound round = StartOfRound.Instance;
+            bool inElevator = round != null
+                && round.shipBounds != null
+                && round.shipBounds.bounds.Contains(revivePosition);
+            bool inShipRoom = inElevator
+                && round.shipInnerRoomBounds != null
+                && round.shipInnerRoomBounds.bounds.Contains(revivePosition);
+
+            player.isInElevator = inElevator;
+            player.isInHangarShipRoom = inShipRoom;
+            player.isInsideFactory = !inElevator && FacilityPositionQuery.IsInsideFactory(revivePosition);
+        }
+
+        /// <summary>
+        /// F-FOREMAN-A-3: a short-lived world marker for marks that cannot be outlined, built
+        /// from primitives with an unlit material tinted to the same channel colours the outline
+        /// effect uses. Self-destructs; no netcode (each peer spawns its own from the replicated
+        /// mark position).
+        /// </summary>
+        private sealed class LocationMarker : MonoBehaviour
+        {
+            // Mirrors OutlineEffectBridge's private line colours; that bridge owns the outline
+            // channels and does not expose them, so the constants are duplicated here.
+            private static readonly Color DangerColor = new Color(1f, 0.18f, 0.12f, 1f);
+            private static readonly Color FriendlyColor = new Color(0.2f, 1f, 0.45f, 1f);
+            private static readonly Color UtilityColor = new Color(0.25f, 0.85f, 1f, 1f);
+
+            private static readonly List<LocationMarker> Live = new List<LocationMarker>();
+
+            private float _expiresAt;
+            private Vector3 _basePosition;
+            // Review pass: owned so OnDestroy can reclaim it - see the note there.
+            private Material _material;
+
+            internal static void Spawn(Vector3 position, UpgradeOutlineChannel channel, float duration)
+            {
+                if (duration <= 0f || position == Vector3.zero)
+                    return;
+
+                try
+                {
+                    GameObject root = new GameObject("Y4NGZ_PingLocationMarker");
+                    root.transform.position = position + Vector3.up * 0.25f;
+
+                    Material material = CreateMaterial(ColorFor(channel));
+                    AddPart(root.transform, PrimitiveType.Sphere, Vector3.zero, new Vector3(0.35f, 0.35f, 0.35f), material);
+                    AddPart(root.transform, PrimitiveType.Cylinder, new Vector3(0f, 0.75f, 0f), new Vector3(0.045f, 0.75f, 0.045f), material);
+
+                    LocationMarker marker = root.AddComponent<LocationMarker>();
+                    marker._material = material;
+                    marker._expiresAt = Time.time + duration;
+                    marker._basePosition = root.transform.position;
+                    Live.Add(marker);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"ForemanPingPatch: location marker spawn failed: {ex.Message}");
+                }
+            }
+
+            internal static void DestroyAll()
+            {
+                for (int i = 0; i < Live.Count; i++)
+                {
+                    LocationMarker marker = Live[i];
+                    if (marker != null)
+                        UnityEngine.Object.Destroy(marker.gameObject);
+                }
+
+                Live.Clear();
+            }
+
+            private static Color ColorFor(UpgradeOutlineChannel channel)
+            {
+                switch (channel)
+                {
+                    case UpgradeOutlineChannel.Danger: return DangerColor;
+                    case UpgradeOutlineChannel.Friendly: return FriendlyColor;
+                    default: return UtilityColor;
+                }
+            }
+
+            private static void AddPart(Transform parent, PrimitiveType shape, Vector3 localPosition, Vector3 localScale, Material material)
+            {
+                GameObject part = GameObject.CreatePrimitive(shape);
+                Collider collider = part.GetComponent<Collider>();
+                if (collider != null)
+                    UnityEngine.Object.Destroy(collider);
+
+                part.transform.SetParent(parent, worldPositionStays: false);
+                part.transform.localPosition = localPosition;
+                part.transform.localScale = localScale;
+
+                Renderer renderer = part.GetComponent<Renderer>();
+                if (renderer == null)
+                    return;
+
+                renderer.sharedMaterial = material;
+                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                renderer.receiveShadows = false;
+            }
+
+            private static Material CreateMaterial(Color color)
+            {
+                Shader shader = Shader.Find("HDRP/Unlit")
+                    ?? Shader.Find("Unlit/Color")
+                    ?? Shader.Find("Sprites/Default")
+                    ?? Shader.Find("Standard");
+
+                Material material = shader != null
+                    ? new Material(shader)
+                    : new Material(Shader.Find("Standard"));
+                material.name = "M_Y4NGZPingLocationMarker";
+                material.hideFlags = HideFlags.HideAndDontSave;
+                material.color = color;
+                // HDRP/Unlit reads _UnlitColor; the built-in fallbacks read _Color / _BaseColor.
+                if (material.HasProperty("_UnlitColor")) material.SetColor("_UnlitColor", color);
+                if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
+                if (material.HasProperty("_EmissiveColor")) material.SetColor("_EmissiveColor", color * 4f);
+                return material;
+            }
+
+            private void LateUpdate()
+            {
+                if (Time.time >= _expiresAt)
+                {
+                    Destroy(gameObject);
+                    return;
+                }
+
+                transform.position = _basePosition
+                    + Vector3.up * (Mathf.Sin(Time.time * LOCATION_MARKER_BOB_SPEED) * LOCATION_MARKER_BOB_HEIGHT);
+            }
+
+            private void OnDestroy()
+            {
+                Live.Remove(this);
+
+                // Review pass: CreateMaterial runs once per marker and the result is attached with
+                // renderer.sharedMaterial, which Destroy(gameObject) does not touch, and stamped
+                // HideAndDontSave - which includes DontUnloadUnusedAsset, so the
+                // Resources.UnloadUnusedAssets between rounds cannot reclaim it either. Every
+                // location ping (the default outcome whenever the aim ray hits plain geometry, on
+                // every peer, for every crew member) leaked one Material for the rest of the
+                // process.
+                if (_material != null)
+                {
+                    Destroy(_material);
+                    _material = null;
+                }
             }
         }
 
@@ -1132,6 +1608,26 @@ namespace Y4NGZUpgrades.Patches
             SendMarkMessage(target, pingTier, null);
         }
 
+        /// <summary>
+        /// F-FOREMAN-A-13: host re-broadcast of a client's mark, skipping the originator (whose
+        /// own ApplyMark already ran) and the host itself. Mirrors
+        /// <c>ForemanSupportPatch.RelaySupportState</c>; SendNamedMessageToAll would echo the
+        /// mark back to the sender, refreshing its 5s timer and re-running the outline work.
+        /// </summary>
+        private static void RelayMark(ulong excludeClientId, PingTarget target, int pingTier)
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            if (network == null || !network.IsServer || network.CustomMessagingManager == null) return;
+
+            foreach (ulong clientId in network.ConnectedClientsIds)
+            {
+                if (clientId == excludeClientId || clientId == network.LocalClientId)
+                    continue;
+
+                SendMarkMessage(target, pingTier, clientId);
+            }
+        }
+
         private static void SendMarkMessage(PingTarget target, int pingTier, ulong? clientId)
         {
             if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null) return;
@@ -1194,7 +1690,7 @@ namespace Y4NGZUpgrades.Patches
                     && NetworkManager.Singleton.IsServer
                     && senderClientId != NetworkManager.Singleton.LocalClientId)
                 {
-                    BroadcastMark(target, pingTier);
+                    RelayMark(senderClientId, target, pingTier);
                 }
             }
             catch (Exception ex)
@@ -1252,6 +1748,16 @@ namespace Y4NGZUpgrades.Patches
                     break;
                 case MarkKind.Entrance:
                     FindClosestComponent<EntranceTeleport>(position, ref best, ref bestSqr);
+                    break;
+                // F-FOREMAN-A-3: the new kinds need the same position fallback the others have,
+                // or a client that has not spawned the NetworkObject yet drops the mark.
+                case MarkKind.Trap:
+                    FindClosestComponent<Turret>(position, ref best, ref bestSqr);
+                    FindClosestComponent<Landmine>(position, ref best, ref bestSqr);
+                    FindClosestComponent<SpikeRoofTrap>(position, ref best, ref bestSqr);
+                    break;
+                case MarkKind.Interactable:
+                    FindClosestComponent<InteractTrigger>(position, ref best, ref bestSqr);
                     break;
             }
 
@@ -1341,9 +1847,28 @@ namespace Y4NGZUpgrades.Patches
                 return;
             }
 
+            // F-FOREMAN-A-2: the 75s cooldown was purely client-side, so a modified client could
+            // re-roll the 50% every frame until it succeeded. The server owns the retry stamp now.
+            if (InspireRetryAtByClient.TryGetValue(requesterClientId, out float retryAt) && Time.time < retryAt)
+            {
+                SendReviveResult(requesterClientId, InspireResult.OnCooldown);
+                return;
+            }
+
             PlayerControllerB requester = FindPlayerByClientId(requesterClientId);
             if (requester == null || requester.isPlayerDead || !requester.isPlayerControlled)
             {
+                SendReviveResult(requesterClientId, InspireResult.InvalidTarget);
+                return;
+            }
+
+            // F-FOREMAN-A-20: everything else on this path was already server-authoritative;
+            // ownership was the one gap. The tier comes from the broadcast UpgradeTierSync table,
+            // keyed by the connection's actualClientId (never a payload-supplied id).
+            if (UpgradeTierSync.GetTier(requesterClientId, InspireUpgrade.UPGRADE_ID) < 1)
+            {
+                Plugin.Log?.LogWarning(
+                    $"ForemanPingPatch: revive request from client {requesterClientId} without the Inspire upgrade; ignoring.");
                 SendReviveResult(requesterClientId, InspireResult.InvalidTarget);
                 return;
             }
@@ -1373,12 +1898,16 @@ namespace Y4NGZUpgrades.Patches
                 return;
             }
 
+            // F-FOREMAN-A-2: the roll is what the 75s cooldown is FOR - a failure must cost the
+            // attempt. The once-per-round use is still only consumed on success.
             if (UnityEngine.Random.value > InspireUpgrade.REVIVE_CHANCE)
             {
+                InspireRetryAtByClient[requesterClientId] = Time.time + InspireUpgrade.COOLDOWN_SECONDS;
                 SendReviveResult(requesterClientId, InspireResult.NoResponse);
                 return;
             }
 
+            InspireRetryAtByClient[requesterClientId] = Time.time + InspireUpgrade.COOLDOWN_SECONDS;
             InspireUsedThisRoundByClient.Add(requesterClientId);
             RevivePlayerLocal(playerId, bodyPosition);
             BroadcastRevive(playerId, bodyPosition);
@@ -1454,7 +1983,17 @@ namespace Y4NGZUpgrades.Patches
                     _nextInspireTime = Time.time + InspireUpgrade.COOLDOWN_SECONDS;
                     break;
                 case InspireResult.NoResponse:
+                    // F-FOREMAN-A-2: a failed roll is exactly what the 75s cooldown exists for.
+                    // Without this the 50% chance was meaningless - the player just pressed again
+                    // on the next frame until it landed. The once-per-round use stays unconsumed.
+                    _nextInspireTime = Time.time + InspireUpgrade.COOLDOWN_SECONDS;
                     HUDManager.Instance?.DisplayTip("INSPIRE", "No response...", isWarning: true);
+                    break;
+                case InspireResult.OnCooldown:
+                    // The server refused on its own retry stamp; mirror it locally so the client
+                    // stops asking (this is the path a desynced or modified client lands on).
+                    _nextInspireTime = Time.time + InspireUpgrade.COOLDOWN_SECONDS;
+                    HUDManager.Instance?.DisplayTip("INSPIRE", "Still recovering.", isWarning: true);
                     break;
                 case InspireResult.AlreadyUsed:
                     HUDManager.Instance?.DisplayTip("INSPIRE", "Already used this round.", isWarning: true);

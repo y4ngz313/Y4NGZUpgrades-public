@@ -21,8 +21,11 @@ namespace Y4NGZUpgrades
         /// <summary>
         /// 1 = hand-authored price literals (everything shipped before #217).
         /// 2 = tier-derived prices.
+        /// 3 = Pumping Iron dropped to two sub-tiers (#364). Profiles stamped 2 already hold the
+        ///     derived three-level list, which the narrowed schema would reject on every boot, so
+        ///     the stamp has to advance for the repair pass to reach them.
         /// </summary>
-        internal const int CurrentSchemaVersion = 2;
+        internal const int CurrentSchemaVersion = 3;
 
         /// <summary>
         /// Schema stamp assumed for a profile written before the stamp existed. A missing key binds
@@ -73,7 +76,9 @@ namespace Y4NGZUpgrades
             Entry("shadow_step", 3, "5,7"),
             Entry("sixth_sense", 1, "2,3"),
             new LegacyPrices("extra_inventory_slot", new[] { 3 }, new[] { "5,7" }, optionalGated: true),
-            Entry("protein_powder", 3, "5,7"),
+            // Three tier lists: the pre-#217 authored "5,7", the #217-derived three-level "3,4"
+            // that stamped-2 profiles still hold, and the current one-value list they migrate to.
+            new LegacyPrices("protein_powder", new[] { 3 }, new[] { "5,7", "3,4" }),
             Entry("back_muscles", 3, "5,7"),
             Entry("better_scanner", 3, "5,7"),
             Entry("quick_hands", 1, "2,3"),

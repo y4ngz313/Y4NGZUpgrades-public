@@ -24,6 +24,12 @@ namespace Y4NGZUpgrades.Patches
         private static readonly ConditionalWeakTable<Light, LightBaseline> Baselines =
             new ConditionalWeakTable<Light, LightBaseline>();
 
+        // F-TECH-13: the helmet light is the one light that is only written while an operator
+        // resolves. Vanilla PocketItem/DiscardItem clear usingPlayerHelmetLight, so dropping or
+        // handing over a pocketed flashlight made operator_ null and stranded the boosted
+        // intensity on the helmet lamp. Remembering who we last boosted lets the reset run once.
+        private static PlayerControllerB _boostedHelmetOperator;
+
         [HarmonyPatch(typeof(FlashlightItem), "Update")]
         [HarmonyPostfix]
         private static void BoostOperatedFlashlight(FlashlightItem __instance)
@@ -50,7 +56,20 @@ namespace Y4NGZUpgrades.Patches
             ApplyFromBaseline(__instance.flashlightBulbGlow, intensityMultiplier, coneMultiplier);
 
             if (operator_ != null)
+            {
                 ApplyFromBaseline(operator_.helmetLight, intensityMultiplier, coneMultiplier);
+                if (boosted)
+                    _boostedHelmetOperator = operator_;
+                else if (_boostedHelmetOperator == operator_)
+                    _boostedHelmetOperator = null;
+            }
+            else if (_boostedHelmetOperator != null)
+            {
+                // F-TECH-13: one final write of the cached baseline, which is what the design
+                // doc promises ("multipliers fall back to 1.0").
+                ApplyFromBaseline(_boostedHelmetOperator.helmetLight, 1f, 1f);
+                _boostedHelmetOperator = null;
+            }
         }
 
         private static bool IsOperatedByLocalPlayer(FlashlightItem flashlight, out PlayerControllerB operator_)

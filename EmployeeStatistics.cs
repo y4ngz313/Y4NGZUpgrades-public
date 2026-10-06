@@ -6,6 +6,7 @@ using BepInEx;
 using GameNetcodeStuff;
 using HarmonyLib;
 using UnityEngine;
+using Y4NGZUpgrades.Patches;
 
 namespace Y4NGZUpgrades
 {
@@ -26,6 +27,10 @@ namespace Y4NGZUpgrades
         public int drillsPlaced;
         public int breakersRestored;
         public float timeSpentOnCctvSeconds;
+        // Kept separate from the legacy all-source devicesHacked aggregate. Old saves cannot
+        // safely split historical turret/door/tablet work into CCTV, so this begins at zero.
+        public int cctvAlarmsSetOff;
+        public int cctvDevicesHacked;
         public int devicesHacked;
         public int quotasCompleted;
 
@@ -47,6 +52,8 @@ namespace Y4NGZUpgrades
                 drillsPlaced = drillsPlaced,
                 breakersRestored = breakersRestored,
                 timeSpentOnCctvSeconds = timeSpentOnCctvSeconds,
+                cctvAlarmsSetOff = cctvAlarmsSetOff,
+                cctvDevicesHacked = cctvDevicesHacked,
                 devicesHacked = devicesHacked,
                 quotasCompleted = quotasCompleted
             };
@@ -71,6 +78,8 @@ namespace Y4NGZUpgrades
             drillsPlaced = AddClamped(drillsPlaced, other.drillsPlaced);
             breakersRestored = AddClamped(breakersRestored, other.breakersRestored);
             timeSpentOnCctvSeconds = AddClamped(timeSpentOnCctvSeconds, other.timeSpentOnCctvSeconds);
+            cctvAlarmsSetOff = AddClamped(cctvAlarmsSetOff, other.cctvAlarmsSetOff);
+            cctvDevicesHacked = AddClamped(cctvDevicesHacked, other.cctvDevicesHacked);
             devicesHacked = AddClamped(devicesHacked, other.devicesHacked);
             quotasCompleted = AddClamped(quotasCompleted, other.quotasCompleted);
         }
@@ -168,6 +177,7 @@ namespace Y4NGZUpgrades
             _lastRound = null;
             _lastTimesFulfilledQuota = CurrentQuotaCount();
             ResetPositionTracking();
+            CctvEmployeeStatisticsNetwork.ResetRound();
         }
 
         /// <summary>
@@ -376,14 +386,92 @@ namespace Y4NGZUpgrades
             _round.Data.devicesHacked = AddOne(_round.Data.devicesHacked);
         }
 
+        /// <summary>
+        /// Records one host-confirmed CCTV state transition. It contributes to the legacy
+        /// all-device aggregate for continuity, while the new source-specific total only covers
+        /// events that began tracking with this version.
+        /// </summary>
+        internal static void RecordCctvDeviceHacked(string logicalDeviceKey)
+        {
+            if (!_latch.Active
+                || _latch.Finalized
+                || string.IsNullOrWhiteSpace(logicalDeviceKey)
+                || !_round.CctvEvents.TryAcceptDevice(logicalDeviceKey)
+                || !TryAddRoundKey("cctv.hack." + logicalDeviceKey))
+            {
+                return;
+            }
+
+            _round.Data.cctvDevicesHacked = AddOne(_round.Data.cctvDevicesHacked);
+            _round.Data.devicesHacked = AddOne(_round.Data.devicesHacked);
+        }
+
+        /// <summary>
+        /// Records a new host-confirmed CCTV detection alarm for the local employee. The caller
+        /// supplies a host-issued episode key; timer refreshes and duplicate deliveries do not
+        /// create another local record.
+        /// </summary>
+        internal static void RecordCctvAlarmSetOff(string episodeKey)
+        {
+            if (!_latch.Active
+                || _latch.Finalized
+                || string.IsNullOrWhiteSpace(episodeKey)
+                || !_round.CctvEvents.TryAcceptAlarm(episodeKey)
+                || !TryAddRoundKey("cctv.alarm." + episodeKey))
+            {
+                return;
+            }
+
+            _round.Data.cctvAlarmsSetOff = AddOne(_round.Data.cctvAlarmsSetOff);
+        }
+
+        /// <summary>
+        /// A late joiner does not replay RoundLifecycle.openingDoorsSequence. Once the local player
+        /// is attached to an already-landed map, open a fresh personal ledger for this peer only.
+        /// An active ledger is deliberately left intact; a finalized prior round may begin anew.
+        /// </summary>
+        internal static bool TryInitializeLateJoinRound(PlayerControllerB localPlayer)
+        {
+            StartOfRound round = StartOfRound.Instance;
+            bool isSaveKeyResolved = SaveKey.TryGetCurrent(out _);
+            bool isLocalPlayerReady = localPlayer != null && IsLocalPlayer(localPlayer);
+            bool isMapReady = round != null && round.currentLevel != null;
+            if (!CctvLateJoinLifecycle.ShouldInitializePersonalRound(
+                    _latch.Active,
+                    isSaveKeyResolved,
+                    isLocalPlayerReady,
+                    isMapReady,
+                    round != null && round.shipHasLanded,
+                    round != null && round.inShipPhase,
+                    round != null && round.shipIsLeaving))
+            {
+                return false;
+            }
+
+            SwitchToCurrentSave();
+            if (_latch.Active)
+                return false;
+
+            _round = new RoundState();
+            _latch.Begin();
+            _lastRound = null;
+            _lastTimesFulfilledQuota = CurrentQuotaCount();
+            ResetPositionTracking();
+            return true;
+        }
         internal static void UpdateRuntime(PlayerControllerB localPlayer, float deltaTime)
         {
             if (_lifetime == null)
                 SwitchToCurrentSave();
 
+            TryInitializeLateJoinRound(localPlayer);
+            CctvEmployeeStatisticsNetwork.EnsureRegistered();
+
             UpdateQuotaCompletion();
             if (!_latch.Active || _latch.Finalized || !IsLocalPlayer(localPlayer))
                 return;
+
+            CctvEmployeeStatisticsNetwork.EnsureEpochForActiveRound();
 
             float delta = Mathf.Clamp(deltaTime, 0f, 0.25f);
             UpdateSteps(localPlayer);
@@ -403,7 +491,7 @@ namespace Y4NGZUpgrades
                 Plugin.Log?.LogWarning(
                     "[EmployeeStatistics] FinalizeRound ran without a round start "
                     + $"(sequence={_latch.Sequence}, scrapCollected={scrapCollected}). "
-                    + "Nothing was recorded this round — the RoundLifecycle.RoundStarted hook "
+                    + "Nothing was recorded this round ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the RoundLifecycle.RoundStarted hook "
                     + "did not fire for this peer.");
             }
 
@@ -419,7 +507,7 @@ namespace Y4NGZUpgrades
         /// <summary>
         /// Candidate note lines for the Company performance report's Notes column,
         /// highest priority first. Only covers facts the Company report cannot derive
-        /// itself — kills, steps, delivered scrap and deaths already have their own
+        /// itself ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â kills, steps, delivered scrap and deaths already have their own
         /// note categories over there, so repeating them would just crowd the column.
         /// </summary>
         internal static IReadOnlyList<ReportNoteCandidate> BuildReportNoteCandidates()
@@ -831,6 +919,7 @@ namespace Y4NGZUpgrades
             _latch.Abandon();
             _lastTimesFulfilledQuota = CurrentQuotaCount();
             ResetPositionTracking();
+            CctvEmployeeStatisticsNetwork.ResetSession();
         }
 
         private sealed class RoundState
@@ -840,6 +929,7 @@ namespace Y4NGZUpgrades
             internal readonly Dictionary<ulong, float> LastEnemyHitByLocalPlayer = new Dictionary<ulong, float>();
             internal readonly HashSet<ulong> KilledEnemies = new HashSet<ulong>();
             internal readonly HashSet<string> UniqueEventKeys = new HashSet<string>(StringComparer.Ordinal);
+            internal readonly CctvStatisticsEventGuard CctvEvents = new CctvStatisticsEventGuard();
             internal Vector3 LastPlayerPosition;
             internal bool PlayerPositionValid;
             internal float StepDistance;

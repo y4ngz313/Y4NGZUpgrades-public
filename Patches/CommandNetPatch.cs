@@ -19,7 +19,9 @@ namespace Y4NGZUpgrades.Patches
         private const string MSG_WALKIE = "CommandNet_Walkie";
         private const string MSG_DAMAGE_OUTLINE = "CommandNet_DamageOutline";
         private const string PROMPT_KEY = "command_net_walkie";
-        private const float MINIMAP_REFRESH_INTERVAL = 0.10f;
+        // F-FOREMAN-B-6: 5 Hz. Every refresh is a second full HDRP camera render on top of
+        // vanilla's own radar render, for a widget that is 130 px across.
+        private const float MINIMAP_REFRESH_INTERVAL = 0.20f;
         private const float MINIMAP_SIZE = 130f;
         private const float MINIMAP_MARGIN = 18f;
         private const float MINIMAP_CHAT_GAP = 10f;
@@ -32,18 +34,21 @@ namespace Y4NGZUpgrades.Patches
         private const float MINIMAP_BOOT_LINE_PHASE = 0.16f;
         private const float MINIMAP_TACTICAL_DOT_SIZE = 7.5f;
         private const float MINIMAP_TACTICAL_DOT_INSET = 1.35f;
-        private const int MINIMAP_TEXTURE_SIZE = 512;
+        // F-FOREMAN-B-6: 256 px is already more than the 130 px widget resolves.
+        private const int MINIMAP_TEXTURE_SIZE = 256;
         private const int MINIMAP_SCANLINE_COUNT = 11;
+        // F-FOREMAN-B-14: the dedup sets used to grow for a whole round. A few hundred ids is far
+        // more than the reliable-sequenced reorder window these messages can produce.
+        private const int SEEN_MESSAGE_CAPACITY = 256;
 
-        private static readonly HashSet<int> SeenWalkieMessages = new HashSet<int>();
-        private static readonly HashSet<int> SeenDamageMessages = new HashSet<int>();
-        private static readonly HashSet<int> ActiveVirtualSpeakers = new HashSet<int>();
-        private static readonly Dictionary<WalkieTalkie, bool> PriorSpeakerStates = new Dictionary<WalkieTalkie, bool>();
+        private static readonly HashSet<long> SeenWalkieMessages = new HashSet<long>();
+        private static readonly Queue<long> SeenWalkieOrder = new Queue<long>();
+        private static readonly HashSet<long> SeenDamageMessages = new HashSet<long>();
+        private static readonly Queue<long> SeenDamageOrder = new Queue<long>();
 
         private static bool _handlersRegistered;
-        private static int _nextMessageId;
+        private static uint _nextMessageCounter;
         private static PlayerControllerB _listeningPlayer;
-        private static bool _priorHoldingWalkieTalkie;
         private static bool _localSpeaking;
         private static float _nextMinimapRefresh;
         private static bool _presentationVisible;
@@ -111,11 +116,7 @@ namespace Y4NGZUpgrades.Patches
         internal static void OnRoundStarted()
         {
             RegisterNetworkHandlers();
-            SeenWalkieMessages.Clear();
-            SeenDamageMessages.Clear();
-            SetVirtualSpeakerState(false);
-            ActiveVirtualSpeakers.Clear();
-            PriorSpeakerStates.Clear();
+            ClearSeenMessages();
             _nextMinimapRefresh = 0f;
             _hangarStateKnown = false;
             _wasInHangarShipRoom = true;
@@ -167,11 +168,30 @@ namespace Y4NGZUpgrades.Patches
             ExitVirtualRadio();
             DestroyMinimap();
             Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PROMPT_KEY);
+            ClearSeenMessages();
+        }
+
+        private static void ClearSeenMessages()
+        {
             SeenWalkieMessages.Clear();
+            SeenWalkieOrder.Clear();
             SeenDamageMessages.Clear();
-            SetVirtualSpeakerState(false);
-            ActiveVirtualSpeakers.Clear();
-            PriorSpeakerStates.Clear();
+            SeenDamageOrder.Clear();
+        }
+
+        /// <summary>
+        /// F-FOREMAN-B-14: dedup with a bounded window. The sets used to be cleared only at round
+        /// start and end, so they grew monotonically for a whole round.
+        /// </summary>
+        private static bool TryMarkSeen(HashSet<long> seen, Queue<long> order, long messageId)
+        {
+            if (!seen.Add(messageId))
+                return false;
+
+            order.Enqueue(messageId);
+            while (order.Count > SEEN_MESSAGE_CAPACITY)
+                seen.Remove(order.Dequeue());
+            return true;
         }
 
         [HarmonyPatch(typeof(PlayerControllerB), "Update")]
@@ -198,7 +218,7 @@ namespace Y4NGZUpgrades.Patches
                 return;
 
             int playerId = (int)__instance.playerClientId;
-            int messageId = NextMessageId();
+            long messageId = NextMessageId();
             HandleDamageNotice(messageId, playerId);
             SendDamageNotice(messageId, playerId);
         }
@@ -236,11 +256,17 @@ namespace Y4NGZUpgrades.Patches
             if (player == null)
                 return;
 
+            // F-FOREMAN-B-1: this runs from a PlayerControllerB.Update postfix, so it is reached
+            // every frame. UpdatePlayerVoiceEffects() walks every player doing three GetComponent
+            // calls each and resets vanilla's own 2 s interval, so it may only run on an actual
+            // transition - never on a frame where the state is already what we want.
+            if (_listeningPlayer == player && player.holdingWalkieTalkie)
+                return;
+
             if (_listeningPlayer != player)
             {
                 ExitVirtualRadio();
                 _listeningPlayer = player;
-                _priorHoldingWalkieTalkie = player.holdingWalkieTalkie;
             }
 
             player.holdingWalkieTalkie = true;
@@ -249,14 +275,33 @@ namespace Y4NGZUpgrades.Patches
 
         private static void ExitVirtualRadio()
         {
-            if (_listeningPlayer != null)
+            // F-FOREMAN-B-1: nothing to undo means nothing to recompute. This used to fall
+            // through to UpdateVoiceEffects() every frame for every player, upgrade or not.
+            if (_listeningPlayer == null)
+                return;
+
+            PlayerControllerB player = _listeningPlayer;
+            _listeningPlayer = null;
+            // F-FOREMAN-B-15: the walkie item owns this flag. Restoring a snapshot taken on the
+            // first Enter wrote a stale false over a player who had since switched a real walkie
+            // on, leaving them deaf to it; re-read the live state from their own inventory.
+            player.holdingWalkieTalkie = HasSwitchedOnWalkie(player);
+            UpdateVoiceEffects();
+        }
+
+        private static bool HasSwitchedOnWalkie(PlayerControllerB player)
+        {
+            if (player == null || player.ItemSlots == null)
+                return false;
+
+            for (int i = 0; i < player.ItemSlots.Length; i++)
             {
-                _listeningPlayer.holdingWalkieTalkie = _priorHoldingWalkieTalkie;
-                _listeningPlayer = null;
+                WalkieTalkie walkie = player.ItemSlots[i] as WalkieTalkie;
+                if (walkie != null && walkie.isBeingUsed)
+                    return true;
             }
 
-            _priorHoldingWalkieTalkie = false;
-            UpdateVoiceEffects();
+            return false;
         }
 
         private static void SetLocalSpeaking(bool speaking)
@@ -277,15 +322,15 @@ namespace Y4NGZUpgrades.Patches
                 EnterVirtualRadio(player);
 
             _localSpeaking = speaking;
-            int messageId = NextMessageId();
+            long messageId = NextMessageId();
             int playerId = (int)player.playerClientId;
             ApplyWalkieMessage(messageId, playerId, speaking, localSender: true);
             SendWalkieMessage(messageId, playerId, speaking);
         }
 
-        private static void ApplyWalkieMessage(int messageId, int playerId, bool speaking, bool localSender)
+        private static void ApplyWalkieMessage(long messageId, int playerId, bool speaking, bool localSender)
         {
-            if (!SeenWalkieMessages.Add(messageId))
+            if (!TryMarkSeen(SeenWalkieMessages, SeenWalkieOrder, messageId))
                 return;
 
             StartOfRound round = StartOfRound.Instance;
@@ -306,41 +351,15 @@ namespace Y4NGZUpgrades.Patches
                     player.playerBodyAnimator.SetBool("walkieTalkie", speaking);
             }
 
-            if (speaking)
-                ActiveVirtualSpeakers.Add(playerId);
-            else
-                ActiveVirtualSpeakers.Remove(playerId);
-
-            SetVirtualSpeakerState(ActiveVirtualSpeakers.Count > 0);
+            // F-FOREMAN-B-4: the old SetVirtualSpeakerState walked WalkieTalkie.allWalkieTalkies and
+            // set clientIsHoldingAndSpeakingIntoThis on *every* switched-on walkie in the world.
+            // In vanilla WalkieTalkie.Update that flag is what puts a walkie into another walkie's
+            // talkiesSendingToThis list, so keying the Command Net channel made every unrelated
+            // walkie start relaying its own holder's ambient sounds. The vanilla radio SFX this was
+            // reaching for is already handled by PlayTransmissionSfx, and the voice routing itself
+            // only needs speakingToWalkieTalkie (set above) plus the listener's holdingWalkieTalkie.
             PlayTransmissionSfx(playerId, speaking);
             UpdateVoiceEffects();
-        }
-
-        private static void SetVirtualSpeakerState(bool speaking)
-        {
-            if (WalkieTalkie.allWalkieTalkies == null)
-                return;
-
-            if (!speaking)
-            {
-                foreach (KeyValuePair<WalkieTalkie, bool> pair in PriorSpeakerStates)
-                {
-                    if (pair.Key != null)
-                        pair.Key.clientIsHoldingAndSpeakingIntoThis = pair.Value;
-                }
-                PriorSpeakerStates.Clear();
-                return;
-            }
-
-            for (int i = 0; i < WalkieTalkie.allWalkieTalkies.Count; i++)
-            {
-                WalkieTalkie walkie = WalkieTalkie.allWalkieTalkies[i];
-                if (walkie == null || !walkie.isBeingUsed)
-                    continue;
-                if (!PriorSpeakerStates.ContainsKey(walkie))
-                    PriorSpeakerStates[walkie] = walkie.clientIsHoldingAndSpeakingIntoThis;
-                walkie.clientIsHoldingAndSpeakingIntoThis = true;
-            }
         }
 
         private static void PlayTransmissionSfx(int playerId, bool speaking)
@@ -393,9 +412,9 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
-        private static void HandleDamageNotice(int messageId, int playerId)
+        private static void HandleDamageNotice(long messageId, int playerId)
         {
-            if (!SeenDamageMessages.Add(messageId))
+            if (!TryMarkSeen(SeenDamageMessages, SeenDamageOrder, messageId))
                 return;
             if (!CommandNetUpgrade.HasDamageOutline())
                 return;
@@ -410,19 +429,30 @@ namespace Y4NGZUpgrades.Patches
             if (damaged == null || damaged.isPlayerDead || !damaged.isPlayerControlled)
                 return;
 
-            ForemanPingPatch.MarkTeammateFromCommandNet(damaged);
+            // F-FOREMAN-B-3: apply the outline locally only. The damage notice is already fanned
+            // out to every client and gated here on the *receiver* owning level 2, so every
+            // eligible player paints their own outline. Re-fanning a ping mark from each receiver
+            // amplified O(N^2) and, because the ping receive path has no ownership check, painted
+            // the outline on players who own neither upgrade.
+            // F-FOREMAN-B-12: the duration comes from Command Net's own constant so the catalog's
+            // "5 seconds" cannot drift when Ping is retuned.
+            ForemanPingPatch.MarkTeammateFromCommandNetLocal(damaged, CommandNetUpgrade.DAMAGE_OUTLINE_SECONDS);
         }
 
         private static string _cachedPromptText;
         private static string _cachedPromptPath;
+        private static bool _cachedPromptSpeaking;
 
         private static void UpdateCommandPrompt(PlayerControllerB player)
         {
+            // F-FOREMAN-B-18: also clear in orbit. The prompt used to sit on the HUD all game,
+            // matching the Worklight prompt's gating (WorklightBeaconPatch.UpdatePrompt).
             if (!CommandNetUpgrade.HasVirtualWalkie()
                 || player == null
                 || player.isPlayerDead
                 || player.isTypingChat
                 || player.inTerminalMenu
+                || (StartOfRound.Instance != null && StartOfRound.Instance.inShipPhase)
                 || (player.quickMenuManager != null && player.quickMenuManager.isMenuOpen))
             {
                 Y4ngzPromptOverlay.ClearPostPlayerMenuPrompt(PROMPT_KEY);
@@ -430,11 +460,18 @@ namespace Y4NGZUpgrades.Patches
             }
 
             string bindingPath = Gui.UpgradeInput.EffectivePath(Gui.Plugin.Keybinds?.CommandNetTransmit);
-            if (_cachedPromptText == null || !string.Equals(_cachedPromptPath, bindingPath, StringComparison.Ordinal))
+            if (_cachedPromptText == null
+                || _cachedPromptSpeaking != _localSpeaking
+                || !string.Equals(_cachedPromptPath, bindingPath, StringComparison.Ordinal))
             {
                 _cachedPromptPath = bindingPath;
+                _cachedPromptSpeaking = _localSpeaking;
                 string label = Gui.UpgradeInput.DisplayLabel(Gui.Plugin.Keybinds?.CommandNetTransmit, "J");
-                _cachedPromptText = $"Walkie-talkie: [{label}]";
+                // F-FOREMAN-B-18: nothing on screen told the player the key was actually keying
+                // the channel.
+                _cachedPromptText = _localSpeaking
+                    ? $"Walkie-talkie: [{label}] TRANSMITTING"
+                    : $"Walkie-talkie: [{label}]";
             }
 
             Y4ngzPromptOverlay.SetPostPlayerMenuPrompt(PROMPT_KEY, _cachedPromptText);
@@ -618,14 +655,33 @@ namespace Y4NGZUpgrades.Patches
             chatRect.anchoredPosition = _chatOriginalAnchoredPosition + new Vector2(0f, verticalOffset);
         }
 
+        /// <summary>
+        /// F-FOREMAN-B-6: ApplyChatLayoutForMinimap is not throttled - it runs every frame - so the
+        /// GetComponent is cached and only re-paid when the HUDManager instance itself changes.
+        /// </summary>
         private static RectTransform ResolveChatRect()
         {
             HUDManager hud = HUDManager.Instance;
-            if (hud == null || hud.Chat == null || hud.Chat.canvasGroup == null)
+            if (hud == null)
+            {
+                _resolvedChatHud = null;
+                _resolvedChatRect = null;
+                return null;
+            }
+
+            if (ReferenceEquals(_resolvedChatHud, hud) && _resolvedChatRect != null)
+                return _resolvedChatRect;
+
+            if (hud.Chat == null || hud.Chat.canvasGroup == null)
                 return null;
 
-            return hud.Chat.canvasGroup.GetComponent<RectTransform>();
+            _resolvedChatHud = hud;
+            _resolvedChatRect = hud.Chat.canvasGroup.GetComponent<RectTransform>();
+            return _resolvedChatRect;
         }
+
+        private static HUDManager _resolvedChatHud;
+        private static RectTransform _resolvedChatRect;
 
         private static void RestoreChatLayout()
         {
@@ -827,29 +883,37 @@ namespace Y4NGZUpgrades.Patches
                 return false;
 
             Vector3 focus = ResolveMinimapFocus(player);
-            ConfigureMinimapCamera(player, mapScreen, sourceCamera, focus.x, focus.y, focus.z);
 
-            _vanillaMapUiState = HideVanillaMapUi(mapScreen);
-            GameObject contourMap = ResolveContourMap(mapScreen);
+            // F-FOREMAN-B-6: everything that mutates vanilla state happens inside the try. Hiding
+            // the vanilla map UI before it meant an exception in the camera or contour setup left
+            // the real map screen blanked until the next successful render.
+            GameObject contourMap = null;
+            bool hidVanillaUi = false;
             bool restoreContour = false;
             bool contourWasActive = false;
             Vector3 contourPosition = Vector3.zero;
-            if (contourMap != null)
-            {
-                restoreContour = true;
-                contourWasActive = contourMap.activeSelf;
-                contourPosition = contourMap.transform.position;
-                bool showOutsideMap = !player.isInsideFactory;
-                contourMap.SetActive(showOutsideMap);
-                if (showOutsideMap)
-                {
-                    Vector3 pos = contourMap.transform.position;
-                    contourMap.transform.position = new Vector3(pos.x, focus.y - 1.5f, pos.z);
-                }
-            }
-
             try
             {
+                ConfigureMinimapCamera(player, mapScreen, sourceCamera, focus.x, focus.y, focus.z);
+
+                _vanillaMapUiState = HideVanillaMapUi(mapScreen);
+                hidVanillaUi = true;
+
+                contourMap = ResolveContourMap(mapScreen);
+                if (contourMap != null)
+                {
+                    restoreContour = true;
+                    contourWasActive = contourMap.activeSelf;
+                    contourPosition = contourMap.transform.position;
+                    bool showOutsideMap = !player.isInsideFactory;
+                    contourMap.SetActive(showOutsideMap);
+                    if (showOutsideMap)
+                    {
+                        Vector3 pos = contourMap.transform.position;
+                        contourMap.transform.position = new Vector3(pos.x, focus.y - 1.5f, pos.z);
+                    }
+                }
+
                 _minimapCamera.Render();
             }
             catch (Exception ex)
@@ -864,7 +928,8 @@ namespace Y4NGZUpgrades.Patches
                     contourMap.SetActive(contourWasActive);
                     contourMap.transform.position = contourPosition;
                 }
-                RestoreVanillaMapUi(mapScreen);
+                if (hidVanillaUi)
+                    RestoreVanillaMapUi(mapScreen);
             }
 
             return true;
@@ -1202,9 +1267,14 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
+        // F-FOREMAN-B-6: reused buffers. These used to allocate a fresh List on every refresh.
+        private static readonly List<Transform> CameraMarkerBuffer = new List<Transform>();
+        private static readonly List<Vector3> ObjectiveMarkerBuffer = new List<Vector3>();
+
         private static void AddCameraMarkers(ref int used)
         {
-            var cameras = new List<Transform>();
+            List<Transform> cameras = CameraMarkerBuffer;
+            cameras.Clear();
             OptionalCctvBridge.CollectCameraTransforms(cameras);
 
             Color color = UiTheme.Accent;
@@ -1221,7 +1291,8 @@ namespace Y4NGZUpgrades.Patches
 
         private static void AddObjectiveMarkers(ref int used)
         {
-            var objectives = new List<Vector3>();
+            List<Vector3> objectives = ObjectiveMarkerBuffer;
+            objectives.Clear();
             OptionalCctvBridge.CollectActiveObjectivePositions(objectives);
 
             Color color = UiTheme.Warning;
@@ -1243,10 +1314,17 @@ namespace Y4NGZUpgrades.Patches
             bool playerIsOutside = !player.isInsideFactory;
             Color color = UiTheme.Danger;
             color.a = 0.98f;
+            // F-FOREMAN-B-17 / F-FOREMAN-B-12: the declared 80 m range is now the enemy-marker
+            // limit. Frustum culling alone made the widget perfect ESP over a large fraction of
+            // the interior, which is a lot for one level of a tier-2 upgrade.
+            Vector3 origin = player.transform.position;
+            float rangeSqr = CommandNetUpgrade.MINIMAP_RANGE_METERS * CommandNetUpgrade.MINIMAP_RANGE_METERS;
             for (int i = 0; i < enemies.Count; i++)
             {
                 EnemyAI enemy = enemies[i];
                 if (enemy == null || enemy.isEnemyDead || enemy.isOutside != playerIsOutside)
+                    continue;
+                if ((enemy.transform.position - origin).sqrMagnitude > rangeSqr)
                     continue;
 
                 AddMinimapTacticalDot(ref used, enemy.transform.position, color);
@@ -1529,15 +1607,21 @@ namespace Y4NGZUpgrades.Patches
             return _vignetteSprite;
         }
 
-        private static int NextMessageId()
+        /// <summary>
+        /// F-FOREMAN-B-14: a plain monotonic (clientId &lt;&lt; 32 | counter). The old id mixed the
+        /// clock into the low bits, so two ids could collide and silently suppress a legitimate
+        /// outline - or, worse, a stop-speaking walkie message, leaving a player's voice stuck on
+        /// the radio channel for the rest of the round.
+        /// </summary>
+        private static long NextMessageId()
         {
             unchecked
             {
-                int client = GameNetworkManager.Instance?.localPlayerController != null
-                    ? (int)GameNetworkManager.Instance.localPlayerController.playerClientId
-                    : 0;
-                _nextMessageId++;
-                return (client << 20) ^ _nextMessageId ^ Mathf.RoundToInt(Time.realtimeSinceStartup * 1000f);
+                ulong client = GameNetworkManager.Instance?.localPlayerController != null
+                    ? GameNetworkManager.Instance.localPlayerController.actualClientId
+                    : 0UL;
+                _nextMessageCounter++;
+                return (long)(((client & 0xFFFFFFFFUL) << 32) | _nextMessageCounter);
             }
         }
 
@@ -1573,10 +1657,13 @@ namespace Y4NGZUpgrades.Patches
         }
 
 #pragma warning disable Harmony003
-        private static void SendWalkieMessage(int messageId, int playerId, bool speaking)
+        private static void SendWalkieMessage(long messageId, int playerId, bool speaking)
         {
             NetworkManager network = NetworkManager.Singleton;
             if (network == null || !network.IsClient || network.CustomMessagingManager == null)
+                return;
+            // F-FOREMAN-B-14: no round, nobody to tell.
+            if (StartOfRound.Instance == null)
                 return;
 
             if (network.IsServer)
@@ -1585,12 +1672,12 @@ namespace Y4NGZUpgrades.Patches
                 SendWalkieMessage(messageId, playerId, speaking, NetworkManager.ServerClientId);
         }
 
-        private static void SendWalkieMessage(int messageId, int playerId, bool speaking, ulong? clientId)
+        private static void SendWalkieMessage(long messageId, int playerId, bool speaking, ulong? clientId)
         {
             if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null)
                 return;
 
-            FastBufferWriter writer = new FastBufferWriter(sizeof(int) * 2 + sizeof(bool), Allocator.Temp);
+            FastBufferWriter writer = new FastBufferWriter(sizeof(long) + sizeof(int) + sizeof(bool), Allocator.Temp);
             try
             {
                 writer.WriteValueSafe(messageId);
@@ -1622,7 +1709,7 @@ namespace Y4NGZUpgrades.Patches
         {
             try
             {
-                int messageId;
+                long messageId;
                 int playerId;
                 bool speaking;
                 reader.ReadValueSafe(out messageId);
@@ -1647,10 +1734,13 @@ namespace Y4NGZUpgrades.Patches
             }
         }
 
-        private static void SendDamageNotice(int messageId, int playerId)
+        private static void SendDamageNotice(long messageId, int playerId)
         {
             NetworkManager network = NetworkManager.Singleton;
             if (network == null || !network.IsClient || network.CustomMessagingManager == null)
+                return;
+            // F-FOREMAN-B-14: no round, nobody to tell.
+            if (StartOfRound.Instance == null)
                 return;
 
             if (network.IsServer)
@@ -1659,12 +1749,12 @@ namespace Y4NGZUpgrades.Patches
                 SendDamageNotice(messageId, playerId, NetworkManager.ServerClientId);
         }
 
-        private static void SendDamageNotice(int messageId, int playerId, ulong? clientId)
+        private static void SendDamageNotice(long messageId, int playerId, ulong? clientId)
         {
             if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null)
                 return;
 
-            FastBufferWriter writer = new FastBufferWriter(sizeof(int) * 2, Allocator.Temp);
+            FastBufferWriter writer = new FastBufferWriter(sizeof(long) + sizeof(int), Allocator.Temp);
             try
             {
                 writer.WriteValueSafe(messageId);
@@ -1695,7 +1785,7 @@ namespace Y4NGZUpgrades.Patches
         {
             try
             {
-                int messageId;
+                long messageId;
                 int playerId;
                 reader.ReadValueSafe(out messageId);
                 reader.ReadValueSafe(out playerId);

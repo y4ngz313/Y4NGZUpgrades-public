@@ -21,10 +21,22 @@ namespace Y4NGZUpgrades.Patches
 
         // Turret NetworkObjectId -> Time.time the disable expires at.
         private static readonly Dictionary<ulong, float> HackedTurrets = new Dictionary<ulong, float>();
+        // F-TECH-6: senderClientId -> Time.time the host will accept that sender's next hack.
+        // The client-side _cooldownEnd below is presentation only and is not enforceable.
+        private static readonly Dictionary<ulong, float> HostCooldownEnd = new Dictionary<ulong, float>();
         private static bool _handlersRegistered;
         private static float _cooldownEnd;
         private static float _doorHackHold;
         private static float _turretHackHold;
+
+        // Cached prompt strings: the tick methods run every frame, so the interpolated label is
+        // rebuilt only when the bound Interact key actually changes.
+        private static string _promptInteractLabel;
+        private static string _turretPromptText;
+        private static string _doorPromptText;
+        private static float _nextPromptRefresh;
+        private static int _cooldownPromptSeconds = -1;
+        private static string _cooldownPromptText;
 
         [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
         [HarmonyPostfix]
@@ -44,6 +56,7 @@ namespace Y4NGZUpgrades.Patches
         {
             _handlersRegistered = false;
             HackedTurrets.Clear();
+            HostCooldownEnd.Clear();
             _doorHackHold = 0f;
             _turretHackHold = 0f;
             ClearDoorHackPrompt();
@@ -55,6 +68,7 @@ namespace Y4NGZUpgrades.Patches
         internal static void OnRoundStarted()
         {
             HackedTurrets.Clear();
+            HostCooldownEnd.Clear();
             _cooldownEnd = 0f;
             _doorHackHold = 0f;
             _turretHackHold = 0f;
@@ -67,6 +81,7 @@ namespace Y4NGZUpgrades.Patches
         private static void PostEndOfGame()
         {
             HackedTurrets.Clear();
+            HostCooldownEnd.Clear();
             _doorHackHold = 0f;
             _turretHackHold = 0f;
             ClearDoorHackPrompt();
@@ -136,19 +151,34 @@ namespace Y4NGZUpgrades.Patches
                 return;
             }
 
-            float range = player.grabDistance > 0f ? player.grabDistance : 4f;
-            Turret turret = FindLookedAtTurret(player, range);
-            if (turret == null || Time.time < _cooldownEnd)
+            Turret turret = FindLookedAtTurret(player);
+            if (turret == null)
             {
                 _turretHackHold = 0f;
                 ClearTurretHackPrompt();
                 return;
             }
 
-            string interact = UpgradeInteractInput.DisplayLabel();
-            Y4ngzPromptOverlay.SetPersistentPrompt(
-                TurretHackPromptKey,
-                $"Disable turret: Hold [{interact}]");
+            // F-TECH-12: the prompt used to disappear during the advertised 20 s cooldown, so a
+            // player looking at a second turret saw exactly what they would see without the
+            // upgrade. Keep it up with a countdown instead.
+            if (Time.time < _cooldownEnd)
+            {
+                _turretHackHold = 0f;
+                // Cached per whole second: this is an Update path.
+                int remaining = Mathf.CeilToInt(_cooldownEnd - Time.time);
+                if (remaining != _cooldownPromptSeconds || _cooldownPromptText == null)
+                {
+                    _cooldownPromptSeconds = remaining;
+                    _cooldownPromptText = $"Turret splice recharging: {remaining}s";
+                }
+
+                Y4ngzPromptOverlay.SetPersistentPrompt(TurretHackPromptKey, _cooldownPromptText);
+                Y4ngzPromptOverlay.SetPersistentPromptProgress(TurretHackPromptKey, 0f);
+                return;
+            }
+
+            Y4ngzPromptOverlay.SetPersistentPrompt(TurretHackPromptKey, ResolveTurretPromptText());
 
             if (UpgradeInteractInput.IsHeld())
             {
@@ -159,6 +189,7 @@ namespace Y4NGZUpgrades.Patches
                     if (TryApplyHack(turret))
                         EmployeeStatistics.RecordDeviceHacked(turret);
                     ClearTurretHackPrompt();
+                    return;
                 }
             }
             else
@@ -168,6 +199,48 @@ namespace Y4NGZUpgrades.Patches
                     0f,
                     Time.deltaTime * 2f);
             }
+
+            // F-TECH-2: the hold was completely silent before - a text prompt and nothing in
+            // between it and the 1.2 s completion.
+            Y4ngzPromptOverlay.SetPersistentPromptProgress(
+                TurretHackPromptKey,
+                _turretHackHold / TurretHackerUpgrade.HACK_HOLD_SECONDS);
+        }
+
+        /// <summary>
+        /// Rebuilds the two hold-hack prompt strings only when the bound Interact key changes;
+        /// these are read from Update postfixes.
+        /// </summary>
+        private static void RefreshPromptStrings()
+        {
+            // DisplayLabel() itself allocates (InputAction.GetBindingDisplayString), and a
+            // rebind cannot happen mid-hold, so polling it twice a second is plenty.
+            if (_turretPromptText != null && Time.unscaledTime < _nextPromptRefresh)
+                return;
+
+            _nextPromptRefresh = Time.unscaledTime + 0.5f;
+            string interact = UpgradeInteractInput.DisplayLabel();
+            if (string.Equals(interact, _promptInteractLabel, StringComparison.Ordinal)
+                && _turretPromptText != null)
+            {
+                return;
+            }
+
+            _promptInteractLabel = interact;
+            _turretPromptText = $"Disable turret: Hold [{interact}]";
+            _doorPromptText = $"Bypass lock: Hold [{interact}]";
+        }
+
+        private static string ResolveTurretPromptText()
+        {
+            RefreshPromptStrings();
+            return _turretPromptText;
+        }
+
+        private static string ResolveDoorPromptText()
+        {
+            RefreshPromptStrings();
+            return _doorPromptText;
         }
 
         private static bool TryApplyHack(Turret turret)
@@ -182,33 +255,58 @@ namespace Y4NGZUpgrades.Patches
             return true;
         }
 
-        private static readonly RaycastHit[] TurretHackHits = new RaycastHit[16];
+        // F-TECH-14: one reused non-alloc buffer, and one raycast per frame shared by the door,
+        // turret and camera probes. All three run from PlayerControllerB.Update postfixes at the
+        // same grab distance, so firing three RaycastAlls (one of which also allocated a sort
+        // comparison delegate every frame) was pure waste.
+        private static readonly RaycastHit[] LookHits = new RaycastHit[16];
+        private static int _lookHitCount;
+        private static int _lookHitFrame = -1;
+        private static float _lookHitRange = -1f;
 
-        private static Turret FindLookedAtTurret(PlayerControllerB player, float range)
+        internal static float ResolveLookRange(PlayerControllerB player)
         {
-            Camera camera = player.gameplayCamera != null ? player.gameplayCamera : Camera.main;
+            return player != null && player.grabDistance > 0f ? player.grabDistance : 4f;
+        }
+
+        internal static int LookRaycast(PlayerControllerB player, float range, out RaycastHit[] hits)
+        {
+            hits = LookHits;
+            if (_lookHitFrame == Time.frameCount && _lookHitRange == range)
+                return _lookHitCount;
+
+            _lookHitFrame = Time.frameCount;
+            _lookHitRange = range;
+            _lookHitCount = 0;
+
+            Camera camera = player != null && player.gameplayCamera != null
+                ? player.gameplayCamera
+                : Camera.main;
             if (camera == null)
-                return null;
+                return 0;
 
             Ray ray = new Ray(camera.transform.position, camera.transform.forward);
-            int hitCount = Physics.RaycastNonAlloc(
-                ray,
-                TurretHackHits,
-                range,
-                ~0,
-                QueryTriggerInteraction.Collide);
+            _lookHitCount = Physics.RaycastNonAlloc(ray, LookHits, range, ~0, QueryTriggerInteraction.Collide);
+            return _lookHitCount;
+        }
+
+        private static Turret FindLookedAtTurret(PlayerControllerB player)
+        {
+            int hitCount = LookRaycast(player, ResolveLookRange(player), out RaycastHit[] hits);
+
+            // RaycastNonAlloc results are unordered; take the nearest hit that resolves a Turret.
             Turret nearest = null;
             float nearestDistance = float.MaxValue;
             for (int i = 0; i < hitCount; i++)
             {
-                Turret turret = TurretHackHits[i].collider != null
-                    ? TurretHackHits[i].collider.GetComponentInParent<Turret>()
+                Turret turret = hits[i].collider != null
+                    ? hits[i].collider.GetComponentInParent<Turret>()
                     : null;
-                if (turret == null || TurretHackHits[i].distance >= nearestDistance)
+                if (turret == null || hits[i].distance >= nearestDistance)
                     continue;
 
                 nearest = turret;
-                nearestDistance = TurretHackHits[i].distance;
+                nearestDistance = hits[i].distance;
             }
 
             return nearest;
@@ -222,7 +320,9 @@ namespace Y4NGZUpgrades.Patches
         private static void ApplyHack(ulong turretNetworkId, float duration)
         {
             float expiresAt;
-            if (!HackedTurrets.TryGetValue(turretNetworkId, out expiresAt))
+            bool alreadyHacked = HackedTurrets.TryGetValue(turretNetworkId, out expiresAt)
+                                 && Time.time < expiresAt;
+            if (!alreadyHacked)
                 expiresAt = 0f;
 
             HackedTurrets[turretNetworkId] = Mathf.Max(expiresAt, Time.time + duration);
@@ -232,7 +332,34 @@ namespace Y4NGZUpgrades.Patches
             {
                 turret.targetPlayerWithRotation = null;
                 turret.targetTransform = null;
+                if (!alreadyHacked)
+                    SilenceHackedTurret(turret);
             }
+        }
+
+        /// <summary>
+        /// F-TECH-5: PreTurretUpdate skips Turret.Update outright, so vanilla's
+        /// Firing -> Detection transition - the only place the firing audio and bullet particles
+        /// are stopped - never runs. A turret hacked mid-burst kept a stream of tracers and
+        /// looping gunfire pointed at the crew for the whole 90 s while dealing no damage.
+        /// Replicate that transition once, when the turret is newly hacked.
+        /// </summary>
+        private static void SilenceHackedTurret(Turret turret)
+        {
+            if (turret.mainAudio != null)
+                turret.mainAudio.Stop();
+            if (turret.farAudio != null)
+                turret.farAudio.Stop();
+            if (turret.berserkAudio != null)
+                turret.berserkAudio.Stop();
+            if (turret.bulletCollisionAudio != null)
+                turret.bulletCollisionAudio.Stop();
+            if (turret.bulletParticles != null)
+                turret.bulletParticles.Stop(withChildren: true, ParticleSystemStopBehavior.StopEmitting);
+
+            // Leaving this at Firing is what made vanilla run the cleanup only once the hack
+            // expired; Detection also matches the steady state UpdateHackedTurret holds.
+            turret.turretModeLastFrame = TurretMode.Detection;
         }
 
         private static Turret ResolveTurret(ulong networkId)
@@ -294,10 +421,7 @@ namespace Y4NGZUpgrades.Patches
                 return;
             }
 
-            string interact = UpgradeInteractInput.DisplayLabel();
-            Y4ngzPromptOverlay.SetPersistentPrompt(
-                DoorHackPromptKey,
-                $"Bypass lock: Hold [{interact}]");
+            Y4ngzPromptOverlay.SetPersistentPrompt(DoorHackPromptKey, ResolveDoorPromptText());
 
             if (UpgradeInteractInput.IsHeld())
             {
@@ -310,12 +434,18 @@ namespace Y4NGZUpgrades.Patches
                     door.UnlockDoorSyncWithServer();
                     EmployeeStatistics.RecordDeviceHacked(door);
                     ClearDoorHackPrompt();
+                    return;
                 }
             }
             else
             {
                 _doorHackHold = Mathf.MoveTowards(_doorHackHold, 0f, Time.deltaTime * 2f);
             }
+
+            // F-TECH-2: visible hold progress for the door bypass.
+            Y4ngzPromptOverlay.SetPersistentPromptProgress(
+                DoorHackPromptKey,
+                _doorHackHold / TurretHackerUpgrade.HACK_HOLD_SECONDS);
         }
 
         private static void ClearDoorHackPrompt()
@@ -323,19 +453,9 @@ namespace Y4NGZUpgrades.Patches
             Y4ngzPromptOverlay.ClearPersistentPrompt(DoorHackPromptKey);
         }
 
-        // Reused raycast buffer: this runs every frame from the Update postfix, and
-        // Physics.RaycastAll allocated a fresh RaycastHit[] per call.
-        private static readonly RaycastHit[] DoorHackHits = new RaycastHit[16];
-
         private static DoorLock FindLookedAtLockedDoor(PlayerControllerB player)
         {
-            Camera camera = player.gameplayCamera != null ? player.gameplayCamera : Camera.main;
-            if (camera == null)
-                return null;
-
-            float range = player.grabDistance > 0f ? player.grabDistance : 4f;
-            Ray ray = new Ray(camera.transform.position, camera.transform.forward);
-            int hitCount = Physics.RaycastNonAlloc(ray, DoorHackHits, range, ~0, QueryTriggerInteraction.Collide);
+            int hitCount = LookRaycast(player, ResolveLookRange(player), out RaycastHit[] hits);
 
             // RaycastNonAlloc results are unordered; take the nearest hit that
             // resolves a DoorLock (matches the previous sorted first-hit logic).
@@ -343,11 +463,11 @@ namespace Y4NGZUpgrades.Patches
             float nearestDistance = float.MaxValue;
             for (int i = 0; i < hitCount; i++)
             {
-                DoorLock door = DoorHackHits[i].collider != null ? DoorHackHits[i].collider.GetComponentInParent<DoorLock>() : null;
-                if (door == null || DoorHackHits[i].distance >= nearestDistance)
+                DoorLock door = hits[i].collider != null ? hits[i].collider.GetComponentInParent<DoorLock>() : null;
+                if (door == null || hits[i].distance >= nearestDistance)
                     continue;
 
-                nearestDistance = DoorHackHits[i].distance;
+                nearestDistance = hits[i].distance;
                 nearestDoor = door;
             }
 
@@ -480,6 +600,21 @@ namespace Y4NGZUpgrades.Patches
                     if (!(duration > 0f) || ResolveTurret(turretNetworkId) == null)
                         return;
 
+                    // F-TECH-6: entitlement and the advertised 20 s cooldown are now enforced on
+                    // the host. _cooldownEnd on the sender is a client-side static, so a modded
+                    // or stale client could otherwise disable every turret in the level at will.
+                    //
+                    // #435: entitlement is the sender's published CAPABILITY, not their rank.
+                    // Full-native rank 2 cannot hack a turret while unique-only rank 2 can, so the
+                    // rank cannot answer this, and the host must never substitute its own
+                    // preference for the sender's. A peer that never publishes the index reads 0:
+                    // unknown is not authorisation.
+                    if (UpgradeTierSync.GetTier(senderClientId, TurretHackerUpgrade.TURRET_HACK_CAPABILITY_ID) < 1)
+                        return;
+                    if (HostCooldownEnd.TryGetValue(senderClientId, out float readyAt) && Time.time < readyAt)
+                        return;
+
+                    HostCooldownEnd[senderClientId] = Time.time + TurretHackerUpgrade.COOLDOWN_SECONDS;
                     duration = Mathf.Min(duration, MAX_HACK_DURATION_SECONDS);
                     RelayHack(senderClientId, turretNetworkId, duration);
                 }

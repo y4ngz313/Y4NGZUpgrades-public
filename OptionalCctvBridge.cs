@@ -20,12 +20,35 @@ namespace Y4NGZUpgrades
         private const string ObjectiveApiTypeName =
             "Y4NGZCompany.Contracts._Shared.MoonContractObjectiveMarkerApi, Y4NGZCompany";
 
-        private static Type CctvApi => OptionalPluginCapabilities.LethalCctv
-            ? Type.GetType(CctvApiTypeName, throwOnError: false)
-            : null;
-        private static Type MainframeType => OptionalPluginCapabilities.LethalCctv
-            ? Type.GetType(MainframeTypeName, throwOnError: false)
-            : null;
+        // F-TABLET-11: the MAINFRAME tab reads these every row rebuild (~10 Hz x N cameras), and
+        // Type.GetType + GetMethod/GetProperty are not free. Resolutions are cached; a *failed*
+        // type lookup is deliberately not cached, because the CCTV plugin's assembly may not be
+        // loaded yet the first time a read happens. Member lookups are cached either way: once the
+        // declaring type exists its member set cannot change.
+        private static Type _cctvApiType;
+        private static Type _mainframeType;
+        private static Type _cameraRegistryType;
+        private static Type _objectiveApiType;
+        private static readonly Dictionary<string, MethodInfo> MethodCache =
+            new Dictionary<string, MethodInfo>();
+        private static readonly Dictionary<string, MemberInfo> StaticMemberCache =
+            new Dictionary<string, MemberInfo>();
+        private static readonly Dictionary<string, MemberInfo> InstanceMemberCache =
+            new Dictionary<string, MemberInfo>();
+
+        private static Type CctvApi => ResolveCctvType(CctvApiTypeName, ref _cctvApiType);
+        private static Type MainframeType => ResolveCctvType(MainframeTypeName, ref _mainframeType);
+        private static Type CameraRegistryType => ResolveCctvType(CameraRegistryTypeName, ref _cameraRegistryType);
+
+        private static Type ResolveCctvType(string assemblyQualifiedName, ref Type cache)
+        {
+            if (cache != null)
+                return cache;
+            if (!OptionalPluginCapabilities.LethalCctv)
+                return null;
+            cache = Type.GetType(assemblyQualifiedName, throwOnError: false);
+            return cache;
+        }
 
         internal static bool InstallDetectionTimeMultiplierProvider(Func<PlayerControllerB, float> provider)
         {
@@ -101,19 +124,59 @@ namespace Y4NGZUpgrades
             return ReadInstanceBool(support, "IsSecurityAlarmActive") || IsTimedSecurityAlarmActive;
         }
 
-        internal static void ApplyAlarmOperation(byte operation, byte silenceOperation)
+        /// <summary>
+        /// Review pass: reports whether the alarm operation actually reached the mainframe. This
+        /// used to return void and bail silently when <c>MainframeSupport.Active</c> was null, and
+        /// <see cref="InvokeInstance"/> swallows every exception - so the caller's try/catch could
+        /// never fire and the tablet always reported ALARM SET, eating its cooldown, even with no
+        /// mainframe on the moon. Both entry points are void members, so a null return value
+        /// carries no information; the signal is whether the support instance exists, the method
+        /// resolved, and the call completed.
+        /// </summary>
+        internal static bool ApplyAlarmOperation(byte operation, byte silenceOperation)
         {
             object support = ReadStaticMember(MainframeType, "Active");
             if (support == null)
-                return;
+                return false;
 
             if (operation == silenceOperation)
-                InvokeInstance(support, "SilenceSecurityAlarmServerRpc", new object[] { default(ServerRpcParams) });
-            else
-                InvokeInstance(
-                    support,
-                    "SetAlarmServerRpc",
-                    new object[] { operation != 0, default(ServerRpcParams) });
+            {
+                return TryInvokeInstanceVoid(
+                    support, "SilenceSecurityAlarmServerRpc", new object[] { default(ServerRpcParams) });
+            }
+
+            return TryInvokeInstanceVoid(
+                support,
+                "SetAlarmServerRpc",
+                new object[] { operation != 0, default(ServerRpcParams) });
+        }
+
+        /// <summary>
+        /// F-TABLET-2: maps a CCTVCamera behaviour picked up by the SCAN-tab splice raycast back to
+        /// the CameraIndex that CctvSupportApi.TryDisableCamera / IsCameraDisabled take, so the
+        /// splice can route through the same host path the MAINFRAME CAMERAS list uses. Prefers the
+        /// camera's own CameraIndex and falls back to the security registry entry.
+        /// </summary>
+        internal static bool TryResolveCameraId(Component camera, out int cameraId)
+        {
+            cameraId = 0;
+            if (camera == null || !OptionalPluginCapabilities.LethalCctv)
+                return false;
+
+            if (ReadInstanceMember(camera, "CameraIndex") is int index)
+            {
+                cameraId = index;
+                return true;
+            }
+
+            object state = InvokeStatic(CameraRegistryType, "Find", new object[] { camera });
+            if (state != null && ReadInstanceMember(state, "CameraIndex") is int registered)
+            {
+                cameraId = registered;
+                return true;
+            }
+
+            return false;
         }
 
         internal static void CollectCameraTransforms(List<Transform> output)
@@ -121,8 +184,7 @@ namespace Y4NGZUpgrades
             if (output == null || !OptionalPluginCapabilities.LethalCctv)
                 return;
 
-            Type registry = Type.GetType(CameraRegistryTypeName, throwOnError: false);
-            object cameras = ReadStaticMember(registry, "RegisteredCameras");
+            object cameras = ReadStaticMember(CameraRegistryType, "RegisteredCameras");
             if (!(cameras is IEnumerable enumerable))
                 return;
 
@@ -139,8 +201,9 @@ namespace Y4NGZUpgrades
             if (output == null || !OptionalPluginCapabilities.Contracted)
                 return;
 
-            Type api = Type.GetType(ObjectiveApiTypeName, throwOnError: false);
-            object markers = InvokeStatic(api, "GetActiveMarkers", null);
+            if (_objectiveApiType == null)
+                _objectiveApiType = Type.GetType(ObjectiveApiTypeName, throwOnError: false);
+            object markers = InvokeStatic(_objectiveApiType, "GetActiveMarkers", null);
             if (!(markers is IEnumerable enumerable))
                 return;
 
@@ -182,13 +245,71 @@ namespace Y4NGZUpgrades
             return ReadInstanceMember(instance, name) is bool value && value;
         }
 
-        private static object InvokeStatic(Type type, string name, object[] arguments)
+        private static MethodInfo ResolveMethod(Type type, string name, BindingFlags flags)
+        {
+            if (type == null)
+                return null;
+            string key = type.FullName + "|" + name + "|" + (int)flags;
+            if (MethodCache.TryGetValue(key, out MethodInfo cached))
+                return cached;
+
+            MethodInfo method = null;
+            try
+            {
+                method = type.GetMethod(name, flags);
+            }
+            catch
+            {
+            }
+            MethodCache[key] = method;
+            return method;
+        }
+
+        private static MemberInfo ResolveMember(Type type, string name, BindingFlags flags,
+            Dictionary<string, MemberInfo> cache)
+        {
+            if (type == null)
+                return null;
+            string key = type.FullName + "|" + name;
+            if (cache.TryGetValue(key, out MemberInfo cached))
+                return cached;
+
+            MemberInfo member = null;
+            try
+            {
+                member = (MemberInfo)type.GetProperty(name, flags) ?? type.GetField(name, flags);
+            }
+            catch
+            {
+            }
+            cache[key] = member;
+            return member;
+        }
+
+        private static object ReadMember(MemberInfo member, object instance)
         {
             try
             {
-                return type?.GetMethod(
-                    name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-                    ?.Invoke(null, arguments);
+                if (member is PropertyInfo property)
+                    return property.GetValue(instance);
+                if (member is FieldInfo field)
+                    return field.GetValue(instance);
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static object InvokeStatic(Type type, string name, object[] arguments)
+        {
+            MethodInfo method = ResolveMethod(
+                type, name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method == null)
+                return null;
+            try
+            {
+                return method.Invoke(null, arguments);
             }
             catch
             {
@@ -196,15 +317,40 @@ namespace Y4NGZUpgrades
             }
         }
 
+        /// <summary>
+        /// Review pass: the <see cref="InvokeInstance"/> shape for a void member, where a null
+        /// return value means nothing. True only when the method resolved and the call completed.
+        /// </summary>
+        private static bool TryInvokeInstanceVoid(object instance, string name, object[] arguments)
+        {
+            if (instance == null)
+                return false;
+            MethodInfo method = ResolveMethod(
+                instance.GetType(), name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method == null)
+                return false;
+            try
+            {
+                method.Invoke(instance, arguments);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static object InvokeInstance(object instance, string name, object[] arguments)
         {
             if (instance == null)
                 return null;
+            MethodInfo method = ResolveMethod(
+                instance.GetType(), name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method == null)
+                return null;
             try
             {
-                return instance.GetType().GetMethod(
-                    name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    ?.Invoke(instance, arguments);
+                return method.Invoke(instance, arguments);
             }
             catch
             {
@@ -214,41 +360,24 @@ namespace Y4NGZUpgrades
 
         private static object ReadStaticMember(Type type, string name)
         {
-            try
-            {
-                PropertyInfo property = type?.GetProperty(
-                    name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                if (property != null)
-                    return property.GetValue(null);
-                return type?.GetField(
-                    name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-                    ?.GetValue(null);
-            }
-            catch
-            {
-                return null;
-            }
+            return ReadMember(
+                ResolveMember(
+                    type, name,
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                    StaticMemberCache),
+                null);
         }
 
         private static object ReadInstanceMember(object instance, string name)
         {
             if (instance == null)
                 return null;
-            try
-            {
-                Type type = instance.GetType();
-                PropertyInfo property = type.GetProperty(
-                    name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (property != null)
-                    return property.GetValue(instance);
-                return type.GetField(
-                    name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    ?.GetValue(instance);
-            }
-            catch
-            {
-                return null;
-            }
+            return ReadMember(
+                ResolveMember(
+                    instance.GetType(), name,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    InstanceMemberCache),
+                instance);
         }
     }
 }

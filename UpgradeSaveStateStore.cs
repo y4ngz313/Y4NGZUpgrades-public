@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Y4NGZUpgrades.Upgrades;
 
 namespace Y4NGZUpgrades
 {
@@ -11,9 +14,169 @@ namespace Y4NGZUpgrades
 
     internal sealed class UpgradeSaveState
     {
+        /// <summary>
+        /// Full-native ranks and imported Late Game Upgrades ranks. This is the record every save
+        /// has always had; it keeps its meaning whatever the live policy says (#435).
+        /// </summary>
         internal readonly Dictionary<string, int> Levels =
             new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         internal bool ImportedLegacyLevels;
+        internal readonly HashSet<string> ImportedLguLevels =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Unique-only ranks of the native families (#435), kept apart from <see cref="Levels"/>
+        /// so neither mode's ownership is ever reinterpreted as the other's. A smaller live
+        /// MaxTier is not a save migration.
+        /// </summary>
+        internal readonly Dictionary<string, int> UniqueLevels =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        internal Dictionary<string, int> RanksFor(UpgradeRankRecord record)
+        {
+            return record == UpgradeRankRecord.UniqueOnly ? UniqueLevels : Levels;
+        }
+
+        internal bool ImportLguLevel(string id, int level)
+        {
+            if (!ImportedLguLevels.Add(id))
+                return false;
+            Levels.TryGetValue(id, out int owned);
+            if (level > owned)
+                Levels[id] = level;
+            return true;
+        }
+
+        /// <summary>
+        /// Re-arms the one-time import for a row the provider stopped offering. Without this a
+        /// rank bought back with company credits while the row was unavailable would be driven
+        /// away the next time it binds.
+        /// </summary>
+        internal void ClearLguImport(string id)
+        {
+            ImportedLguLevels.Remove(id);
+        }
+
+        /// <summary>
+        /// Re-arms every one-time import (#493) for a session in which Late Game Upgrades is
+        /// installed but not integrated into the player menu: it sells the imported rows for
+        /// credits again then, so the next integrated load must merge what it holds (the larger of
+        /// the token rank and LGU's) instead of driving it away. Levels are untouched. True when a
+        /// marker was cleared, so the caller has something to persist.
+        /// </summary>
+        internal bool RearmLguImports()
+        {
+            if (ImportedLguLevels.Count == 0)
+                return false;
+            ImportedLguLevels.Clear();
+            return true;
+        }
+
+        /// <summary>
+        /// One save's line in upgrade_levels.txt:
+        /// <c>key|levels|importedLegacy|importedLgu|uniqueLevels</c>. The fifth field is new in
+        /// #435; a line written before it still decodes, with an empty unique record.
+        /// </summary>
+        internal string Encode(string saveKey)
+        {
+            var builder = new StringBuilder();
+            builder.Append(saveKey).Append('|');
+            AppendRanks(builder, Levels);
+            builder.Append('|').Append(ImportedLegacyLevels).Append('|');
+            bool first = true;
+            foreach (string id in ImportedLguLevels.OrderBy(x => x, StringComparer.Ordinal))
+            {
+                if (!first)
+                    builder.Append(';');
+                builder.Append(id);
+                first = false;
+            }
+
+            builder.Append('|');
+            AppendRanks(builder, UniqueLevels);
+            return builder.ToString();
+        }
+
+        internal static bool TryDecode(
+            string line,
+            Func<string, bool> isBridgedUpgrade,
+            out string saveKey,
+            out UpgradeSaveState state)
+        {
+            saveKey = null;
+            state = null;
+            if (string.IsNullOrWhiteSpace(line))
+                return false;
+
+            string[] parts = line.Split('|');
+            if (parts.Length < 2)
+                return false;
+
+            string key = parts[0].Trim();
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+
+            var decoded = new UpgradeSaveState();
+            ParseRanks(parts[1], decoded.Levels);
+            decoded.ImportedLegacyLevels = parts.Length >= 3
+                && bool.TryParse(parts[2], out bool imported)
+                && imported;
+            if (parts.Length >= 4)
+            {
+                foreach (string id in parts[3].Split(';'))
+                {
+                    if (isBridgedUpgrade != null && isBridgedUpgrade(id))
+                        decoded.ImportedLguLevels.Add(id);
+                }
+            }
+
+            if (parts.Length >= 5)
+                ParseRanks(parts[4], decoded.UniqueLevels);
+
+            saveKey = key;
+            state = decoded;
+            return true;
+        }
+
+        private static void AppendRanks(StringBuilder builder, Dictionary<string, int> ranks)
+        {
+            bool first = true;
+            foreach (KeyValuePair<string, int> pair in ranks
+                         .Where(x => x.Value > 0)
+                         .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!first)
+                    builder.Append(';');
+                builder.Append(pair.Key).Append('=').Append(pair.Value);
+                first = false;
+            }
+        }
+
+        private static void ParseRanks(string encoded, Dictionary<string, int> ranks)
+        {
+            ranks.Clear();
+            if (string.IsNullOrWhiteSpace(encoded))
+                return;
+
+            string[] entries = encoded.Split(';');
+            for (int i = 0; i < entries.Length; i++)
+            {
+                string entry = entries[i];
+                if (string.IsNullOrWhiteSpace(entry))
+                    continue;
+
+                int separator = entry.IndexOf('=');
+                if (separator <= 0 || separator >= entry.Length - 1)
+                    continue;
+
+                string id = Y4NGZUpgradeDefinition.NormalizeId(entry.Substring(0, separator));
+                if (string.IsNullOrWhiteSpace(id))
+                    continue;
+
+                if (int.TryParse(entry.Substring(separator + 1), out int level) && level > 0)
+                    ranks[id] = level;
+            }
+        }
     }
 
     /// <summary>
@@ -134,13 +297,56 @@ namespace Y4NGZUpgrades
             return removed;
         }
 
-        internal int GetLevel(string upgradeId, int maxTier)
+        /// <summary>
+        /// <see cref="UpgradeSaveState.RearmLguImports"/> for every save this store holds; the
+        /// number of saves that changed and so need writing back.
+        /// </summary>
+        internal int RearmLguImports()
+        {
+            int rearmed = 0;
+            foreach (UpgradeSaveState state in _states.Values)
+            {
+                if (state != null && state.RearmLguImports())
+                    rearmed++;
+            }
+
+            return rearmed;
+        }
+
+        /// <summary>
+        /// The level a record holds for this row, clamped to what the row currently sells. A
+        /// <see cref="UpgradeRankRecord.UniqueOnly"/> read projects the full-native ranks this
+        /// save already owns onto the variant's milestones: the credit is inherent to the read,
+        /// so it is idempotent, cannot be consumed by a one-time marker, and never runs backwards
+        /// (#435).
+        /// </summary>
+        internal int GetLevel(
+            string upgradeId,
+            int maxTier,
+            UpgradeRankRecord record = UpgradeRankRecord.Full)
         {
             UpgradeSaveState state = Current;
             if (state == null || string.IsNullOrWhiteSpace(upgradeId))
                 return 0;
 
-            int level = state.Levels.TryGetValue(upgradeId, out int value) ? value : 0;
+            int level;
+            if (record == UpgradeRankRecord.UniqueOnly)
+            {
+                state.UniqueLevels.TryGetValue(upgradeId, out level);
+                if (NativeUpgradeFamilies.TryGet(upgradeId, out NativeUpgradeFamily family)
+                    && family.UniqueVariant != null)
+                {
+                    state.Levels.TryGetValue(upgradeId, out int fullRank);
+                    int projected = family.UniqueVariant.ProjectFullRank(fullRank);
+                    if (projected > level)
+                        level = projected;
+                }
+            }
+            else
+            {
+                state.Levels.TryGetValue(upgradeId, out level);
+            }
+
             return level < 0 ? 0 : level > maxTier ? maxTier : level;
         }
     }

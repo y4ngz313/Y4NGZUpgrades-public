@@ -20,9 +20,14 @@ namespace Y4NGZUpgrades.Patches
             return VanillaSlotCount + tier;
         }
 
-        internal static int GetTwoHandedLimit(int tier)
+        /// <summary>
+        /// How many two-handed items may occupy the hotbar. Takes the ALLOWANCE rather than a
+        /// rank: the unique-only Deeper Pockets variant (#435) sells the same three slot ranks
+        /// without the second two-handed item, so the rank alone no longer answers this.
+        /// </summary>
+        internal static int GetTwoHandedLimit(bool canCarryTwoTwoHandedItems)
         {
-            return tier >= MaximumBonusSlots ? 2 : 1;
+            return canCarryTwoTwoHandedItems ? 2 : 1;
         }
 
         internal static bool IsSelectable(int slot, int unlockedSlotCount, int occupancyMask)

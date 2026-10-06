@@ -12,7 +12,7 @@ namespace Y4NGZUpgrades.Patches
     /// <summary>
     /// What material did this shot hit? (#118)
     ///
-    /// <b>The premise this replaced was wrong.</b> `WORKFLOW_Y4NGZ_WEAPONS.md` recorded surface
+    /// <b>The premise this replaced was wrong.</b> `docs/weapons/README.md` recorded surface
     /// classification as an open question on the stated premise that "LC colliders carry no material
     /// metadata". They do, and the code that disproves it is vanilla melee: <c>Shovel.HitShovel</c>
     /// and <c>KnifeItem.HitKnife</c> both read <c>collider.gameObject.tag</c> and scan it against

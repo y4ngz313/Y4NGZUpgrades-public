@@ -18,7 +18,10 @@ namespace Y4NGZUpgrades.Config
             new Dictionary<string, ConfigEntry<bool>>(StringComparer.OrdinalIgnoreCase);
 
         internal ConfigEntry<bool> Enabled;
+        internal ConfigEntry<bool> PurchasesCostTokens;
         internal ConfigEntry<bool> DebugLogging;
+        internal ConfigEntry<LguUpgradeMode> LguMode;
+        internal ConfigEntry<bool> IntegrateLgu;
         internal ConfigEntry<string>[] RankNames;
         internal ConfigEntry<int>[] XpRequiredForNextRank;
         internal ConfigEntry<int> TokensRanks1To5;
@@ -46,13 +49,19 @@ namespace Y4NGZUpgrades.Config
         internal ConfigEntry<int> MainframeHackXp;
         internal ConfigEntry<bool> ClutchExtractEnabled;
         internal ConfigEntry<int> ClutchExtractXp;
+        internal ConfigEntry<bool> ShipBatteryEnabled;
+        internal ConfigEntry<int> ShipBatteryReplaceXp;
+        internal ConfigEntry<int> ShipBatteryApparatusDockXp;
+        internal ConfigEntry<int> ShipBatteryMaxPerRound;
 
+        internal readonly Dictionary<string, ConfigEntry<int>> LguObjectiveXp = new Dictionary<string, ConfigEntry<int>>(StringComparer.Ordinal);
         internal ConfigEntry<bool> ContractXpEnabled;
         internal ConfigEntry<int> WhistleblowerDiscoveryXp;
         internal ConfigEntry<int> WhistleblowerKillXp;
         internal ConfigEntry<int> BlacksiteDrillPlacedXp;
         internal ConfigEntry<int> SurveyDronePlacedXp;
         internal ConfigEntry<int> BlackoutBreakerRestoredXp;
+        internal ConfigEntry<int> BlackoutBreakerZoneRestoredXp;
         internal ConfigEntry<int> ShadowRaidDrillCompletedXp;
         internal ConfigEntry<int> PestControlCompletedXp;
         internal ConfigEntry<int> WasteDisposalCompletedXp;
@@ -63,6 +72,8 @@ namespace Y4NGZUpgrades.Config
         internal ConfigEntry<int> PestControlCaptureXp;
         internal ConfigEntry<int> PestControlCaptureMaxPerRound;
         internal ConfigEntry<float> ContractCompletionRankWidthFraction;
+        internal ConfigEntry<float> ContractHeadlineRankWidthFraction;
+        internal ConfigEntry<float> ContractStepRankWidthFraction;
         internal ConfigEntry<float> ContractCompletedDefaultMultiplier;
         internal ConfigEntry<int> ContractFailedXp;
         internal ConfigEntry<int> DefuseCorrectWireXp;
@@ -82,10 +93,42 @@ namespace Y4NGZUpgrades.Config
                 progression, "General", "Progression Enabled", true,
                 "Enable Y4NGZ ranks, XP, promotion tokens, and upgrade purchases.",
                 "Progression", "Enabled");
+            PurchasesCostTokens = Y4NGZConfigFiles.BindMigrated(
+                progression, "General", "Purchases Cost Tokens", true,
+                "When disabled, upgrades, suits, cosmetics, and emotes are free for this local player without changing their configured prices. LUCKY-8 and external purchase APIs are unaffected.");
             DebugLogging = Bind(
                 progression, "General", "Debug Logging", false,
                 "Log detailed XP accounting and config migration information.",
                 "Progression", "DebugLogging");
+            // #435: one explicit mode replaces the earlier Prefer LGU Upgrades switch. It lives in
+            // [LGU] with the imported rows and carries its #442 [General] value over; nothing is
+            // read from the retired key.
+            LguMode = Y4NGZConfigFiles.BindMigrated(
+                Y4NGZConfigFiles.Lgu, "General", "LGU Upgrade Mode", LguUpgradeMode.NativePreferred,
+                "Which catalog supplies the effects the native tree and Late Game Upgrades both "
+                + "offer. NativePreferred: every native upgrade, plus the imported rows that add "
+                + "something new; the 17 overlapping imported rows are hidden. LguPreferred: every "
+                + "imported row; Transporter, Resilience, Sprinter and the native Quick Hands hide, "
+                + "and five native rows keep only what is theirs alone: Stagger, Firm Footing, Field "
+                + "Lighting, Expanded Hotbar and a Field Mechanic without door hacking. LguOnly: "
+                + "imported rows only, always in the flat AUGMENTS catalog whatever LGU Upgrade "
+                + "Layout says; the native UPGRADES menu entry is hidden and every native upgrade is "
+                + "switched off. Walkie GPS is hidden in the first two modes "
+                + "while Command Net is enabled. Without Late Game Upgrades every mode uses the full "
+                + "native tree. Levels you own in a hidden row stay in your save and return when you "
+                + "switch back; nothing is converted or refunded. Takes effect on restart. Local "
+                + "setting only.");
+            // #493: one switch for the whole integration. Off, the plugin treats Late Game Upgrades
+            // as absent everywhere the menu, the catalog and the bridge look.
+            IntegrateLgu = Y4NGZConfigFiles.BindMigrated(
+                Y4NGZConfigFiles.Lgu, "General", "Integrate LGU Into Player Menu", true,
+                "Sell Late Game Upgrades' personal upgrades for tokens in this mod's player menu. "
+                + "When off, Late Game Upgrades keeps all of its upgrades in its own terminal "
+                + "store for credits, and the player menu shows the full native tree as if Late "
+                + "Game Upgrades were not installed: LGU Upgrade Mode and LGU Upgrade Layout do "
+                + "nothing and there is no AUGMENTS entry. Levels you own in imported rows stay in "
+                + "your save and return when you switch it back on. Takes effect on restart. Local "
+                + "setting only.");
 
             BindRanks(progression);
             TokensRanks1To5 = BindTokenBand(progression, "Ranks 1-5", 5, "TokensRanks1To5");
@@ -157,9 +200,26 @@ namespace Y4NGZUpgrades.Config
                 Range("XP paid for extracting as the sole survivor of a multi-player facility entry.", 0, 500),
                 "Progression.XP", "ClutchExtractXp");
 
+            // #459: Ship Systems only. Flat like the mainframe and clutch awards: the restore is
+            // ship work, not a moon objective, so the moon risk multiplier does not apply.
+            ShipBatteryEnabled = BindEnabled(xpSources, "Ship Battery", "Ship battery restore XP");
+            ShipBatteryReplaceXp = Y4NGZConfigFiles.BindMigrated(
+                xpSources, "Ship Battery", "XP Per Replace", 20,
+                Range("XP paid for restoring ship power by docking a spare battery at the external socket. Never paid to the player whose hit broke the battery.", 0, 500));
+            ShipBatteryApparatusDockXp = Y4NGZConfigFiles.BindMigrated(
+                xpSources, "Ship Battery", "XP Per Apparatus Dock", 25,
+                Range("XP paid for restoring ship power by docking an apparatus at the external socket. Never paid to the player whose hit broke the battery.", 0, 500));
+            ShipBatteryMaxPerRound = Y4NGZConfigFiles.BindMigrated(
+                xpSources, "Ship Battery", "Maximum Paid Per Round", 2,
+                Range("Maximum battery restores that pay one player in a round.", 0, 20));
+
             ContractXpEnabled = BindEnabled(xpSources, "Contract Work", "All Y4NGZCompany contract XP");
             BindContractSources(xpSources);
             BindRiskMultipliers(xpSources);
+
+            // #455: every XP source is bound, legacy fallbacks included, so a value that still
+            // holds a default the code has since moved can now be judged and replaced once.
+            Y4NGZConfigFiles.MigrateXpSourceDefaults();
 
             RankCatalog.Configure(this);
             UpgradePrices = new PerUpgradeConfig();
@@ -255,32 +315,46 @@ namespace Y4NGZUpgrades.Config
 
         private void BindContractSources(Y4NGZConfigScope config)
         {
+            foreach (LguContractXpCatalog.Award award in LguContractXpCatalog.Awards)
+                LguObjectiveXp[award.Kind] = BindContractAward(config, award.Section, award.Kind,
+                    award.BaseXp, "XP", "Progression.Contracts", award.Kind + "Xp");
             WhistleblowerDiscoveryXp = BindContractAward(
                 config, "Whistleblower Sightings", "WhistleblowerSighted", 10,
                 "XP Per Sighting", "Progression.Contracts", "WhistleblowerDiscoveryXp");
             WhistleblowerKillXp = BindContractAward(
-                config, "Whistleblower Neutralized", "WhistleblowerNeutralized", 35,
+                config, "Whistleblower Neutralized", "WhistleblowerNeutralized",
+                ContractActCatalog.FlatDefaultXp("WhistleblowerNeutralized"),
                 "XP", "Progression.Contracts", "WhistleblowerKillXp");
             BlacksiteDrillPlacedXp = BindContractAward(
                 config, "Shadow Raid Drill Mounted", "ShadowRaidDrillAttached", 25,
                 "XP Per Drill", "Progression.Contracts", "BlacksiteDrillPlacedXp");
             ShadowRaidDrillCompletedXp = BindContractAward(
-                config, "Shadow Raid Container Opened", "ShadowRaidDrillCompleted", 15,
+                config, "Shadow Raid Container Opened", "ShadowRaidDrillCompleted",
+                ContractActCatalog.FlatDefaultXp("ShadowRaidDrillCompleted"),
                 "XP Per Container", "Progression.Contracts", "ShadowRaidDrillCompletedXp");
             ShadowRaidHardDriveXp = BindContractAward(
                 config, "Shadow Raid Hard Drive", "ShadowRaidHardDriveRecovered", 15,
                 "XP", "Progression.Contracts", "ShadowRaidHardDriveXp");
             SurveyDronePlacedXp = BindContractAward(
-                config, "Survey Drone Placed", "SurveyDronePlaced", 12,
+                config, "Survey Drone Placed", "SurveyDronePlaced",
+                ContractActCatalog.FlatDefaultXp("SurveyDronePlaced"),
                 "XP Per Drone", "Progression.Contracts", "SurveyDronePlacedXp");
             BlackoutBreakerRestoredXp = BindContractAward(
-                config, "Blackout Power Restored", "BlackoutAuditRestored", 35,
+                config, "Blackout Power Restored", "BlackoutAuditRestored",
+                ContractActCatalog.FlatDefaultXp("BlackoutAuditRestored"),
                 "XP", "Progression.Contracts", "BlackoutBreakerRestoredXp");
+            // #392: per restored breaker zone (Company #794), on top of the full-restore award
+            // above, so a partial restore on a failed round still pays the one who did it.
+            BlackoutBreakerZoneRestoredXp = BindContractAward(
+                config, "Blackout Breaker Restored", "BlackoutBreakerRestored", 15,
+                "XP Per Breaker", "Progression.Contracts", "BlackoutBreakerZoneRestoredXp");
             ContainmentWaveSurvivedXp = BindContractAward(
-                config, "Containment Wave Survived", "ContainmentBreachWaveSurvived", 10,
+                config, "Containment Wave Survived", "ContainmentBreachWaveSurvived",
+                ContractActCatalog.FlatDefaultXp("ContainmentBreachWaveSurvived"),
                 "XP Per Wave", "Progression.Contracts", "ContainmentWaveSurvivedXp");
             PestControlCompletedXp = BindContractAward(
-                config, "Pest Control Completed", "PestControlCompleted", 25,
+                config, "Pest Control Completed", "PestControlCompleted",
+                ContractActCatalog.FlatDefaultXp("PestControlCompleted"),
                 "XP", "Progression.Contracts", "PestControlCompletedXp");
             PestControlCaptureXp = BindContractAward(
                 config, "Extra Pest Captures", "PestControlCapture", 10,
@@ -290,7 +364,8 @@ namespace Y4NGZUpgrades.Config
                 Range("Maximum repeat captures that pay one player in a round.", 0, 50),
                 "Progression.Contracts", "PestControlCaptureMaxPerRound");
             WasteDisposalCompletedXp = BindContractAward(
-                config, "Waste Disposal Completed", "WasteDisposalCompleted", 25,
+                config, "Waste Disposal Completed", "WasteDisposalCompleted",
+                ContractActCatalog.FlatDefaultXp("WasteDisposalCompleted"),
                 "XP", "Progression.Contracts", "WasteDisposalCompletedXp");
             WasteDisposalRepairedXp = BindContractAward(
                 config, "Waste Disposal Repairs", "WasteDisposalRepaired", 8,
@@ -300,32 +375,48 @@ namespace Y4NGZUpgrades.Config
                 Range("Maximum incinerator repairs that pay one player in a round.", 0, 100),
                 "Progression.Contracts", "WasteDisposalRepairMaxPerRound");
 
+            // #457: 8, not 4 - a 4 XP act rounds away to nothing in the report.
             DefuseCorrectWireXp = BindContractAward(
-                config, "Defuse Correct Wire", "DefuseCorrectWire", 4,
+                config, "Defuse Correct Wire", "DefuseCorrectWire", 8,
                 "XP Per Wire", "23 - XP - Contracts", "DefuseCorrectWireXp");
             DefuseCorrectCodeXp = BindContractAward(
-                config, "Defuse Correct Code", "DefuseCorrectCode", 10,
+                config, "Defuse Correct Code", "DefuseCorrectCode",
+                ContractActCatalog.FlatDefaultXp("DefuseCorrectCode"),
                 "XP", "23 - XP - Contracts", "DefuseCorrectCodeXp");
             PayloadPilotXpPerSecond = BindContractAwardFloat(
                 config, "Payload Piloting", "PayloadPilotSeconds", 0.1f,
                 "XP Per Second", "23 - XP - Contracts", "PayloadPilotXpPerSecond");
             PayloadPilotMaxXp = Bind(
                 config, "Payload Piloting", "Maximum XP Per Round", 20,
-                Range("Maximum base Payload pilot XP paid to one player before moon risk.", 0, 500),
+                Range("Minimum ceiling on base Payload pilot XP for one player before moon risk. The actual ceiling is the larger of this and the actor's rank-band headline share.", 0, 500),
                 "23 - XP - Contracts", "PayloadPilotMaxXp");
+
+            // #457: acts are priced against the actor's own rank band, with the flat XP above as
+            // the floor, so the player who did the work out-earns a crew mate who only collects
+            // the completion share.
+            ContractHeadlineRankWidthFraction = Bind(
+                config, "Contract Act Scaling", "Headline Rank Width Fraction", 0.10f,
+                Range("Fraction of the acting player's current rank width paid for a contract's headline act, when that beats the act's flat XP; 0.10 means 10%. Also the ceiling on Payload pilot XP.", 0f, 1f),
+                "Progression.Contracts.Completion", "ContractHeadlineRankWidthFraction");
+            ContractStepRankWidthFraction = Bind(
+                config, "Contract Act Scaling", "Repeated Step Rank Width Fraction", 0.04f,
+                Range("Fraction of the acting player's current rank width paid for ONE step of a repeated objective (survey beacons, containment waves), when that beats the step's flat XP; 0.04 means 4%.", 0f, 1f),
+                "Progression.Contracts.Completion", "ContractStepRankWidthFraction");
 
             _contractSourceEnabled["ContractCompleted"] = BindEnabled(
                 config, "Contract Completion", "Generic contract completion XP");
             ContractCompletionRankWidthFraction = Bind(
-                config, "Contract Completion", "Rank Width Fraction", 0.20f,
-                Range("Fraction of the completing player's current rank width paid before multipliers; 0.20 means 20%.", 0f, 1f),
+                config, "Contract Completion", "Rank Width Fraction", 0.10f,
+                Range("Fraction of the completing player's current rank width paid before multipliers; 0.10 means 10%. Paid only to players who entered the facility or earned contract act XP this round.", 0f, 1f),
                 "Progression.Contracts.Completion", "ContractCompletionRankWidthFraction");
             ContractCompletedDefaultMultiplier = Bind(
                 config, "Contract Completion", "Unknown Contract Multiplier", 1f,
                 Range("Completion multiplier for contract types without an explicit entry.", 0f, 10f),
                 "Progression.Contracts.Completion", "ContractCompletedMultiplier.Default");
             BindContractCompleted(config, "Whistleblower", 1f);
-            BindContractCompleted(config, "BlackoutAudit", 1f);
+            // #392: the restore IS the completion, and it is already paid per breaker and on
+            // the full restore; a completion multiplier on top paid the same act twice.
+            BindContractCompleted(config, "BlackoutAudit", 0f);
             BindContractCompleted(config, "ShadowRaid", 1f);
             BindContractCompleted(config, "Survey", 1f);
             BindContractCompleted(config, "Defuse", 0f);
@@ -333,6 +424,12 @@ namespace Y4NGZUpgrades.Config
             BindContractCompleted(config, "Payload", 0f);
             BindContractCompleted(config, "PestControl", 0f);
             BindContractCompleted(config, "WasteDisposal", 0f);
+            // LGU final steps pay explicitly, just like native Defuse and Pest Control.
+            BindContractCompleted(config, "LguDataRetrieval", 0f);
+            BindContractCompleted(config, "LguExtermination", 0f);
+            BindContractCompleted(config, "LguExtraction", 0f);
+            BindContractCompleted(config, "LguExorcism", 0f);
+            BindContractCompleted(config, "LguDefusal", 0f);
 
             _contractSourceEnabled["ContractFailed"] = BindEnabled(
                 config, "Failed Contracts", "Failed-contract XP");

@@ -22,15 +22,23 @@ namespace Y4NGZUpgrades.UITheme
     }
 
     /// <summary>
-    /// Upgrades-owned UI palette facade. When Contracted is installed it mirrors Contracted's
-    /// selected palette through reflection; otherwise it supplies the same orange defaults. This
-    /// keeps every Upgrades UI usable without placing Y4NGZCompany in this assembly's reference
-    /// table.
+    /// Upgrades-owned UI palette facade. It mirrors Y4NGZUI's selected palette through reflection,
+    /// retains Contracted's delegating facade as a legacy fallback, and otherwise supplies the same
+    /// orange defaults. This keeps every Upgrades UI usable without placing either presentation
+    /// assembly in this project's reference table.
     /// </summary>
     internal static class UiTheme
     {
-        private const string ExternalTypeName =
-            "Y4NGZCompany.Experience.UITheme.UiTheme, Y4NGZCompany";
+        private static readonly string[] ExternalTypeNames =
+        {
+            "Y4NGZUI.UiTheme, Y4NGZUI",
+            "Y4NGZCompany.Experience.UITheme.UiTheme, Y4NGZCompany",
+        };
+
+        private static readonly OptionalTypeResolver ExternalThemeResolver =
+            new OptionalTypeResolver(
+                ExternalTypeNames,
+                typeName => Type.GetType(typeName, throwOnError: false));
 
         private static Type _externalType;
         private static EventInfo _externalThemeChanged;
@@ -118,6 +126,7 @@ namespace Y4NGZUpgrades.UITheme
             _externalThemeChanged = null;
             _externalThemeHandler = null;
             _externalType = null;
+            ExternalThemeResolver.Reset();
             ThemeChanged = null;
             _initialized = false;
         }
@@ -145,10 +154,7 @@ namespace Y4NGZUpgrades.UITheme
 
         private static void ResolveExternalTheme()
         {
-            if (_externalType != null || !OptionalPluginCapabilities.Contracted)
-                return;
-
-            _externalType = Type.GetType(ExternalTypeName, throwOnError: false);
+            _externalType = ExternalThemeResolver.Resolve();
         }
 
         private static void SubscribeToExternalTheme()
@@ -284,10 +290,18 @@ namespace Y4NGZUpgrades.UITheme
         private const string ReportTypeName =
             "Y4NGZCompany.Contracts._Shared.ContractPerformanceReportUi, Y4NGZCompany";
 
+        private static readonly string[] VisibilityTypeNames =
+        {
+            "Y4NGZUI.GameplayUiVisibility, Y4NGZUI",
+            "Y4NGZCompany.Experience.UITheme.GameplayUiVisibility, Y4NGZCompany",
+        };
+
         private static bool _initialized;
         private static bool _lastPublishedVisibility;
         private static PropertyInfo _reportActiveProperty;
         private static bool _reportProbeResolved;
+        private static bool _externalVisibilityResolved;
+        private static PropertyInfo _externalVisibilityProperty;
 
         internal static event Action<bool> VisibilityChanged;
         internal static bool IsVisible => ComputeVisibility();
@@ -308,6 +322,8 @@ namespace Y4NGZUpgrades.UITheme
             SceneManager.sceneLoaded -= OnSceneLoaded;
             VisibilityChanged = null;
             _initialized = false;
+            _externalVisibilityResolved = false;
+            _externalVisibilityProperty = null;
         }
 
         internal static void PublishCurrentState(bool force = false)
@@ -328,6 +344,9 @@ namespace Y4NGZUpgrades.UITheme
 
         private static bool ComputeVisibility()
         {
+            if (TryReadExternalVisibility(out bool externalVisible))
+                return externalVisible;
+
             Scene scene = SceneManager.GetActiveScene();
             if (!scene.IsValid() || !scene.isLoaded || scene.name != GameplaySceneName)
                 return false;
@@ -339,6 +358,33 @@ namespace Y4NGZUpgrades.UITheme
             if (PlayerIsUsingTerminal(player))
                 return false;
             return !IsRoundEndReportActive();
+        }
+
+        private static bool TryReadExternalVisibility(out bool visible)
+        {
+            if (!_externalVisibilityResolved)
+            {
+                _externalVisibilityResolved = true;
+                for (int i = 0; i < VisibilityTypeNames.Length && _externalVisibilityProperty == null; i++)
+                {
+                    Type type = Type.GetType(VisibilityTypeNames[i], throwOnError: false);
+                    _externalVisibilityProperty = type?.GetProperty(
+                        "IsVisible", BindingFlags.Static | BindingFlags.Public);
+                }
+            }
+
+            try
+            {
+                if (_externalVisibilityProperty?.GetValue(null) is bool value)
+                {
+                    visible = value;
+                    return true;
+                }
+            }
+            catch { }
+
+            visible = false;
+            return false;
         }
 
         private static bool PlayerIsUsingTerminal(PlayerControllerB player)
@@ -390,7 +436,18 @@ namespace Y4NGZUpgrades.UITheme
 
     internal static class GameplayHudMotion
     {
+        private static readonly string[] MotionTypeNames =
+        {
+            "Y4NGZUI.GameplayHudMotion, Y4NGZUI",
+            "Y4NGZCompany.Experience.UITheme.GameplayHudMotion, Y4NGZCompany",
+        };
+
         private static bool _initialized;
+        private static Type _externalType;
+        private static PropertyInfo _externalCurrentOffset;
+        private static EventInfo _externalMotionSampled;
+        private static Delegate _externalMotionHandler;
+
         internal static Vector2 CurrentOffset { get; private set; }
         internal static event Action<Vector2> MotionSampled;
 
@@ -398,24 +455,84 @@ namespace Y4NGZUpgrades.UITheme
         {
             if (_initialized)
                 return;
+
             _initialized = true;
+            ResolveExternalMotion();
             SceneManager.sceneLoaded += OnSceneLoaded;
-            Publish(Vector2.zero);
+            Publish(ReadExternalOffset());
         }
 
         internal static void Shutdown()
         {
             if (!_initialized)
                 return;
+
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            if (_externalMotionSampled != null && _externalMotionHandler != null)
+            {
+                try { _externalMotionSampled.RemoveEventHandler(null, _externalMotionHandler); }
+                catch { }
+            }
+
+            _externalType = null;
+            _externalCurrentOffset = null;
+            _externalMotionSampled = null;
+            _externalMotionHandler = null;
             CurrentOffset = Vector2.zero;
             MotionSampled = null;
             _initialized = false;
         }
 
+        private static void ResolveExternalMotion()
+        {
+            for (int i = 0; i < MotionTypeNames.Length && _externalType == null; i++)
+                _externalType = Type.GetType(MotionTypeNames[i], throwOnError: false);
+            if (_externalType == null)
+                return;
+
+            const BindingFlags flags = BindingFlags.Static | BindingFlags.Public;
+            _externalCurrentOffset = _externalType.GetProperty("CurrentOffset", flags);
+            _externalMotionSampled = _externalType.GetEvent("MotionSampled", flags);
+            if (_externalMotionSampled == null)
+                return;
+
+            try
+            {
+                MethodInfo callback = typeof(GameplayHudMotion).GetMethod(
+                    nameof(OnExternalMotionSampled), BindingFlags.Static | BindingFlags.NonPublic);
+                _externalMotionHandler = Delegate.CreateDelegate(
+                    _externalMotionSampled.EventHandlerType, callback);
+                _externalMotionSampled.AddEventHandler(null, _externalMotionHandler);
+            }
+            catch
+            {
+                _externalMotionSampled = null;
+                _externalMotionHandler = null;
+            }
+        }
+
+        private static Vector2 ReadExternalOffset()
+        {
+            try
+            {
+                return _externalCurrentOffset?.GetValue(null) is Vector2 offset
+                    ? offset
+                    : Vector2.zero;
+            }
+            catch
+            {
+                return Vector2.zero;
+            }
+        }
+
+        private static void OnExternalMotionSampled(Vector2 offset)
+        {
+            Publish(offset);
+        }
+
         private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            Publish(Vector2.zero);
+            Publish(_externalType != null ? ReadExternalOffset() : Vector2.zero);
         }
 
         private static void Publish(Vector2 offset)
@@ -428,36 +545,6 @@ namespace Y4NGZUpgrades.UITheme
             {
                 try { ((Action<Vector2>)callback)(offset); }
                 catch { }
-            }
-        }
-    }
-
-    internal static class ContractHudLayoutBridge
-    {
-        private const string ExternalTypeName =
-            "Y4NGZCompany.Contracts._Shared.ContractHudLayoutBridge, Y4NGZCompany";
-        private static bool _resolved;
-        private static MethodInfo _getStackedPromptTop;
-
-        internal static float GetStackedPromptTop()
-        {
-            if (!_resolved)
-            {
-                _resolved = true;
-                Type type = OptionalPluginCapabilities.Contracted
-                    ? Type.GetType(ExternalTypeName, throwOnError: false)
-                    : null;
-                _getStackedPromptTop = type?.GetMethod(
-                    "GetStackedPromptTop", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-            }
-
-            try
-            {
-                return _getStackedPromptTop?.Invoke(null, null) is float top ? Mathf.Max(0f, top) : 0f;
-            }
-            catch
-            {
-                return 0f;
             }
         }
     }

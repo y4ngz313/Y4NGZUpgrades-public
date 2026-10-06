@@ -55,8 +55,12 @@ namespace Y4NGZUpgrades.Effects
         private Vector3 _joltBaseLocalPosition;
         private bool _initialized;
         private bool _flashlightConeToned;
+        // F-DRONE-8: the real materials are captured ONCE and kept here for the object's lifetime,
+        // and the runtime dissolve copies currently on the renderers are tracked so they can always
+        // be put back and destroyed.
+        private Material[][] _originalMaterials;
+        private Material[][] _activeDissolveMaterials;
 
-        internal bool IsPoweredOn { get; private set; }
         internal bool HasAnimator => _animator != null && _animator.runtimeAnimatorController != null;
         internal Transform CarryAnchor { get; private set; }
 
@@ -93,13 +97,11 @@ namespace Y4NGZUpgrades.Effects
             _liveBodyRenderers = null;
             SetBrokenPiecesActive(false);
             SetFlashlightActive(false);
-            IsPoweredOn = false;
         }
 
         internal void PlayLiftOff()
         {
             EnsureInitialized();
-            IsPoweredOn = true;
             SetBrokenPiecesActive(false);
             SetTrigger(LiftOffTrigger);
         }
@@ -107,7 +109,6 @@ namespace Y4NGZUpgrades.Effects
         internal void PlayLand()
         {
             EnsureInitialized();
-            IsPoweredOn = false;
             SetFlashlightActive(false);
             SetTrigger(LandTrigger);
         }
@@ -150,20 +151,9 @@ namespace Y4NGZUpgrades.Effects
             _joltRoutine = StartCoroutine(PlayHitJoltRoutine(_joltTarget, _joltBaseLocalPosition, localDirection * distance, duration));
         }
 
-        internal void PlayHurtSmall()
-        {
-            PlayHurt(largeHit: false);
-        }
-
-        internal void PlayHurtLarge()
-        {
-            PlayHurt(largeHit: true);
-        }
-
         internal void PlayDeath()
         {
             EnsureInitialized();
-            IsPoweredOn = false;
             SetFlashlightActive(false);
             SetTrigger(ExplodeTrigger);
         }
@@ -223,6 +213,21 @@ namespace Y4NGZUpgrades.Effects
             _joltRoutine = null;
         }
 
+        /// <summary>
+        /// F-DRONE-8: three bugs lived here. The originals were re-captured on every call from
+        /// <c>renderer.materials</c>, which instantiates a fresh copy of every shared material; a
+        /// dematerialize left its <c>new Material(template)</c> instances on the renderers and threw
+        /// the captured originals away; and a pre-empting call (PlayMaterializeIn right after the
+        /// dematerialize in StuckRescueRelocateRoutine) then captured those dissolve copies AS the
+        /// originals and restored them at the end - so a stuck-rescued drone permanently wore flat
+        /// base-colour-only materials and every rescue cycle leaked another layer.
+        ///
+        /// Now the originals are captured once from <c>sharedMaterials</c> and kept for the object's
+        /// lifetime, and whichever direction ran last, the dissolve set is restored and destroyed
+        /// before a new one is built (and on OnDestroy). A finished dematerialize deliberately keeps
+        /// its set applied at amount 1 - restoring there would pop the drone back into view during
+        /// the gap before it is destroyed or re-materialized.
+        /// </summary>
         private float StartDissolve(float from, float to, float duration, bool restoreOriginalMaterials)
         {
             Material template = CourierDroneRuntimeAssets.LoadDissolveMaterial();
@@ -237,18 +242,25 @@ namespace Y4NGZUpgrades.Effects
                 return 0f;
 
             if (_dissolveRoutine != null)
+            {
                 StopCoroutine(_dissolveRoutine);
+                _dissolveRoutine = null;
+            }
 
-            Material[][] originalMaterials = CaptureOriginalMaterials(renderers);
-            Material[][] dissolveMaterials = CreateDissolveMaterialArrays(template, originalMaterials);
+            if (_originalMaterials == null)
+                _originalMaterials = CaptureOriginalMaterials(renderers);
+            else
+                ReleaseActiveDissolveMaterials(renderers);
+
+            Material[][] dissolveMaterials = CreateDissolveMaterialArrays(template, _originalMaterials);
+            _activeDissolveMaterials = dissolveMaterials;
             ApplyDissolveMaterials(renderers, dissolveMaterials, from);
-            _dissolveRoutine = StartCoroutine(PlayDissolveRoutine(renderers, originalMaterials, dissolveMaterials, from, to, duration, restoreOriginalMaterials));
+            _dissolveRoutine = StartCoroutine(PlayDissolveRoutine(renderers, dissolveMaterials, from, to, duration, restoreOriginalMaterials));
             return duration;
         }
 
         private IEnumerator PlayDissolveRoutine(
             Renderer[] renderers,
-            Material[][] originalMaterials,
             Material[][] dissolveMaterials,
             float from,
             float to,
@@ -266,13 +278,30 @@ namespace Y4NGZUpgrades.Effects
             }
 
             ApplyDissolveAmount(dissolveMaterials, to);
-            if (restoreOriginalMaterials)
-            {
-                RestoreOriginalMaterials(renderers, originalMaterials);
-                DestroyDissolveMaterials(dissolveMaterials);
-            }
-
             _dissolveRoutine = null;
+            if (restoreOriginalMaterials)
+                ReleaseActiveDissolveMaterials(renderers);
+        }
+
+        /// <summary>
+        /// Puts the captured originals back on the renderers and destroys the runtime dissolve copies
+        /// that were on them. Safe to call when no dissolve set is active.
+        /// </summary>
+        private void ReleaseActiveDissolveMaterials(Renderer[] renderers)
+        {
+            if (_originalMaterials != null && renderers != null)
+                RestoreOriginalMaterials(renderers, _originalMaterials);
+
+            DestroyDissolveMaterials(_activeDissolveMaterials);
+            _activeDissolveMaterials = null;
+        }
+
+        private void OnDestroy()
+        {
+            // The drone object can be destroyed mid-dissolve (dismiss, death, round reset); without
+            // this the runtime dissolve copies are orphaned (F-DRONE-8).
+            DestroyDissolveMaterials(_activeDissolveMaterials);
+            _activeDissolveMaterials = null;
         }
 
         private static void ApplyDissolveMaterials(Renderer[] renderers, Material[][] dissolveMaterialSets, float amount)
@@ -285,17 +314,21 @@ namespace Y4NGZUpgrades.Effects
                 if (renderer == null || dissolveMaterials == null)
                     continue;
 
-                renderer.materials = dissolveMaterials;
+                renderer.sharedMaterials = dissolveMaterials;
             }
         }
 
+        /// <summary>
+        /// sharedMaterials, not materials: the getter on <c>materials</c> instantiates a copy of
+        /// every material it returns, so capturing through it leaked a full set per call (F-DRONE-8).
+        /// </summary>
         private static Material[][] CaptureOriginalMaterials(Renderer[] renderers)
         {
             Material[][] originalMaterials = new Material[renderers.Length][];
             for (int i = 0; i < renderers.Length; i++)
             {
                 Renderer renderer = renderers[i];
-                originalMaterials[i] = renderer != null ? renderer.materials : Array.Empty<Material>();
+                originalMaterials[i] = renderer != null ? renderer.sharedMaterials : Array.Empty<Material>();
             }
 
             return originalMaterials;
@@ -353,8 +386,8 @@ namespace Y4NGZUpgrades.Effects
             for (int i = 0; i < renderers.Length; i++)
             {
                 Renderer renderer = renderers[i];
-                if (renderer != null && originalMaterials[i] != null)
-                    renderer.materials = originalMaterials[i];
+                if (renderer != null && i < originalMaterials.Length && originalMaterials[i] != null)
+                    renderer.sharedMaterials = originalMaterials[i];
             }
         }
 

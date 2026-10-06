@@ -28,7 +28,7 @@ namespace Y4NGZUpgrades.Gui;
 internal static class Palette
 {
     public static readonly Color Transparent = new Color(0f, 0f, 0f, 0f);
-    public static Color BgOverlay => Tone(0.42f, 0.44f);
+    public static Color BgOverlay => Tone(0.42f, 0.60f);
     public static Color Backframe => Tone(0.50f, 0.86f);
     public static Color BgPanel => Tone(0.74f, 0.72f);
     public static Color BgHeader => Tone(0.92f, 0.78f);
@@ -257,7 +257,56 @@ internal static class UI
         rt.localScale = Vector3.one;
         rt.localRotation = Quaternion.identity;
 
+        LogClonedFrameHierarchy(clone);
         return clone;
+    }
+
+    // #444: the clone's source is whichever of several vanilla cells was found first,
+    // so which Image draws the red border and which the fill cannot be read from source.
+    // One Extended Logging dump per session records the hierarchy the frame tint needs.
+    private static bool _clonedFrameLogged;
+
+    private static void LogClonedFrameHierarchy(GameObject clone)
+    {
+        if (_clonedFrameLogged || clone == null || Plugin.extendedLog == null || !Plugin.extendedLog.Value)
+            return;
+
+        _clonedFrameLogged = true;
+        try
+        {
+            var dump = new StringBuilder();
+            dump.Append("[PMenu/Frame] cloned vanilla frame from '")
+                .Append(HierarchyPath(_cachedLevelUpBox != null ? _cachedLevelUpBox.transform : null, null))
+                .Append("':");
+            foreach (var image in clone.GetComponentsInChildren<Image>(true))
+            {
+                Color c = image.color;
+                dump.Append("\n  ").Append(HierarchyPath(image.transform, clone.transform))
+                    .Append(" | sprite=").Append(image.sprite != null ? image.sprite.name : "<none>")
+                    .Append(" | type=").Append(image.type)
+                    .Append(" | color=(").Append(c.r.ToString("0.###")).Append(", ")
+                    .Append(c.g.ToString("0.###")).Append(", ").Append(c.b.ToString("0.###")).Append(", ")
+                    .Append(c.a.ToString("0.###")).Append(')')
+                    .Append(" | enabled=").Append(image.enabled && image.gameObject.activeSelf);
+            }
+            Plugin.ExtendedLogging(dump.ToString());
+        }
+        catch (Exception ex)
+        {
+            // Diagnostics must never break menu construction.
+            Plugin.ExtendedLogging("[PMenu/Frame] hierarchy dump failed: " + ex.Message);
+        }
+    }
+
+    private static string HierarchyPath(Transform node, Transform root)
+    {
+        if (node == null) return "<none>";
+        var parts = new List<string>();
+        for (Transform t = node; t != null && t != root; t = t.parent)
+            parts.Add(t.name);
+        if (root != null) parts.Add(root.name);
+        parts.Reverse();
+        return string.Join("/", parts);
     }
 
     private static GameObject FindInactiveVanillaBorderedPanel()
@@ -394,7 +443,7 @@ internal static class UI
         srt.anchorMax = anchorMax;
         srt.offsetMin = offsetMin;
         srt.offsetMax = offsetMax;
-        var scrollRect = scrollGo.AddComponent<ScrollRect>();
+        var scrollRect = scrollGo.AddComponent<MenuScrollRect>();
         scrollRect.horizontal = false;
 
         // viewport
@@ -408,6 +457,7 @@ internal static class UI
         // 14px so the 12px scrollbar has horizontal room.
         vrt.offsetMax = addScrollbar ? new Vector2(-14f, 0f) : Vector2.zero;
         viewport.AddComponent<RectMask2D>();
+        viewport.AddComponent<Image>().color = Color.clear;
 
         // content - plain RectTransform, rows are positioned manually
         var content = new GameObject("Content");
@@ -422,7 +472,8 @@ internal static class UI
         scrollRect.viewport       = vrt;
         scrollRect.content        = crt;
         scrollRect.movementType   = ScrollRect.MovementType.Clamped;
-        scrollRect.scrollSensitivity = 25f;
+        scrollRect.scrollSensitivity = 52f;
+        scrollRect.inertia = false;
         // Anchor content to top immediately so rows are visible on first frame.
         scrollRect.verticalNormalizedPosition = 1f;
 
@@ -433,18 +484,37 @@ internal static class UI
         Scrollbar vScrollbar = null;
         if (addScrollbar)
         {
-            vScrollbar = BuildScrollbar(scrollGo.transform);
+            vScrollbar = BuildScrollbar(scrollGo.transform, 12f, 2f, Palette.ScrollHandle);
             scrollRect.verticalScrollbar = vScrollbar;
             scrollRect.verticalScrollbarVisibility =
-                ScrollRect.ScrollbarVisibility.Permanent;
+                ScrollRect.ScrollbarVisibility.AutoHide;
+            scrollRect.ObserveScrollbar();
         }
 
         return (scrollGo, content.transform);
     }
 
+    /// <summary>
+    /// A slim, auto-hiding bar in the <paramref name="gutter"/> just outside a scroll
+    /// view's right edge, so the view keeps its full content width - the skill tree
+    /// measures its card pitch from that width. Unity's AutoHide shows it only while the
+    /// content overflows; it neither fades nor moves, so Reduce Motion has nothing to gate.
+    /// </summary>
+    public static void AttachGutterScrollbar(MenuScrollRect scrollRect, float gutter)
+    {
+        if (scrollRect == null) return;
+        const float width = 8f;
+        Scrollbar bar = BuildScrollbar(scrollRect.transform, width, 0f, Palette.Alpha(Palette.Accent, 0.55f));
+        bar.GetComponent<RectTransform>().anchoredPosition =
+            new Vector2(width + (gutter - width) * 0.5f, 0f);
+        scrollRect.verticalScrollbar = bar;
+        scrollRect.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHide;
+        scrollRect.ObserveScrollbar();
+    }
+
     // Minimal Unity Scrollbar built from primitives - handle on a sliding
     // area inside a colored track. Direction = BottomToTop (top=1, bot=0).
-    private static Scrollbar BuildScrollbar(Transform parent)
+    private static Scrollbar BuildScrollbar(Transform parent, float width, float sideInset, Color handleColor)
     {
         var sbGo = new GameObject("VScrollbar");
         sbGo.transform.SetParent(parent, false);
@@ -452,7 +522,7 @@ internal static class UI
         sbRt.anchorMin = new Vector2(1, 0);
         sbRt.anchorMax = new Vector2(1, 1);
         sbRt.pivot     = new Vector2(1, 0.5f);
-        sbRt.sizeDelta = new Vector2(12f, 0f);
+        sbRt.sizeDelta = new Vector2(width, 0f);
         sbRt.anchoredPosition = Vector2.zero;
         var sbBg = sbGo.AddComponent<Image>();
         sbBg.color = Palette.ScrollTrack;
@@ -465,8 +535,8 @@ internal static class UI
         var saRt = saGo.AddComponent<RectTransform>();
         saRt.anchorMin = Vector2.zero;
         saRt.anchorMax = Vector2.one;
-        saRt.offsetMin = new Vector2(2f, 2f);
-        saRt.offsetMax = new Vector2(-2f, -2f);
+        saRt.offsetMin = new Vector2(sideInset, 2f);
+        saRt.offsetMax = new Vector2(-sideInset, -2f);
 
         // Handle
         var hGo = new GameObject("Handle");
@@ -477,7 +547,7 @@ internal static class UI
         hRt.offsetMin = Vector2.zero;
         hRt.offsetMax = Vector2.zero;
         var hImg = hGo.AddComponent<Image>();
-        hImg.color = Palette.ScrollHandle;
+        hImg.color = handleColor;
 
         sb.targetGraphic = hImg;
         sb.handleRect    = hRt;
@@ -502,25 +572,8 @@ internal static class UI
     {
         if (sr == null || contentRt == null) return;
         contentRt.anchoredPosition = Vector2.zero;
-        sr.verticalNormalizedPosition = 1f;
-
-        // Defer the re-clamp to the next frame via the menu's own
-        // MonoBehaviour, since UI is a static helper class. If we can't find
-        // an active MonoBehaviour to host the coroutine (menu in teardown,
-        // for example) the immediate set above is still in effect.
-        var host = sr.GetComponentInParent<MenuController>();
-        if (host != null && host.isActiveAndEnabled)
-            host.StartCoroutine(ResetScrollNextFrame(sr));
-    }
-
-    private static System.Collections.IEnumerator ResetScrollNextFrame(ScrollRect sr)
-    {
-        // Two-frame wait: one for layout to settle, one for any TMP caret /
-        // ContentSizeFitter pass to finish. After that the ScrollRect's
-        // metrics are correct and the clamp pins to the top reliably.
-        yield return null;
-        yield return null;
-        if (sr != null) sr.verticalNormalizedPosition = 1f;
+        if (sr is MenuScrollRect menuScroll) menuScroll.RestorePosition(1f);
+        else sr.verticalNormalizedPosition = 1f;
     }
 
     // - Input field -
@@ -1034,7 +1087,7 @@ internal static class UI
 // -
 //  PURCHASE MENU
 // -
-public class PurchaseMenu
+public partial class PurchaseMenu
 {
     // -
     //  DESIGN TOKENS
@@ -1104,7 +1157,6 @@ public class PurchaseMenu
     private const float HeaderH      = 118f;
     private const float FooterH      =  44f;
     private const float RowH         =  34f;
-    private const int   LowCurrency  =  50;
     private const float LeftRailW    = 170f;
     private const float InspectorW   = 360f;
     private const float BodyPad      = Space5;
@@ -1129,20 +1181,13 @@ public class PurchaseMenu
     // row rather than an absolute offset into the view.
     private const float RecordListTop         = 76f;   // below the PERFORMANCE RECORD title card
     private const float RecordRowH            = 46f;   // icon + label/context + value
-    private const float RecordClusterHeaderH  = 20f;   // FIELD WORK / COMBAT / ...
+    private const float RecordClusterHeaderH  = 28f;
     private const float RecordIconSize        = 28f;
     private const float RecordTextLeft        = Space3 + RecordIconSize + Space3;
 
-    // - Skill tree tier captions -
-    // A caption band sits in the gap above each tier row, inside the tree glass.
-    // 16px keeps the caption above the legibility floor while clearing the 18px
-    // gap TierRowH leaves between one row's nodes and the next row's top.
-    private const float TierLabelH     = 16f;
-    private const float TierLabelInset = 10f;
-
     // - Skill tree vertical stack -
-    // Top down: class tabs, clear space, the tree glass, then the first tier's
-    // caption band sitting inside the glass above the first row of nodes.
+    // Top down: class tabs, clear space, the tree glass, then headroom inside
+    // the glass for the compact heading above the first row of nodes.
     // SkillTreeLayout.TreeTop is derived from these rather than typed as a
     // literal, so moving the tabs or the gap can never silently close the gap
     // or push the glass under them.
@@ -1150,20 +1195,22 @@ public class PurchaseMenu
     private const float SkillTreeTabsH     = 44f;
     private const float SkillTreeTabsGap   = 10f;  // clear space below the tabs
     private const float SkillTreeTabRadius = 10f;
-    private const float SkillTreeGlassRise = 26f;  // glass top, measured up from TreeTop
-    private const float SkillTreeGateRise  = 28f;  // tier-gate rail top, up from TreeTop
+    private const float SkillTreeCaptionInset = SkillTreeCardLayout.CaptionInset;
+    private const float SkillTreeGlassRise = SkillTreeCaptionInset + 2f;
 
     // - Skill tree node internals -
-    // A node box is 94x94 and stacks, bottom up: level pips, name, icon. There
-    // is no state-marker band (#258) - cost, gate and level detail live in the
-    // right inspector, and the node itself carries state in fill, stroke, group
-    // alpha and pip fill only. The bands below are measured from the bottom edge
+    // A 144x92 node stacks, bottom up: numeric rank, two-line name, icon.
+    // A small corner lock supplements fill, stroke and group alpha; cost and
+    // full gate/level details live in the inspector. These positions use the bottom edge
     // and must not overlap - the icon is the only one that grows on selection.
-    private const float NodeNameBottom       = 18f;
-    private const float NodeNameTop          = 46f;
-    private const float NodeIconSize         = 40f;
-    private const float NodeIconSelectedSize = 44f;
-    private const float NodeIconCenterY      = -27f;  // from the node's top edge
+    private const float NodeNameBottom       = 17f;
+    private const float NodeNameTop          = 49f;
+    private const float NodeNameSidePadding  = 12f;
+    private const float NodeIconSize         = 32f;
+    private const float NodeIconSelectedSize = 34f;
+    private const float NodeIconCenterY      = -23f;  // from the node's top edge
+    private static Color SkillTreeLockedText =>
+        Palette.Alpha(Color.Lerp(Palette.RowButtonText, Palette.Locked, 0.25f), 1f);
     // Bottom of the description when a purchase-refusal notice occupies the strip above the button.
     private const float PurchaseNoticeTop = 76f;
     private const float PurchaseNoticeDuration = 5f;
@@ -1177,15 +1224,11 @@ public class PurchaseMenu
     private static readonly Dictionary<int, Sprite> _roundedBorderSprites =
         new Dictionary<int, Sprite>();
 
-    // - Category tabs -
-    // Internal const names (CatDexterity / CatCombat / CatScavenging) are kept
-    // intact so existing code paths and saved state references don't move; only
-    // the player-facing display strings changed in the upgrade-reorg pass.
-    private const string CatDexterity  = "Athletics";
-    private const string CatCombat     = "Combat";
-    private const string CatScavenging = "Utility";
-
-    // - Sub-categories (within each tab) -
+    // - Flavour sub-categories -
+    // The class trees replaced the old category tabs, so these survive only as the tone hint
+    // GetFallbackFlavorText reads. They are keyed by stable upgrade id, never by title: an
+    // imported row now shows "Quick Hands" and "Deeper Pockets" without the LGU prefix, so a
+    // display-name key would silently bind it to the native row's bucket (#435).
     private const string SubSpeed       = "Speed";
     private const string SubDexterity   = "Dexterity";
     private const string SubLethality   = "Lethality";
@@ -1193,134 +1236,56 @@ public class PurchaseMenu
     private const string SubLogistics   = "Logistics";
     private const string SubOperations  = "Operations";
 
-    // Sub-category - main category. Single source of truth for routing tabs.
-    private static readonly Dictionary<string, string> SubCategoryMain =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-    {
-        { SubSpeed,       CatDexterity },
-        { SubDexterity,   CatDexterity },
-        { SubLethality,   CatCombat    },
-        { SubSurvival,    CatCombat    },
-        { SubLogistics,   CatScavenging },
-        { SubOperations,  CatScavenging },
-    };
-
-    // Order of sub-categories displayed within each main tab.
-    private static readonly Dictionary<string, string[]> SubCategoriesByMain =
-        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
-    {
-        { CatDexterity,   new[] { SubSpeed, SubDexterity } },
-        { CatCombat,      new[] { SubLethality, SubSurvival } },
-        { CatScavenging,  new[] { SubLogistics, SubOperations } },
-    };
-
-    // Upgrade name - sub-category. Edit this map to re-route an upgrade.
-    // The main-category routing for each upgrade is derived from this via
-    // SubCategoryMain - there's no separate per-upgrade tab assignment.
     private static readonly Dictionary<string, string> UpgradeSubCategories =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
-        // Athletics
-        { "Adrenaline Rush",       SubSpeed },
-        { "Deathbound",            SubSurvival },
-        { "Deeper Pockets",        SubDexterity },
-        { "Resilience",            SubDexterity },
-        { "Sprinter",              SubSpeed },
-        { "Transporter",           SubDexterity },
+        // Enforcer
+        { "adrenaline_rush",        SubSurvival },
+        { "deathbound",             SubSurvival },
+        { "extra_inventory_slot",   SubDexterity },
+        { "thick_skin",             SubDexterity },
+        { "physical_conditioning",  SubSpeed },
+        { "surefooted",             SubSpeed },
+        { "back_muscles",           SubDexterity },
+        { "lethal_hands_training",  SubLethality },
+        { "panic_slide",            SubSpeed },
+        { "protein_powder",         SubLethality },
 
-        // Combat
-        { "Lethal Hands",          SubLethality },
-        { "Lethal Hands Training", SubLethality },
-        { "Bait Bomb",             SubLethality },
-        { "Bait Beacon",           SubLethality },
-        { "Pumping Iron",          SubLethality },
-
-        // Utility
-        { "Field Optics",          SubLogistics },
-        { "Buddy System",          SubLogistics },
-        { "Command Net",           SubOperations },
-        { "Field Mechanic",        SubOperations },
-        { "Field Operations",      SubOperations },
-        { "Inspire",               SubOperations },
-        { "Chameleon",             SubOperations },
-        { "Scavenger",             SubLogistics },
-        { "Overachiever",          SubOperations },
-        { "Veteran",               SubOperations },
-        { "Quick Hands",           SubLogistics },
-        { "Light Feet",            SubOperations },
-        { "Lone Wolf",             SubOperations },
-        { "Ping",                  SubLogistics },
-        { "Shadow Step",           SubOperations },
-        { "Sixth Sense",           SubLogistics },
-        { "Squad Sight",           SubLogistics },
-        { "Worklight Beacon",      SubOperations },
-    };
-
-    // Accent colours for sub-category header bars. Hex values from the spec -
-    // shift here if any read poorly against the dark-red panel background.
-    private static readonly Dictionary<string, Color> SubCategoryColors =
-        new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase)
-    {
-        { CatDexterity,   Palette.Accent },
-        { CatCombat,      Palette.Accent },
-        { CatScavenging,  Palette.Accent },
-        { SubSpeed,       Palette.Dim },
-        { SubDexterity,   Palette.Dim },
-        { SubLethality,   Palette.Dim },
-        { SubSurvival,    Palette.Dim },
-        { SubLogistics,   Palette.Dim },
-        { SubOperations,  Palette.Dim },
+        // Technician / Ghost / Foreman
+        { "better_scanner",         SubLogistics },
+        { "buddy_system",           SubLogistics },
+        { "command_net",            SubOperations },
+        { "turret_hacker",          SubOperations },
+        { "field_operations",       SubOperations },
+        { "inspire",                SubOperations },
+        { "chameleon",              SubOperations },
+        { "scavenger",              SubLogistics },
+        { "veteran",                SubOperations },
+        { "quota_guard",            SubOperations },
+        { "quick_hands",            SubLogistics },
+        { "light_feet",             SubOperations },
+        { "lone_wolf",              SubOperations },
+        { "ping",                   SubLogistics },
+        { "shadow_step",            SubOperations },
+        { "sixth_sense",            SubLogistics },
+        { "worklight_beacon",       SubOperations },
     };
 
     // Deliberately removed: the Hex(string) helper that used to parse baked
     // color literals. Every color in this menu now comes from the palette, and
     // reintroducing a hex parser is how off-theme colors get back in.
+    //
+    // Also removed with #435: the HiddenUpgrades display-name blocklist. The names it carried
+    // (Locksmith, Mechanical Arms, Sleight of Hand, Hollow Point, Long Barrel, Beekeeper,
+    // Oxygen Canisters) left the native catalog long ago and are now the titles of imported
+    // Late Game Upgrades rows, so the set had stopped hiding vanilla leftovers and started
+    // hiding seven rows the player can buy. The tab-routing maps it fed (UpgradeCategories,
+    // GetCategory, GetRowAccentColor, SubCategoryMain, SubCategoriesByMain, SubCategoryColors)
+    // went with it: the skill trees own placement now, and every one of them was dead.
 
-    private static string GetSubCategory(string upgradeName)
+    private static string GetSubCategory(string upgradeId)
     {
-        return upgradeName != null && UpgradeSubCategories.TryGetValue(upgradeName, out var sub) ? sub : null;
-    }
-
-    // Resolves the accent colour used for an upgrade's row tint and
-    // detail-panel header. Sub-category accent takes precedence; the
-    // legacy UpgradeColorType palette is only consulted for upgrades
-    // outside the sub-category mapping (defensive - shouldn't trigger
-    // for the 29 routed upgrades).
-    private static Color GetRowAccentColor(string upgradeName)
-    {
-        var sub = GetSubCategory(upgradeName);
-        if (sub != null && SubCategoryColors.TryGetValue(sub, out var accent))
-            return accent;
-        return GetUpgradeColor(upgradeName);
-    }
-
-    // Upgrades that should never appear in any tab - vanilla Y4NGZ entries not in this modpack.
-    private static readonly HashSet<string> HiddenUpgrades = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "Oxygen Canisters",
-        "Beekeeper",
-        "Hollow Point",
-        "Long Barrel",
-        "Locksmith",
-        "Mechanical Arms",
-        "Sleight of Hand",
-        "Predator Instinct",
-        "Salvager",
-    };
-
-    // Main-category routing is derived directly from UpgradeSubCategories so
-    // there's only one place to edit when an upgrade moves. Unknown upgrades
-    // fall through to CatScavenging via GetCategory below.
-    private static readonly Dictionary<string, string> UpgradeCategories =
-        UpgradeSubCategories.ToDictionary(
-            kv => kv.Key,
-            kv => SubCategoryMain[kv.Value],
-            StringComparer.OrdinalIgnoreCase);
-
-
-    private static string GetCategory(string upgradeName)
-    {
-        return UpgradeCategories.TryGetValue(upgradeName, out var cat) ? cat : CatScavenging;
+        return upgradeId != null && UpgradeSubCategories.TryGetValue(upgradeId, out var sub) ? sub : null;
     }
 
     // - Upgrade type classification -
@@ -1335,11 +1300,12 @@ public class PurchaseMenu
         new Dictionary<string, UpgradeColorType>(StringComparer.OrdinalIgnoreCase)
     {
         // - Dexterity & Speed -
-        { "Adrenaline Rush",       UpgradeColorType.Speed },
+        { "Nine Lives",            UpgradeColorType.Defense },
         { "Deathbound",            UpgradeColorType.Defense },
         { "Deeper Pockets",        UpgradeColorType.Loot },
         { "Resilience",            UpgradeColorType.Defense },
         { "Sprinter",              UpgradeColorType.Speed },
+        { "Surefooted",            UpgradeColorType.Speed },
         { "Transporter",           UpgradeColorType.Loot },
 
         // - Combat & Survival -
@@ -1361,7 +1327,6 @@ public class PurchaseMenu
         { "Scavenger",             UpgradeColorType.Loot },
         { "Light Feet",            UpgradeColorType.Speed },
         { "Sixth Sense",           UpgradeColorType.Team },
-        { "Squad Sight",           UpgradeColorType.Team },
         // Team (Purple)
         { "Buddy System",          UpgradeColorType.Team },
         { "Command Net",           UpgradeColorType.Team },
@@ -1441,7 +1406,12 @@ public class PurchaseMenu
     private static Y4NGZSkillTreeClass _activeSkillTreeClass = Y4NGZSkillTreeClass.Enforcer;
     private static string _selectedSkillTreeNodeId;
     private static SkillTreeNodeVisual _selectedSkillTreeNodeVisual;
-    private static float _lastSkillTreeScrollTime = -100f;
+    // The class trees and the flat Augments catalog share _listView, so this is what tells the
+    // rail, the inspector and every re-render which of the two is on screen (#435).
+    private static bool _augmentsActive;
+    // Set only while a purchase click is inside the manager. The rankup raises UpgradesChanged
+    // from there, and the click handler repaints for itself afterwards.
+    private static bool _purchasing;
 
     // - PLAYER COSMETICS sub-state -
     // Left-rail category for the PLAYER COSMETICS tab. Mirrors how
@@ -1526,8 +1496,8 @@ public class PurchaseMenu
     private static float         _employeePreviewYawOffset;
     private static float         _employeePreviewLastDragTime = -100f;
     private static float         _nextEmployeePreviewRenderAt;
-    // TEMPORARY - blank-employee-preview investigation, see
-    // .planning/debug/model-replacement-employee-preview.md. Remove with
+    // TEMPORARY - blank-employee-preview investigation (model-replacement employee
+    // preview renders empty). Remove with
     // LogEmployeePreviewDiagnostic and EmployeePreviewClearAlpha.
     private static float         _nextEmployeePreviewDiagnosticAt;
     private static bool          _employeePreviewStaleReplacementWarned;
@@ -1629,8 +1599,9 @@ public class PurchaseMenu
             Color hover = Hover;
             if (Background != null)
             {
-                Background.color = normal;
-                Background.CrossFadeColor(normal, 0f, true, true);
+                // Button owns the canvas-renderer tint. A second tint on Image
+                // multiplies both the color and opacity, defeating dark plates.
+                Background.color = Color.white;
             }
 
             if (Button != null)
@@ -1679,26 +1650,6 @@ public class PurchaseMenu
         public void OnPointerExit(PointerEventData eventData) => Visual?.SetHovered(false);
     }
 
-    private sealed class SkillTreeScrollPager : MonoBehaviour, IScrollHandler
-    {
-        public void OnScroll(PointerEventData eventData)
-        {
-            if (_listView == null || !_listView.activeInHierarchy || eventData == null)
-                return;
-
-            float delta = eventData.scrollDelta.y;
-            if (Mathf.Abs(delta) < 0.01f)
-                return;
-
-            if (Time.unscaledTime - _lastSkillTreeScrollTime < 0.18f)
-                return;
-
-            _lastSkillTreeScrollTime = Time.unscaledTime;
-            CycleSkillTree(delta < 0f ? 1 : -1);
-            eventData.Use();
-        }
-    }
-
     private static readonly Dictionary<string, UpgradeRowVisual> _upgradeRowVisuals =
         new Dictionary<string, UpgradeRowVisual>(StringComparer.OrdinalIgnoreCase);
 
@@ -1708,6 +1659,8 @@ public class PurchaseMenu
     private static Action _activeView;
     private static bool _themeHookInstalled;
     private static bool _rebuildingForTheme;
+    private static bool _catalogHookInstalled;
+    private static bool _rebuildingForCatalog;
 
     public static void initMenu()
     {
@@ -1715,6 +1668,11 @@ public class PurchaseMenu
         Plugin.ExtendedLogging("Building Y4NGZ Menu from code");
 
         InstallThemeHook();
+        InstallCatalogHook();
+        // MenuController's reflective teardown only clears Unity-object statics, so a close
+        // taken from the Augments catalog would otherwise leave this set for the next open.
+        _augmentsActive = false;
+        _cosmeticState = CosmeticStateService.Capture();
         _root = BuildRoot();
         _root.AddComponent<MenuController>().Init(_root);
 
@@ -1729,6 +1687,42 @@ public class PurchaseMenu
         // Never unsubscribed: the handler is inert while the menu is closed, and
         // a static subscription cannot outlive the assembly.
         UiTheme.ThemeChanged += OnUiThemeChanged;
+    }
+
+    private static void InstallCatalogHook()
+    {
+        if (_catalogHookInstalled) return;
+        _catalogHookInstalled = true;
+        // Same contract as the theme hook: never unsubscribed, inert while the menu is closed.
+        Y4NGZUpgradeManager.UpgradesChanged += OnUpgradeCatalogChanged;
+    }
+
+    // Which rows exist, what they are called, how many ranks they sell and what they cost are all
+    // re-derived when the resolved family policy or the Late Game Upgrades provider changes
+    // (#435). Everything on screen - the rail's Augments availability, the visible tree or
+    // catalog, the selection, the keyboard focus and the inspector - is a view of that catalog,
+    // so re-enter the active view rather than leaving a stale quote on a row that may no longer
+    // exist. A purchase raises this event from inside its own click handler, which repaints for
+    // itself; rebuilding there would destroy the button mid-click.
+    private static void OnUpgradeCatalogChanged()
+    {
+        if (_root == null || _purchasing || _rebuildingForTheme || _rebuildingForCatalog) return;
+
+        _rebuildingForCatalog = true;
+        try
+        {
+            RebuildModeRail();
+            Action restore = _activeView;
+            if (restore != null) restore();
+        }
+        catch (Exception e)
+        {
+            Plugin.CustomLogger?.LogError($"[PMenu] Upgrade catalog refresh failed: {e}");
+        }
+        finally
+        {
+            _rebuildingForCatalog = false;
+        }
     }
 
     // The whole menu bakes palette colors at construction, so the only way to
@@ -1797,7 +1791,7 @@ public class PurchaseMenu
         var prt   = panel.GetComponent<RectTransform>();
         prt.pivot        = new Vector2(0.5f, 0.5f);
         prt.sizeDelta    = new Vector2(PanelW, PanelH);
-        prt.localScale   = Vector3.one * MenuScale;
+        prt.localScale   = Vector3.one * FittedMenuScale(canvas.GetComponent<RectTransform>());
         UI.AddPanelTexture(panel.transform, TexFaint, 1101);
 
         BuildHeader(panel.transform);
@@ -2023,7 +2017,7 @@ public class PurchaseMenu
         efrt.anchorMax = new Vector2(1, 1);
         efrt.offsetMin = new Vector2(centerLeft, contentBottom);
         efrt.offsetMax = new Vector2(-centerRight, -BodyPad);
-        AddBackground(_employeeFileView, Palette.Alpha(Palette.BgInput, FillGhost),
+        AddBackground(_employeeFileView, Palette.Alpha(Palette.BgInput, FillSoft),
             outline: false);
 
         // List view  (upgrade scroll list)
@@ -2034,14 +2028,18 @@ public class PurchaseMenu
         lvrt.anchorMax = new Vector2(1, 1);
         lvrt.offsetMin = new Vector2(centerLeft, contentBottom);
         lvrt.offsetMax = new Vector2(-centerRight, -BodyPad);
-        AddBackground(_listView, Palette.Alpha(Palette.BgInput, FillGhost), outline: false);
+        AddBackground(_listView, Palette.Alpha(Palette.BgInput, FillSoft), outline: false);
 
+        const float listGutter = 10f;
         var (scrollGo, content) = UI.MakeScrollView("Scroll", _listView.transform,
             Vector2.zero, Vector2.one,
-            new Vector2(10, 6), new Vector2(-10, -6),
+            new Vector2(listGutter, 6), new Vector2(-listGutter, -6),
             addScrollbar: false);
         _scrollContent = content;
         _scrollRect    = scrollGo.GetComponent<ScrollRect>();
+        // The tree and the Augments grid measure their pitch from the content
+        // width, so their bar lives in the gutter rather than inside the viewport.
+        UI.AttachGutterScrollbar(scrollGo.GetComponent<MenuScrollRect>(), listGutter);
 
         // Persistent inspector. This stays active while the center panel
         // switches between upgrades, cosmetics, emotes, and trade.
@@ -2091,10 +2089,12 @@ public class PurchaseMenu
         AddRoundedFrame(footer.transform, 3f, 4f,
             Palette.Alpha(Palette.Accent, FillWash), CellRadius);
         _footerHint = UI.MakeText("Hint", footer.transform,
-            HintDefault, FontXs, Palette.Dim, TextAlignmentOptions.Center);
+            HintDefault, FontSm, Palette.Body, TextAlignmentOptions.Center);
         _footerHint.enableWordWrapping = false;
         _footerHint.overflowMode = TextOverflowModes.Ellipsis;
         _footerHint.raycastTarget = false;
+        _footerHint.richText = true;
+        SetFooterHint(HintDefault);
     }
 
     // -
@@ -2107,11 +2107,11 @@ public class PurchaseMenu
     private const string HintDefault =
         "[W/S] MOVE   [ENTER] SELECT   [Q/E] SECTION   [ESC] CLOSE";
     private const string HintSkillTree =
-        "[W/S] TIER   [A/D] NODE   [ENTER] SELECT   [Q/E] SECTION   [ESC] CLOSE";
+        "[W/S] TIER   [A/D] NODE   [ENTER] SELECT   [TAB] DETAILS   [Q/E] SECTION   [ESC] CLOSE";
     private const string HintGrid =
-        "[W/S] ROW   [A/D] COLUMN   [ENTER] SELECT   [Q/E] SECTION   [ESC] CLOSE";
+        "[W/S] ROW   [A/D] COLUMN   [ENTER] SELECT   [TAB] DETAILS   [Q/E] SECTION   [ESC] CLOSE";
     private const string HintList =
-        "[W/S] MOVE   [ENTER] SELECT   [Q/E] SECTION   [ESC] CLOSE";
+        "[W/S] MOVE   [ENTER] SELECT   [TAB] DETAILS   [Q/E] SECTION   [ESC] CLOSE";
     private const string HintRecord =
         "[W/S] SCROLL RECORD   [Q/E] SECTION   [ESC] CLOSE";
     // Everything the menu can always do. Used by views with no focusable
@@ -2138,8 +2138,15 @@ public class PurchaseMenu
             keybinds?.PlayerMenuSelect, "ENTER") + "]");
         resolved = resolved.Replace("[ESC]", "[" + UpgradeInput.DisplayLabel(
             keybinds?.PlayerMenuClose, "ESC") + "]");
-        _footerHint.text = resolved;
+        resolved = resolved.Replace("[TAB]", "[" + UpgradeInput.DisplayLabel(
+            keybinds?.PlayerMenuInspector, "TAB") + "]");
+        // Keys read in the accent, the words between them in Body. Only the colour
+        // changes; the strings above stay the literal binding contract.
+        string keyHex = "#" + ColorUtility.ToHtmlStringRGBA(Palette.Accent);
+        _footerHint.text = FooterKeyPattern.Replace(resolved, "<color=" + keyHex + ">$0</color>");
     }
+
+    private static readonly Regex FooterKeyPattern = new Regex(@"\[[^\]]*\]", RegexOptions.CultureInvariant);
 
     // -
     //  SECTION REGISTRY
@@ -2184,7 +2191,34 @@ public class PurchaseMenu
                 currentSelection = null;
                 showUpgrades(false, resetScroll: true);
             },
-            IsActive = view => view != null && view == _listView
+            IsActive = view => view != null && view == _listView && !_augmentsActive,
+            // #435: LGU-only mode with Late Game Upgrades integrated hides every native row, so
+            // the class trees would open empty; Augments carries the whole catalog instead.
+            IsAvailable = () => LguCatalogLayout.ClassTreesAvailable(
+                Y4NGZUpgradeManager.CurrentPolicy.NativeCatalogHidden)
+        },
+        // #435: only while the registered catalog holds flat rows - the SeparateCatalog layout,
+        // or LGU-only mode with Late Game Upgrades integrated. No provider, an integration
+        // switched off (#493), a provider still loading, every imported row switched off, or
+        // ClassTrees in another mode means no tab at all. It reuses the upgrades mark rather than
+        // shipping new art, the way Lucky8 reuses category glyphs.
+        new SectionDef
+        {
+            Id = "augments",
+            Label = "AUGMENTS",
+            IconFile = "menu-icon-upgrades.png",
+            Show = () =>
+            {
+                _selectedCosmeticForPurchase = null;
+                _selectedEmoteForPurchase = null;
+                _previewingEmote = null;
+                _selectedSkillTreeNodeId = null;
+                currentSelection = null;
+                showAugments(resetScroll: true);
+            },
+            IsActive = view => view != null && view == _listView && _augmentsActive,
+            IsAvailable = () => LguCatalogLayout.AugmentsAvailable(
+                Y4NGZUpgradeManager.GetFlatCatalogNodes().Count)
         },
         new SectionDef
         {
@@ -2452,7 +2486,7 @@ public class PurchaseMenu
 
         string key = _pendingFocusKey;
         _pendingFocusKey = null;
-        FocusByKey(key, scrollIntoView: true);
+        FocusByKey(key, scrollIntoView: _invokingFocusedButton);
     }
 
     private static void FocusByKey(string key, bool scrollIntoView)
@@ -2552,6 +2586,7 @@ public class PurchaseMenu
     {
         ScrollRect sr = target?.Scroller;
         if (sr == null || target.Rect == null) return;
+        if (sr is MenuScrollRect menuScroll) menuScroll.CancelPendingRestore();
 
         RectTransform content = sr.content;
         RectTransform viewport = sr.viewport;
@@ -2582,6 +2617,7 @@ public class PurchaseMenu
         if (IsTextInputFocused()) return;
 
         IngameKeybinds keybinds = Plugin.Keybinds;
+        if (UpgradeInput.WasPressed(keybinds?.PlayerMenuInspector)) { ToggleInspectorFocus(); return; }
         if (UpgradeInput.WasPressed(keybinds?.PlayerMenuPreviousSection)) { CycleSection(-1); return; }
         if (UpgradeInput.WasPressed(keybinds?.PlayerMenuNextSection)) { CycleSection(1); return; }
         if (UpgradeInput.WasPressed(keybinds?.PlayerMenuUp)) { MoveFocus(0, -1); return; }
@@ -2626,7 +2662,8 @@ public class PurchaseMenu
         if (_focusIndex < 0 || _focusIndex >= _focusTargets.Count)
         {
             MenuAudio.PlayNav();
-            SetFocusIndex(dy < 0 ? _focusTargets.Count - 1 : 0, scrollIntoView: true);
+            int firstRow = dy < 0 ? _focusTargets.Max(x => x.Row) : _focusTargets.Min(x => x.Row);
+            SetFocusIndex(_focusTargets.FindIndex(x => x.Row == firstRow), scrollIntoView: true);
             return;
         }
 
@@ -2756,10 +2793,15 @@ public class PurchaseMenu
     {
         RefreshVisibleSections();
         _sectionVisuals.Clear();
+        // The rail's rounded frame is drawn Space1 inside the cell. Dropping the cell by
+        // InspectorTop less that inset puts the stroke on the line where the centre's
+        // first surface and the inspector's preview begin.
         var rail = BuildInnerCell("ModeRail", parent,
             new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(BodyPad, FooterH + BodyPad + 6f), new Vector2(BodyPad + LeftRailW, -BodyPad),
+            new Vector2(BodyPad, FooterH + BodyPad + 6f),
+            new Vector2(BodyPad + LeftRailW, -(BodyPad + InspectorTop - Space1)),
             rounded: true);
+        _modeRail = rail;
 
         for (int i = 0; i < _visibleSections.Count; i++)
         {
@@ -2772,6 +2814,22 @@ public class PurchaseMenu
             int captured = i;
             btn.onClick.AddListener(() => ShowSection(captured));
         }
+    }
+
+    /// <summary>
+    /// Re-derives the rail from a fresh availability snapshot. A provider that finishes loading
+    /// after the menu opened, or a catalog re-registration that adds or empties the Augments
+    /// section (#435), changes which rows the rail should offer without a reopen.
+    /// </summary>
+    private static void RebuildModeRail()
+    {
+        if (_modeRail == null) return;
+
+        Transform parent = _modeRail.transform.parent;
+        _modeRail.SetActive(false);
+        Object.Destroy(_modeRail);
+        BuildModeRail(parent);
+        UpdateNavTabs(_activeSectionView);
     }
 
     private static (Button btn, TMP_Text label, RawImage icon) BuildRailButton(
@@ -2848,7 +2906,7 @@ public class PurchaseMenu
     {
         if (button == null) return;
 
-        AddBorder(button.transform, 4f, 0f, Palette.BorderDim);
+        AddBorder(button.transform, 3f, 0f, Palette.BorderDim);
     }
 
     private static void AddBackground(GameObject target, Color color, bool outline)
@@ -3258,6 +3316,7 @@ public class PurchaseMenu
     // - Employee File hub -
     public static void showEmployeeFile()
     {
+        _cosmeticState = CosmeticStateService.Capture();
         currentSelection = null;
         location = nameof(showEmployeeFile);
         _activeView = () => showEmployeeFile();
@@ -3274,6 +3333,8 @@ public class PurchaseMenu
     {
         if (_employeeFileView == null)
             return;
+
+        float previousPosition = ScrollPosition(_performanceScroll);
 
         foreach (Transform child in _employeeFileView.transform)
         {
@@ -3301,7 +3362,7 @@ public class PurchaseMenu
         title.characterSpacing = 2f;
 
         TMP_Text subtitle = UI.MakeText("PerformanceSubtitle", header.transform,
-            "LIFETIME TOTALS // ACTIVE ROUND INCLUDED", FontTiny, Palette.Body,
+            "TOTALS INCLUDE CURRENT ROUND", FontSm, Palette.Body,
             TextAlignmentOptions.MidlineLeft);
         var subtitleRt = subtitle.GetComponent<RectTransform>();
         subtitleRt.anchorMin = Vector2.zero;
@@ -3320,22 +3381,24 @@ public class PurchaseMenu
             new Vector2(Space4, Space4), new Vector2(-Space4, -RecordListTop),
             addScrollbar: true);
         var recordBg = recordScroll.AddComponent<Image>();
-        recordBg.color = Palette.Alpha(Palette.BgInput, FillGhost);
+        recordBg.color = Palette.Alpha(Palette.BgInput, FillRow);
         // Left as a raycast target so the wheel scrolls anywhere over the list.
         // Nothing inside the strip is clickable, so it swallows no input.
         recordBg.raycastTarget = true;
         UI.AddPanelTexture(recordScroll.transform, TexFaint, 7102);
         AddBorder(recordScroll.transform, 3f, 0f, Palette.BorderDim);
         ScrollRect recordRect = recordScroll.GetComponent<ScrollRect>();
+        _performanceScroll = recordRect;
 
         float y = Space2;
         int rowIndex = 0;
         var clusters = BuildPerformanceClusters(stats);
         for (int c = 0; c < clusters.Length; c++)
         {
-            BuildPerformanceClusterHeader(recordContent, clusters[c].Title, y);
+            BuildPerformanceClusterHeader(recordContent, clusters[c].Title, y, rowIndex++);
             y += RecordClusterHeaderH + Space1;
 
+            if (!_expandedRecordSections.Contains(clusters[c].Title)) { y += Space2; continue; }
             PerformanceStat[] entries = clusters[c].Stats;
             for (int s = 0; s < entries.Length; s++)
             {
@@ -3353,7 +3416,13 @@ public class PurchaseMenu
         // for; the helper additionally makes sure the deferred re-pin never
         // undoes the scroll CommitFocusTargets does to bring a restored focus
         // row back into view.
-        ResetScrollForRebuild(recordRect, contentRt);
+        if (_recordAnchorTitle != null)
+        {
+            float overflow = Mathf.Max(0f, y - recordRect.viewport.rect.height);
+            previousPosition = overflow <= 1f ? 1f : 1f - Mathf.Clamp01(_recordRestoreY / overflow);
+            _recordAnchorTitle = null;
+        }
+        RestoreScroll(recordRect, previousPosition);
     }
 
     /// <summary>One line of the performance record. Context is optional muted sub-text.</summary>
@@ -3392,107 +3461,7 @@ public class PurchaseMenu
     // advertises unavailable work. Icon
     // keys are the upgrade glyphs under Assets/UI/UpgradeIcons; a row whose key
     // does not resolve falls back to an ASCII marker, never a missing-texture box.
-    private static PerformanceCluster[] BuildPerformanceClusters(EmployeeStatisticsData stats)
-    {
-        int quotas = Mathf.Max(0, stats.quotasCompleted);
 
-        // Secondary figures only where one number genuinely qualifies another.
-        string distance = stats.stepsTaken > 0
-            ? "~ " + (stats.stepsTaken * EmployeeStatistics.StepMeters).ToString("N0") + " M ON FOOT"
-            : null;
-        string beaconRate = quotas > 0
-            ? (stats.surveyBeaconsPlaced / (float)quotas).ToString("N1") + " PER QUOTA"
-            : null;
-        string killRate = stats.timesDied > 0
-            ? (stats.monstersKilled / (float)stats.timesDied).ToString("N2") + " PER DEATH"
-            : null;
-        string scrapRate = quotas > 0
-            ? "$" + (stats.scrapValueDelivered / (float)quotas).ToString("N0") + " PER QUOTA"
-            : null;
-
-        var clusters = new List<PerformanceCluster>();
-        var fieldWork = new List<PerformanceStat>
-        {
-            new PerformanceStat("stat.steps", "light_feet",
-                "STEPS TAKEN", stats.stepsTaken.ToString("N0"), distance)
-        };
-        if (OptionalPluginCapabilities.Contracted)
-        {
-            fieldWork.Add(new PerformanceStat("stat.bombs", "escape_protocol",
-                "BOMBS DEFUSED", stats.bombsDefused.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.payload", "transporter",
-                "PAYLOAD DISTANCE PUSHED",
-                stats.payloadDistancePushedMeters.ToString("N1") + " M", null));
-            fieldWork.Add(new PerformanceStat("stat.beacons", "worklight_beacon",
-                "SURVEY BEACONS PLACED", stats.surveyBeaconsPlaced.ToString("N0"), beaconRate));
-            fieldWork.Add(new PerformanceStat("stat.incinerated", "scavenger",
-                "ITEMS INCINERATED", stats.itemsIncinerated.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.whistleblower_damage", "lethal_hands",
-                "DAMAGE DEALT TO WHISTLEBLOWER", stats.whistleblowerDamageDealt.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.pests", "quick_hands",
-                "PESTS TRAPPED", stats.pestsTrapped.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.breach_waves", "resilience",
-                "CONTAINMENT WAVES SURVIVED", stats.containmentWavesSurvived.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.drills", "turret_hacker",
-                "DRILLS PLACED", stats.drillsPlaced.ToString("N0"), null));
-            fieldWork.Add(new PerformanceStat("stat.breakers", "field_operations",
-                "BREAKERS RESTORED", stats.breakersRestored.ToString("N0"), null));
-        }
-        clusters.Add(new PerformanceCluster("FIELD WORK", fieldWork.ToArray()));
-
-        clusters.Add(new PerformanceCluster("COMBAT", new[]
-        {
-            new PerformanceStat("stat.kills", "lethal_hands",
-                "MONSTERS KILLED", stats.monstersKilled.ToString("N0"), killRate),
-            new PerformanceStat("stat.deaths", "deathbound",
-                "TIMES DIED", stats.timesDied.ToString("N0"), null)
-        }));
-
-        var operations = new List<PerformanceStat>
-        {
-            new PerformanceStat("stat.hacks", "turret_hacker",
-                "DEVICES HACKED", stats.devicesHacked.ToString("N0"), null)
-        };
-        if (OptionalPluginCapabilities.LethalCctv)
-        {
-            operations.Add(new PerformanceStat("stat.cctv", "better_scanner",
-                "TIME SPENT ON CCTV",
-                EmployeeStatistics.FormatDuration(stats.timeSpentOnCctvSeconds), null));
-        }
-        clusters.Add(new PerformanceCluster("OPERATIONS", operations.ToArray()));
-
-        clusters.Add(new PerformanceCluster("ECONOMY", new[]
-        {
-            new PerformanceStat("stat.scrap", "scavenger",
-                "SCRAP VALUE DELIVERED", "$" + stats.scrapValueDelivered.ToString("N0"), scrapRate),
-            new PerformanceStat("stat.quotas", "quota_guard",
-                "QUOTAS COMPLETED", stats.quotasCompleted.ToString("N0"), null)
-        }));
-        return clusters.ToArray();
-    }
-
-    private static void BuildPerformanceClusterHeader(Transform parent, string title, float yTop)
-    {
-        var label = UI.MakeText("RecordCluster_" + title, parent,
-            title, FontXs, Palette.Alpha(Palette.Accent, 0.92f),
-            TextAlignmentOptions.MidlineLeft);
-        label.fontStyle = FontStyles.Bold;
-        label.characterSpacing = 3f;
-        label.raycastTarget = false;
-        label.enableWordWrapping = false;
-        label.overflowMode = TextOverflowModes.Ellipsis;
-        var rt = label.GetComponent<RectTransform>();
-        rt.anchorMin = new Vector2(0, 1);
-        rt.anchorMax = new Vector2(1, 1);
-        rt.offsetMin = new Vector2(Space3, -(yTop + RecordClusterHeaderH));
-        rt.offsetMax = new Vector2(-Space3, -yTop);
-
-        MakeAccentLine(parent, "RecordClusterRule_" + title,
-            new Vector2(0, 1), new Vector2(1, 1),
-            new Vector2(Space3, -(yTop + RecordClusterHeaderH - 2f)),
-            new Vector2(-Space3, -(yTop + RecordClusterHeaderH - 3f)),
-            Palette.Alpha(Palette.Accent, FillWash));
-    }
 
     private static void BuildPerformanceRow(
         Transform parent, PerformanceStat stat, int index, float yTop, ScrollRect scroller)
@@ -3871,13 +3840,8 @@ public class PurchaseMenu
                 available.Add(id);
         }
 
-        PlayerLevelData data = PlayerLevelStore.Get();
-        int owned = data.cosmetics == null
-            ? 0
-            : data.cosmetics
-                .Where(id => !string.IsNullOrEmpty(id) && available.Contains(id))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count();
+        _cosmeticState ??= CosmeticStateService.Capture();
+        int owned = available.Count(id => _cosmeticState.IsOwned(id));
         return (owned, available.Count);
     }
 
@@ -3897,17 +3861,60 @@ public class PurchaseMenu
         return (owned, emotes.Count);
     }
 
-    // - Upgrade list -
+    // - Upgrade catalogs -
+    // Every way into the class trees or the Augments catalog - the rail, a class tab, the repaint
+    // after a purchase, the menu refresh and the restore after a catalog change - enters through
+    // these two, so none can open a screen the rail no longer offers (#435).
     // resetScroll: when true, snap content back to the top after rebuild.
     // Default false so back-button returns from the detail view preserve
     // the user's scroll position. Tab/category switches pass true.
     public static void showUpgrades(bool shared, bool resetScroll = false)
+    {
+        ShowUpgradeCatalog(UpgradeCatalogView.ClassTrees, shared, resetScroll);
+    }
+
+    public static void showAugments(bool resetScroll = false)
+    {
+        ShowUpgradeCatalog(UpgradeCatalogView.Augments, false, resetScroll);
+    }
+
+    /// <summary>
+    /// Opens the screen <see cref="LguCatalogLayout.Resolve"/> allows for
+    /// <paramref name="requested"/> against the registered catalog: LGU-only mode never reopens
+    /// the emptied class trees, and an emptied Augments catalog falls back once. The renderers
+    /// below never route, so the two catalogs cannot bounce between each other.
+    /// </summary>
+    private static void ShowUpgradeCatalog(UpgradeCatalogView requested, bool shared, bool resetScroll)
+    {
+        IReadOnlyList<Y4NGZSkillTreeNodeDefinition> flatNodes = Y4NGZUpgradeManager.GetFlatCatalogNodes();
+        UpgradeCatalogView view = LguCatalogLayout.Resolve(
+            requested, Y4NGZUpgradeManager.CurrentPolicy.NativeCatalogHidden, flatNodes.Count);
+        // A fallback is a different screen from the one asked for, so it opens at the top.
+        if (view != requested)
+            resetScroll = true;
+
+        switch (view)
+        {
+            case UpgradeCatalogView.ClassTrees:
+                RenderClassTrees(shared, resetScroll);
+                break;
+            case UpgradeCatalogView.Augments:
+                RenderAugments(flatNodes.ToList(), resetScroll);
+                break;
+            default:
+                showEmployeeFile();
+                break;
+        }
+    }
+
+    private static void RenderClassTrees(bool shared, bool resetScroll)
     {
         string previousNodeId = !string.IsNullOrEmpty(_selectedSkillTreeNodeId)
             ? _selectedSkillTreeNodeId
             : currentSelection?.Id;
         location = nameof(showUpgrades) + "," + shared;
         _activeView = () => showUpgrades(shared, resetScroll: false);
+        _augmentsActive = false;
         ShowView(_listView);
         // The full hint is set only once there is a tree to walk: both early
         // returns below register zero focus targets, so advertising W/S/A/D
@@ -3941,7 +3948,6 @@ public class PurchaseMenu
 
         Dictionary<string, Y4NGZUpgradeNode> upgradesById = UpgradeApi.GetUpgradeNodes()
             .Where(x => x.SharedUpgrade == shared)
-            .Where(x => !HiddenUpgrades.Contains(x.Name))
             .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
 
@@ -3964,9 +3970,8 @@ public class PurchaseMenu
         SkillTreeLayout layout = BuildSkillTreeLayout(nodes);
 
         BuildSkillTreeNavigation(trees, activeTree, SkillTreeTabsTop, SkillTreeTabsH);
-        BuildSkillTreeBackdrop(layout, activeTree.TreeClass);
-        BuildSkillTreeTierLabels(activeTree, treeInvestment, layout);
-        BuildSkillTreeConnections(nodes, upgradesById, layout);
+        BuildSkillTreeBackdrop(layout);
+        BuildSkillTreeBands(nodes, upgradesById, treeInvestment, layout);
 
         Y4NGZSkillTreeNodeDefinition selectedNode = SelectSkillTreeNodeForRender(nodes, previousNodeId);
         for (int i = 0; i < nodes.Count; i++)
@@ -3974,6 +3979,11 @@ public class PurchaseMenu
 
         var crt = _scrollContent.GetComponent<RectTransform>();
         crt.sizeDelta = new Vector2(0f, layout.ContentHeight);
+        if (_scrollRect != null)
+        {
+            _scrollRect.vertical = _scrollRect.viewport != null && layout.ContentHeight > _scrollRect.viewport.rect.height + 1f;
+            _scrollRect.scrollSensitivity = 52f;
+        }
         if (resetScroll)
         {
             crt.anchoredPosition = Vector2.zero;
@@ -3998,39 +4008,197 @@ public class PurchaseMenu
         }
 
         CommitFocusTargets();
+        _pendingTierUnlocks.Clear();
+    }
+
+    // - Augments catalog (#435) -
+    // The SeparateCatalog layout, and LGU-only mode with Late Game Upgrades installed, put every
+    // imported Late Game Upgrades row in one scrolling wrapping grid: the same cards, icons,
+    // wallet, inspector and W/S/A/D navigation the class trees use, with no branch lines, no tier
+    // bands and no class-investment gate text. Those rows register with gate 0 and no
+    // connections, and GetSkillTreeNodes already excludes them, so nothing here has to filter the
+    // class trees. ShowUpgradeCatalog only calls this with at least one row.
+    private static void RenderAugments(List<Y4NGZSkillTreeNodeDefinition> nodes, bool resetScroll)
+    {
+        string previousNodeId = !string.IsNullOrEmpty(_selectedSkillTreeNodeId)
+            ? _selectedSkillTreeNodeId
+            : currentSelection?.Id;
+
+        location = nameof(showAugments);
+        _activeView = () => showAugments(resetScroll: false);
+        _augmentsActive = true;
+        ShowView(_listView);
+        SetFooterHint(HintGrid);
+        RefreshCurrencyDisplay();
+        ClearContent();
+        ClearFocusTargets();
+
+        if (_scrollRect != null)
+        {
+            _scrollRect.horizontal = false;
+            _scrollRect.vertical = false;
+            _scrollRect.movementType = ScrollRect.MovementType.Clamped;
+            _scrollRect.scrollSensitivity = 0f;
+        }
+
+        Dictionary<string, Y4NGZUpgradeNode> upgradesById = UpgradeApi.GetUpgradeNodes()
+            .Where(x => !x.SharedUpgrade)
+            .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+
+        SkillTreeLayout layout = BuildFlatCatalogLayout(nodes);
+        BuildSkillTreeBackdrop(layout);
+
+        Y4NGZSkillTreeNodeDefinition selectedNode = SelectSkillTreeNodeForRender(nodes, previousNodeId);
+        for (int i = 0; i < nodes.Count; i++)
+            BuildSkillTreeNode(nodes[i], upgradesById, 0, layout, selectedNode);
+
+        var crt = _scrollContent.GetComponent<RectTransform>();
+        crt.sizeDelta = new Vector2(0f, layout.ContentHeight);
+        if (_scrollRect != null)
+        {
+            _scrollRect.vertical = _scrollRect.viewport != null
+                && layout.ContentHeight > _scrollRect.viewport.rect.height + 1f;
+            _scrollRect.scrollSensitivity = 52f;
+        }
+        if (resetScroll)
+        {
+            crt.anchoredPosition = Vector2.zero;
+            if (_scrollRect != null)
+            {
+                _scrollRect.horizontalNormalizedPosition = 0f;
+                _scrollRect.verticalNormalizedPosition = 1f;
+            }
+        }
+
+        if (selectedNode != null)
+        {
+            _selectedSkillTreeNodeId = selectedNode.UpgradeId;
+            upgradesById.TryGetValue(selectedNode.UpgradeId, out Y4NGZUpgradeNode selectedUpgrade);
+            RenderSkillTreeSelection(selectedNode, selectedUpgrade, 0);
+        }
+        else
+        {
+            currentSelection = null;
+            _selectedSkillTreeNodeId = null;
+            RenderInspectorPlaceholder("AUGMENTS",
+                "Imported Late Game Upgrades rows. Select one to read its file.");
+        }
+
+        CommitFocusTargets();
+        _pendingTierUnlocks.Clear();
+    }
+
+    /// <summary>
+    /// One continuous wrapping grid at the shared card pitch. It borrows
+    /// <see cref="SkillTreeCardLayout"/> so a card here is the same size, in the same columns, as
+    /// a card in a class tree - but it registers no caption or route bands, because the flat
+    /// catalog draws no tier captions and no connections.
+    /// </summary>
+    private static SkillTreeLayout BuildFlatCatalogLayout(List<Y4NGZSkillTreeNodeDefinition> nodes)
+    {
+        var layout = new SkillTreeLayout();
+        float viewportHeight = 0f;
+        float viewportWidth = 0f;
+        if (_scrollRect != null && _scrollRect.viewport != null)
+        {
+            viewportWidth = _scrollRect.viewport.rect.width;
+            viewportHeight = _scrollRect.viewport.rect.height;
+        }
+
+        float contentWidth = 0f;
+        RectTransform contentRt = _scrollContent != null
+            ? _scrollContent.GetComponent<RectTransform>()
+            : null;
+        if (contentRt != null)
+            contentWidth = contentRt.rect.width;
+        if (contentWidth <= 10f)
+            contentWidth = viewportWidth;
+        if (contentWidth <= 10f)
+            contentWidth = 542f;
+        layout.ContentWidth = contentWidth;
+        layout.NodeW = SkillTreeCardLayout.CardWidth(contentWidth);
+        // No class tabs sit above this grid, so it opens where a tree's first caption would.
+        layout.TreeTop = SkillTreeTabsTop + SkillTreeGlassRise;
+
+        int count = nodes.Count;
+        for (int i = 0; i < count; i++)
+        {
+            SkillTreeCardLayout.CardSlot slot =
+                SkillTreeCardLayout.Slot(contentWidth, count, layout.TreeTop, i);
+            layout.NodePositions[nodes[i].UpgradeId] = new Vector2(slot.Left, slot.Top);
+            layout.NodeCells[nodes[i].UpgradeId] = new Vector2Int(slot.Row, slot.Column);
+        }
+
+        int columns = SkillTreeCardLayout.MaxColumns(contentWidth);
+        int rows = Mathf.Max(1, SkillTreeCardLayout.PhysicalRowCount(count, columns));
+        float cardsBottom = layout.TreeTop + SkillTreeCardLayout.TierCardsHeight(rows);
+        float naturalHeight = cardsBottom + SkillTreeCardLayout.Clearance + 4f;
+        layout.ContentHeight = Mathf.Max(naturalHeight, viewportHeight - 4f);
+        return layout;
+    }
+
+    /// <summary>
+    /// Re-enters whichever catalog the player is standing in. Both live in <c>_listView</c>, so a
+    /// purchase, a refused quote or an expiring notice must repaint the one on screen instead of
+    /// dropping an Augments browser back into the class trees (#435).
+    /// </summary>
+    private static void ShowActiveUpgradeCatalog(bool shared, bool resetScroll = false)
+    {
+        if (_augmentsActive)
+            showAugments(resetScroll);
+        else
+            showUpgrades(shared, resetScroll);
+    }
+
+    /// <summary>
+    /// One logical tier in drawing order: the authored tier number, the top of
+    /// its first card row and the height of every wrapped row it owns. A tier
+    /// keeps exactly one caption however many rows its nodes wrap onto.
+    /// </summary>
+    private readonly struct SkillTreeTierBand
+    {
+        public SkillTreeTierBand(int tier, float top, float cardsHeight, int rows)
+        {
+            Tier = tier;
+            Top = top;
+            CardsHeight = cardsHeight;
+            Rows = rows;
+        }
+
+        public int Tier { get; }
+        public float Top { get; }
+        public float CardsHeight { get; }
+        public int Rows { get; }
     }
 
     private sealed class SkillTreeLayout
     {
         public float NavTop = SkillTreeTabsTop;
         // Tabs end at 52; the glass opens SkillTreeTabsGap below that and
-        // TreeTop is SkillTreeGlassRise further down, leaving the glass a band
-        // of its own for the first tier caption. 88 today - the 20px the
-        // removed token readout used to occupy (#258) went back to the tree.
+        // TreeTop is SkillTreeGlassRise further down, so the glass opens with a
+        // band of its own above the first row of nodes.
         public float TreeTop =
             SkillTreeTabsTop + SkillTreeTabsH + SkillTreeTabsGap + SkillTreeGlassRise;
         public float Left = 42f;
-        public float NodeW = 94f;
-        public float NodeH = 94f;
-        public float NodeGap = 108f;
-        public float MinNodeGap = 26f;
-        public float SidePad = 22f;
-        public float TierRowH = 112f;
-        public float ColumnW => NodeW + NodeGap;
+        public float NodeW = SkillTreeCardLayout.NodeWidth;
+        public float NodeH = SkillTreeCardLayout.NodeHeight;
         public float ContentWidth;
         public float ContentHeight;
         public readonly Dictionary<string, Vector2> NodePositions =
             new Dictionary<string, Vector2>(StringComparer.OrdinalIgnoreCase);
 
-        // Grid address of each node - x is the tier row index counted from the
-        // top of the drawing (tier 4 first), y is the node's slot inside it.
+        // Grid address of each node - x is the physical card row counted from
+        // the top of the drawing (the highest tier first), y is the node's
+        // column on that row. A tier whose nodes wrap owns several consecutive
+        // rows, so W/S reaches every wrapped row and A/D every card on one.
         // Keyboard navigation walks these; nothing about the pixel layout has
         // to be re-derived to know what is left of what.
         public readonly Dictionary<string, Vector2Int> NodeCells =
             new Dictionary<string, Vector2Int>(StringComparer.OrdinalIgnoreCase);
 
-        /// <summary>Authored tier number and drawing top, in row order.</summary>
-        public readonly List<(int Tier, float Top)> TierRows = new List<(int, float)>();
+        /// <summary>The logical tiers, top to bottom. One caption each.</summary>
+        public readonly List<SkillTreeTierBand> TierBands = new List<SkillTreeTierBand>();
 
         public Vector2Int NodeCell(Y4NGZSkillTreeNodeDefinition node)
         {
@@ -4046,24 +4214,6 @@ public class PurchaseMenu
                 return position;
 
             return new Vector2(Left, TreeTop);
-        }
-
-        public Vector2 NodeCenter(Y4NGZSkillTreeNodeDefinition node)
-        {
-            Vector2 topLeft = NodeTopLeft(node);
-            return new Vector2(topLeft.x + NodeW * 0.5f, topLeft.y + NodeH * 0.5f);
-        }
-
-        public Vector2 NodeTopCenter(Y4NGZSkillTreeNodeDefinition node)
-        {
-            Vector2 topLeft = NodeTopLeft(node);
-            return new Vector2(topLeft.x + NodeW * 0.5f, topLeft.y);
-        }
-
-        public Vector2 NodeBottomCenter(Y4NGZSkillTreeNodeDefinition node)
-        {
-            Vector2 topLeft = NodeTopLeft(node);
-            return new Vector2(topLeft.x + NodeW * 0.5f, topLeft.y + NodeH);
         }
     }
 
@@ -4093,6 +4243,7 @@ public class PurchaseMenu
         if (contentWidth <= 10f)
             contentWidth = 542f;
         layout.ContentWidth = contentWidth;
+        layout.NodeW = SkillTreeCardLayout.CardWidth(contentWidth);
 
         List<IGrouping<int, Y4NGZSkillTreeNodeDefinition>> tiers = nodes
             .GroupBy(x => Mathf.Clamp(x.Tier, 1, 4))
@@ -4100,7 +4251,6 @@ public class PurchaseMenu
             .ToList();
 
         var tierRows = new List<List<Y4NGZSkillTreeNodeDefinition>>(tiers.Count);
-        int widestTier = 0;
         for (int i = 0; i < tiers.Count; i++)
         {
             List<Y4NGZSkillTreeNodeDefinition> tierNodes = tiers[i]
@@ -4109,36 +4259,39 @@ public class PurchaseMenu
                 .ThenBy(x => x.DisplayName)
                 .ToList();
             tierRows.Add(tierNodes);
-            widestTier = Mathf.Max(widestTier, tierNodes.Count);
         }
 
-        // Squeeze the gap - never the 94px boxes - until the widest tier row
-        // clears the backdrop border on both sides. The gap is only ever
-        // reduced, so trees that already fit keep their authored spacing.
-        float usableWidth = Mathf.Max(layout.NodeW, layout.ContentWidth - layout.SidePad * 2f);
-        if (widestTier > 1)
-        {
-            float fitGap = (usableWidth - widestTier * layout.NodeW) / (widestTier - 1);
-            layout.NodeGap = Mathf.Clamp(fitGap, layout.MinNodeGap, layout.NodeGap);
-        }
-
+        // A tier is one logical band; its nodes wrap onto as many physical rows
+        // as the content width holds, every row sharing the same pitch.
+        int columns = SkillTreeCardLayout.MaxColumns(contentWidth);
+        float tierTop = layout.TreeTop;
+        float cardsBottom = layout.TreeTop + layout.NodeH;
+        int physicalRow = 0;
         for (int i = 0; i < tierRows.Count; i++)
         {
             List<Y4NGZSkillTreeNodeDefinition> tierNodes = tierRows[i];
-            float totalWidth = tierNodes.Count * layout.NodeW + Mathf.Max(0, tierNodes.Count - 1) * layout.NodeGap;
-            float startX = (layout.ContentWidth - totalWidth) * 0.5f;
-            float y = layout.TreeTop + i * layout.TierRowH;
-            layout.TierRows.Add((tierNodes.Count > 0 ? Mathf.Clamp(tierNodes[0].Tier, 1, 4) : 1, y));
+            int rows = Mathf.Max(1, SkillTreeCardLayout.PhysicalRowCount(tierNodes.Count, columns));
+            float cardsHeight = SkillTreeCardLayout.TierCardsHeight(rows);
+            layout.TierBands.Add(new SkillTreeTierBand(
+                tierNodes.Count > 0 ? Mathf.Clamp(tierNodes[0].Tier, 1, 4) : 1,
+                tierTop, cardsHeight, rows));
 
             for (int n = 0; n < tierNodes.Count; n++)
             {
-                layout.NodePositions[tierNodes[n].UpgradeId] = new Vector2(startX + n * (layout.NodeW + layout.NodeGap), y);
-                layout.NodeCells[tierNodes[n].UpgradeId] = new Vector2Int(i, n);
+                SkillTreeCardLayout.CardSlot slot =
+                    SkillTreeCardLayout.Slot(contentWidth, tierNodes.Count, tierTop, n);
+                layout.NodePositions[tierNodes[n].UpgradeId] = new Vector2(slot.Left, slot.Top);
+                layout.NodeCells[tierNodes[n].UpgradeId] =
+                    new Vector2Int(physicalRow + slot.Row, slot.Column);
             }
+
+            cardsBottom = tierTop + cardsHeight;
+            physicalRow += rows;
+            tierTop += SkillTreeCardLayout.TierHeight(rows);
         }
 
-        int tierCount = Mathf.Max(1, tiers.Count);
-        float naturalHeight = layout.TreeTop + layout.NodeH + (tierCount - 1) * layout.TierRowH + 18f;
+        // Keep the lowest nodes clear of the glass bottom and scroll boundary.
+        float naturalHeight = cardsBottom + SkillTreeCardLayout.Clearance + 4f;
         layout.ContentHeight = Mathf.Max(naturalHeight, viewportHeight - 4f);
         return layout;
     }
@@ -4196,52 +4349,19 @@ public class PurchaseMenu
         {
             Y4NGZSkillTreeDefinition tree = trees[i];
             bool active = tree.TreeClass == activeTree.TreeClass;
-            Color accent = Palette.Accent;
-            Color bg = active
-                ? Palette.BtnActive
-                : Palette.Alpha(Palette.BgRow, FillGhost);
-            Color hover = active
-                ? Palette.Alpha(Palette.BtnActive, 1f)
-                : Palette.Alpha(Palette.BgRowHover, FillSoft);
-            Color text = active
-                ? accent
-                : Palette.Alpha(Palette.Dim, 0.54f);
             float leftPad = i == 0 ? outerPad : innerGap;
             float rightPad = i == trees.Count - 1 ? outerPad : innerGap;
 
-            string caption = tree.DisplayName.ToUpperInvariant();
-
-            var (btn, lbl) = UI.MakeButton(
+            var (btn, _) = BuildSegmentTab(
                 "TreeTab_" + tree.DisplayName,
                 _scrollContent,
-                caption,
+                tree.DisplayName,
+                active,
                 FontMdLg,
-                bg,
-                hover,
-                text,
                 new Vector2(tabW * i, 1),
                 new Vector2(tabW * (i + 1), 1),
                 new Vector2(leftPad, -(yTop + height)),
                 new Vector2(-rightPad, -yTop));
-            lbl.fontStyle = FontStyles.Bold;
-            lbl.enableAutoSizing = true;
-            lbl.fontSizeMin = FontSm;
-            lbl.fontSizeMax = FontMdLg;
-            ApplyRoundedPanelShape(btn.gameObject, SkillTreeTabRadius);
-            UI.AddPanelTexture(btn.transform, active ? TexMid : TexTrace, tree.DisplayName.GetHashCode());
-            AddRoundedFrame(btn.transform, active ? 3f : 2f, 1f,
-                active
-                    ? Palette.Alpha(accent, 0.92f)
-                    : Palette.Alpha(Palette.BorderDim, 0.32f),
-                SkillTreeTabRadius);
-            if (active)
-            {
-                var underline = UI.MakePanel("TreeTabActiveUnderline", btn.transform,
-                    Palette.Alpha(accent, 0.95f),
-                    new Vector2(0.08f, 0), new Vector2(0.92f, 0),
-                    new Vector2(0f, 0f), new Vector2(0f, 3f));
-                underline.GetComponent<Image>().raycastTarget = false;
-            }
 
             Y4NGZSkillTreeClass captured = tree.TreeClass;
             btn.onClick.AddListener(() =>
@@ -4252,10 +4372,57 @@ public class PurchaseMenu
                 currentSelection = null;
                 showUpgrades(false, resetScroll: true);
             });
+            RegisterFocusTarget("class:" + captured, btn.GetComponent<RectTransform>(), btn, -1, i, _scrollRect);
         }
     }
 
-    private static void BuildSkillTreeBackdrop(SkillTreeLayout layout, Y4NGZSkillTreeClass treeClass)
+    /// <summary>
+    /// One segmented tab: the class tabs above the tree and the cosmetics
+    /// ALL / OWNED / EQUIPPED filters share it. Rounded plate, 3px accent frame
+    /// and underline when active, 2px dim frame when not, bold uppercase label
+    /// autosizing from <paramref name="maxFont"/> down to FontSm.
+    /// </summary>
+    private static (Button btn, TMP_Text label) BuildSegmentTab(
+        string name, Transform parent, string caption, bool active, float maxFont,
+        Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax)
+    {
+        Color accent = Palette.Accent;
+        Color bg = active
+            ? Palette.BtnActive
+            : Palette.Alpha(Palette.BgRow, FillGhost);
+        Color hover = active
+            ? Palette.Alpha(Palette.BtnActive, 1f)
+            : Palette.Alpha(Palette.BgRowHover, FillSoft);
+        Color text = active
+            ? accent
+            : Palette.Alpha(Palette.Dim, 0.54f);
+
+        var (btn, lbl) = UI.MakeButton(name, parent, caption.ToUpperInvariant(), maxFont,
+            bg, hover, text, anchorMin, anchorMax, offsetMin, offsetMax);
+        lbl.fontStyle = FontStyles.Bold;
+        lbl.enableAutoSizing = true;
+        lbl.fontSizeMin = FontSm;
+        lbl.fontSizeMax = maxFont;
+        ApplyRoundedPanelShape(btn.gameObject, SkillTreeTabRadius);
+        UI.AddPanelTexture(btn.transform, active ? TexMid : TexTrace, caption.GetHashCode());
+        AddRoundedFrame(btn.transform, active ? 3f : 2f, 1f,
+            active
+                ? Palette.Alpha(accent, 0.92f)
+                : Palette.Alpha(Palette.BorderDim, 0.32f),
+            SkillTreeTabRadius);
+        if (active)
+        {
+            var underline = UI.MakePanel("TreeTabActiveUnderline", btn.transform,
+                Palette.Alpha(accent, 0.95f),
+                new Vector2(0.08f, 0), new Vector2(0.92f, 0),
+                new Vector2(0f, 0f), new Vector2(0f, 3f));
+            underline.GetComponent<Image>().raycastTarget = false;
+        }
+
+        return (btn, lbl);
+    }
+
+    private static void BuildSkillTreeBackdrop(SkillTreeLayout layout)
     {
         if (layout == null || _scrollContent == null)
             return;
@@ -4266,273 +4433,14 @@ public class PurchaseMenu
         float yTop = layout.TreeTop - SkillTreeGlassRise;
         float yBottom = layout.ContentHeight - 4f;
         var panel = UI.MakePanel("SkillTreeGlass", _scrollContent,
-            Palette.Alpha(Palette.BgInput, FillWash),
+            Palette.Shade(Palette.BgInput, 0.60f, 0.98f),
             new Vector2(0, 1), new Vector2(1, 1),
             new Vector2(4f, -yBottom), new Vector2(-4f, -yTop));
         Image bg = panel.GetComponent<Image>();
         if (bg != null)
             bg.raycastTarget = false;
 
-        UI.AddPanelTexture(panel.transform, TexTrace, treeClass.GetHashCode());
-        AddBorder(panel.transform, 2f, 0f, Palette.Alpha(accent, FillGhost));
-    }
-
-    private static void BuildSkillTreeHeader(
-        Y4NGZSkillTreeDefinition tree,
-        List<Y4NGZSkillTreeNodeDefinition> nodes,
-        Dictionary<string, Y4NGZUpgradeNode> upgradesById,
-        int treeInvestment,
-        float yTop,
-        float height)
-    {
-        Color accent = Palette.Accent;
-        var header = UI.MakePanel("TreeHeader_" + tree.DisplayName, _scrollContent,
-            new Color(Palette.BgHeader.r, Palette.BgHeader.g, Palette.BgHeader.b, 0.82f),
-            new Vector2(0, 1), new Vector2(1, 1),
-            new Vector2(4f, -(yTop + height)), new Vector2(-4f, -yTop));
-        UI.AddPanelTexture(header.transform, TexMid, tree.DisplayName.GetHashCode());
-        AddBorder(header.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("TreeAccent", header.transform, accent,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(5f, 0));
-
-        var label = UI.MakeText("TreeName", header.transform,
-            tree.DisplayName.ToUpperInvariant(),
-            FontLg, accent, TextAlignmentOptions.MidlineLeft);
-        label.fontStyle = FontStyles.Bold;
-        var labelRt = label.GetComponent<RectTransform>();
-        labelRt.anchorMin = new Vector2(0, 0);
-        labelRt.anchorMax = new Vector2(0.50f, 1);
-        labelRt.offsetMin = new Vector2(18f, 0);
-        labelRt.offsetMax = new Vector2(-8f, 0);
-
-        int implemented = nodes.Count(x => upgradesById.ContainsKey(x.UpgradeId));
-        int purchasedLevels = nodes.Sum(x => upgradesById.TryGetValue(x.UpgradeId, out Y4NGZUpgradeNode upgrade)
-            ? Mathf.Max(0, upgrade.GetCurrentLevel())
-            : 0);
-        int totalLevels = nodes.Sum(x => upgradesById.TryGetValue(x.UpgradeId, out Y4NGZUpgradeNode upgrade)
-            ? Mathf.Max(1, upgrade.MaxUpgrade + 1)
-            : 0);
-        string metaText = $"{implemented} / {nodes.Count} FILES    {purchasedLevels} / {Mathf.Max(1, totalLevels)} LEVELS    {treeInvestment} TREE LEVELS";
-        var meta = UI.MakeText("TreeMeta", header.transform,
-            metaText,
-            FontSm, Palette.Body, TextAlignmentOptions.MidlineRight);
-        meta.enableAutoSizing = true;
-        meta.fontSizeMin = FontMicro;
-        meta.fontSizeMax = FontSm;
-        var metaRt = meta.GetComponent<RectTransform>();
-        metaRt.anchorMin = new Vector2(0.50f, 0);
-        metaRt.anchorMax = new Vector2(1, 1);
-        metaRt.offsetMin = new Vector2(8f, 0);
-        metaRt.offsetMax = new Vector2(-16f, 0);
-    }
-
-    private static void BuildSkillTreeTierGates(
-        Y4NGZSkillTreeDefinition tree,
-        int treeInvestment,
-        SkillTreeLayout layout)
-    {
-        if (tree == null || layout == null)
-            return;
-
-        float gateTop = layout.TreeTop - SkillTreeGateRise;
-        float gateBottom = layout.ContentHeight - 20f;
-        for (int tier = 2; tier <= 4; tier++)
-        {
-            int requirement = tree.GetGateRequirement(tier);
-            bool unlocked = treeInvestment >= requirement;
-            float x = layout.Left + (tier - 1) * layout.ColumnW - 24f;
-            Color accent = Palette.Accent;
-            Color color = unlocked
-                ? new Color(accent.r, accent.g, accent.b, 0.62f)
-                : Palette.Alpha(Palette.Locked, 0.48f);
-
-            MakeAccentLine(_scrollContent, "TierGate_" + tier,
-                new Vector2(0, 1), new Vector2(0, 1),
-                new Vector2(x, -gateBottom),
-                new Vector2(x + 4f, -gateTop),
-                color);
-
-            var label = UI.MakeText("TierGateLabel_" + tier, _scrollContent,
-                $"T{tier}  {requirement}",
-                FontXs, unlocked ? accent : Palette.Locked,
-                TextAlignmentOptions.Center);
-            label.enableWordWrapping = false;
-            label.overflowMode = TextOverflowModes.Ellipsis;
-            var rt = label.GetComponent<RectTransform>();
-            rt.anchorMin = new Vector2(0, 1);
-            rt.anchorMax = new Vector2(0, 1);
-            rt.pivot = new Vector2(0.5f, 0.5f);
-            rt.sizeDelta = new Vector2(66f, 20f);
-            rt.anchoredPosition = new Vector2(x + 2f, -(gateTop - 14f));
-        }
-    }
-
-    private static void BuildSkillTreeConnections(
-        List<Y4NGZSkillTreeNodeDefinition> nodes,
-        Dictionary<string, Y4NGZUpgradeNode> upgradesById,
-        SkillTreeLayout layout)
-    {
-        if (nodes == null || layout == null)
-            return;
-
-        // A link the player has actually walked reads as live wiring; everything
-        // else is dim plan. Both endpoints must be bought into for the accent.
-        Color accent = Palette.Accent;
-        Color liveColor = Palette.Alpha(accent, 0.72f);
-        Color plannedColor = Palette.Alpha(Palette.Locked, FillGhost);
-        var drawnConnections = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < nodes.Count; i++)
-        {
-            Y4NGZSkillTreeNodeDefinition node = nodes[i];
-            // Tier 1 has no tier below it to fall back to, but a root-row node
-            // may still declare an explicit link to a node further up the tree.
-            bool hasExplicitConnections = node.ConnectionUpgradeIds != null
-                && node.ConnectionUpgradeIds.Count > 0;
-            if (node.Tier <= 1 && !hasExplicitConnections)
-                continue;
-
-            List<Y4NGZSkillTreeNodeDefinition> previousNodes = FindSkillTreeConnectionSources(nodes, node);
-            for (int c = 0; c < previousNodes.Count; c++)
-            {
-                Y4NGZSkillTreeNodeDefinition previous = previousNodes[c];
-                if (previous == null)
-                    continue;
-
-                string key = previous.UpgradeId + ">" + node.UpgradeId;
-                if (!drawnConnections.Add(key))
-                    continue;
-
-                Vector2 previousCenter = layout.NodeCenter(previous);
-                Vector2 nodeCenter = layout.NodeCenter(node);
-                bool targetAbove = nodeCenter.y < previousCenter.y;
-                Vector2 from = targetAbove
-                    ? layout.NodeTopCenter(previous)
-                    : layout.NodeBottomCenter(previous);
-                Vector2 to = targetAbove
-                    ? layout.NodeBottomCenter(node)
-                    : layout.NodeTopCenter(node);
-                bool live = IsSkillTreeNodeOwned(previous, upgradesById)
-                    && IsSkillTreeNodeOwned(node, upgradesById);
-                MakeSkillTreeConnection(_scrollContent, from, to,
-                    live ? liveColor : plannedColor, live ? 2f : 1f);
-            }
-        }
-    }
-
-    /// <summary>Owned = at least one level bought. Used to light up connection lines.</summary>
-    private static bool IsSkillTreeNodeOwned(
-        Y4NGZSkillTreeNodeDefinition node,
-        Dictionary<string, Y4NGZUpgradeNode> upgradesById)
-    {
-        return node != null
-            && upgradesById != null
-            && upgradesById.TryGetValue(node.UpgradeId, out Y4NGZUpgradeNode upgrade)
-            && upgrade.GetCurrentLevel() > 0;
-    }
-
-    private static List<Y4NGZSkillTreeNodeDefinition> FindSkillTreeConnectionSources(
-        List<Y4NGZSkillTreeNodeDefinition> nodes,
-        Y4NGZSkillTreeNodeDefinition node)
-    {
-        var sources = new List<Y4NGZSkillTreeNodeDefinition>();
-        if (nodes == null || node == null)
-            return sources;
-
-        if (node.ConnectionUpgradeIds != null && node.ConnectionUpgradeIds.Count > 0)
-        {
-            for (int i = 0; i < node.ConnectionUpgradeIds.Count; i++)
-            {
-                string id = node.ConnectionUpgradeIds[i];
-                Y4NGZSkillTreeNodeDefinition source = nodes.FirstOrDefault(x =>
-                    string.Equals(x.UpgradeId, id, StringComparison.OrdinalIgnoreCase));
-                if (source != null && source != node)
-                    sources.Add(source);
-            }
-        }
-
-        if (sources.Count == 0)
-        {
-            Y4NGZSkillTreeNodeDefinition previous = FindPreviousSkillTreeNode(nodes, node);
-            if (previous != null)
-                sources.Add(previous);
-        }
-
-        return sources;
-    }
-
-    private static Y4NGZSkillTreeNodeDefinition FindPreviousSkillTreeNode(
-        List<Y4NGZSkillTreeNodeDefinition> nodes,
-        Y4NGZSkillTreeNodeDefinition node)
-    {
-        return nodes
-            .Where(x => x.Tier < node.Tier)
-            .OrderByDescending(x => x.Tier)
-            .ThenBy(x => Mathf.Abs(x.Row - node.Row))
-            .ThenBy(x => Mathf.Abs(x.Column - node.Column))
-            .FirstOrDefault();
-    }
-
-    private static void MakeSkillTreeConnection(
-        Transform parent,
-        Vector2 from,
-        Vector2 to,
-        Color color,
-        float thickness)
-    {
-        float midY = (from.y + to.y) * 0.5f;
-        Vector2 bendA = new Vector2(from.x, midY);
-        Vector2 bendB = new Vector2(to.x, midY);
-
-        MakeSkillTreeSegment(parent, from, bendA, color, thickness);
-        MakeSkillTreeSegment(parent, bendA, bendB, color, thickness);
-        MakeSkillTreeSegment(parent, bendB, to, color, thickness);
-    }
-
-    private static void MakeSkillTreeSegment(
-        Transform parent,
-        Vector2 a,
-        Vector2 b,
-        Color color,
-        float thickness)
-    {
-        if (parent == null)
-            return;
-
-        float t = Mathf.Max(1f, thickness);
-        float xMin = Mathf.Min(a.x, b.x);
-        float xMax = Mathf.Max(a.x, b.x);
-        float yMin = Mathf.Min(a.y, b.y);
-        float yMax = Mathf.Max(a.y, b.y);
-        if (Mathf.Abs(xMax - xMin) < 0.01f)
-        {
-            xMin -= t * 0.5f;
-            xMax += t * 0.5f;
-        }
-        if (Mathf.Abs(yMax - yMin) < 0.01f)
-        {
-            yMin -= t * 0.5f;
-            yMax += t * 0.5f;
-        }
-
-        var line = UI.MakePanel("TreeConnectionSegment", parent, color,
-            new Vector2(0, 1), new Vector2(0, 1),
-            new Vector2(xMin, -yMax), new Vector2(xMax, -yMin));
-        line.GetComponent<Image>().raycastTarget = false;
-    }
-
-    private static void MakeSkillTreeJunction(Transform parent, Vector2 point, Color color)
-    {
-        if (parent == null)
-            return;
-
-        const float size = 8f;
-        var joint = UI.MakePanel("TreeConnectionJunction", parent,
-            new Color(color.r, color.g, color.b, Mathf.Min(0.72f, color.a + 0.20f)),
-            new Vector2(0, 1), new Vector2(0, 1),
-            new Vector2(point.x - size * 0.5f, -(point.y + size * 0.5f)),
-            new Vector2(point.x + size * 0.5f, -(point.y - size * 0.5f)));
-        joint.GetComponent<Image>().raycastTarget = false;
+        AddBorder(panel.transform, 1f, 0f, Palette.Alpha(accent, FillWash));
     }
 
     private static void BuildSkillTreeNode(
@@ -4555,15 +4463,11 @@ public class PurchaseMenu
         Color accent = Palette.Accent;
         SkillNodeState state = ClassifySkillTreeNode(node, upgrade);
 
-        // A node draws only its icon, its name and its level pips (#258), so the
-        // state has to read off fill, stroke colour, stroke weight, group alpha
-        // and pip fill together - five axes, none of which is text. The exact
-        // cost, gate requirement and level count live in the right inspector,
-        // which is one selection away from any node here.
-        bool dimmed = state == SkillNodeState.Gated || state == SkillNodeState.Planned;
+        // The numeric rank and corner lock/maxed badge supplement the fill and
+        // outline. Purchase cost and full gate requirements live in the inspector.
         Color normal;
         Color borderNormal;
-        float borderWeight = 2f;
+        float borderWeight = 1f;
         float groupAlpha = 1f;
         Color labelColor;
 
@@ -4571,32 +4475,31 @@ public class PurchaseMenu
         {
             case SkillNodeState.Owned:
                 // The only state with an accent-filled body.
-                normal = Palette.Alpha(accent, 0.34f);
+                normal = Palette.Shade(accent, 0.20f, 0.96f);
                 borderNormal = Palette.Alpha(Palette.Gold, 0.90f);
                 labelColor = Palette.RowButtonText;
                 break;
             case SkillNodeState.Affordable:
-                // The only state with the heavy 3px stroke - the buyable ones
-                // are what the eye should land on first.
-                normal = Palette.Alpha(Palette.BgRow, 0.20f);
+                normal = currentLevel > 0
+                    ? Palette.Shade(accent, 0.12f, 0.96f)
+                    : Palette.Shade(Palette.BgInput, 0.45f, 0.94f);
                 borderNormal = Palette.Alpha(accent, 0.95f);
-                borderWeight = 3f;
                 labelColor = Palette.RowButtonText;
                 break;
             case SkillNodeState.TokenLocked:
-                // Reachable but unpaid: undimmed body, accent stroke at half
-                // weight of the affordable one, muted name.
-                normal = Palette.Alpha(Palette.BgRow, 0.20f);
+                // Reachable but unpaid: undimmed body and a quieter accent stroke.
+                normal = currentLevel > 0
+                    ? Palette.Shade(accent, 0.12f, 0.96f)
+                    : Palette.Shade(Palette.BgInput, 0.45f, 0.94f);
                 borderNormal = Palette.Alpha(accent, 0.45f);
-                labelColor = Palette.Muted;
+                labelColor = Palette.RowButtonText;
                 break;
             case SkillNodeState.Gated:
-                // Out of reach: a neutral grey fill, stroke, label, and pips
-                // distinguish the prerequisite/tier lock from mere cost.
-                normal = Palette.Alpha(Palette.Locked, 0.12f);
-                borderNormal = Palette.Alpha(Palette.Locked, 0.56f);
-                groupAlpha = 0.72f;
-                labelColor = Palette.Locked;
+                // Out of reach, but still readable and inspectable. The lock
+                // distinguishes a real gate from insufficient currency.
+                normal = Palette.Shade(Palette.BgInput, 0.45f, 0.94f);
+                borderNormal = Palette.Alpha(Palette.Locked, 0.50f);
+                labelColor = SkillTreeLockedText;
                 break;
             default:
                 // Planned: dimmer still, a hairline stroke, and no pips at all
@@ -4609,30 +4512,27 @@ public class PurchaseMenu
                 break;
         }
 
-        // One hover wash for every state. It used to be halved on the dimmed
-        // ones to keep them quiet, but the CanvasGroup now lifts a hovered node
-        // toward full - halving it again would cancel that lift out.
+        // Keep the backing opaque while hovering so text never competes with
+        // the room behind the menu. The Button applies this tint exactly once.
         Color hoverBase = state == SkillNodeState.Gated || state == SkillNodeState.Planned
             ? Palette.Locked
             : state == SkillNodeState.Owned ? Palette.Gold : accent;
-        Color hover = Palette.Alpha(hoverBase, 0.18f);
+        Color hover = Color.Lerp(normal, Palette.Shade(hoverBase, 0.24f, 0.96f), 0.50f);
         Color borderHover = Palette.Alpha(borderNormal, Mathf.Min(1f, borderNormal.a + 0.30f));
 
         Vector2 topLeft = layout.NodeTopLeft(node);
         var nodeGo = new GameObject("SkillNode_" + node.UpgradeId);
         nodeGo.transform.SetParent(_scrollContent, false);
         var bg = nodeGo.AddComponent<Image>();
-        bg.color = normal;
+        bg.color = Color.white;
         var rt = bg.rectTransform;
         rt.anchorMin = new Vector2(0, 1);
         rt.anchorMax = new Vector2(0, 1);
         rt.pivot = new Vector2(0, 1);
         rt.sizeDelta = new Vector2(layout.NodeW, layout.NodeH);
         rt.anchoredPosition = new Vector2(topLeft.x, -topLeft.y);
-        // The one remaining reach-keyed choice that is not an alpha: out-of-reach
-        // nodes take the sparser grain, which survives the CanvasGroup lift as a
-        // surface difference rather than cancelling it out.
-        UI.AddPanelTexture(nodeGo.transform, dimmed ? TexTrace : TexFaint, node.UpgradeId.GetHashCode());
+        // The existing menu shell carries the CRT texture. Do not stack more
+        // procedural grain behind each small glyph and label.
         Color borderSelected = Palette.Alpha(Color.white, 0.94f);
         var borderGo = new GameObject("NodeBorder");
         borderGo.transform.SetParent(nodeGo.transform, false);
@@ -4649,6 +4549,7 @@ public class PurchaseMenu
         group.alpha = groupAlpha;
 
         var button = nodeGo.AddComponent<Button>();
+        button.targetGraphic = bg;
         var cb = button.colors;
         cb.normalColor = normal;
         cb.highlightedColor = hover;
@@ -4657,7 +4558,6 @@ public class PurchaseMenu
         cb.disabledColor = normal;
         cb.fadeDuration = 0.06f;
         button.colors = cb;
-        button.targetGraphic = bg;
 
         RectTransform iconRect = BuildSkillNodeIcon(nodeGo.transform, node);
 
@@ -4666,22 +4566,26 @@ public class PurchaseMenu
             FontSm, labelColor,
             TextAlignmentOptions.Center);
         label.fontStyle = FontStyles.Bold;
-        label.enableWordWrapping = true;
+        label.text = SkillTreeCardLayout.FormatName(node.DisplayName,
+            layout.NodeW - NodeNameSidePadding * 2f,
+            text => label.GetPreferredValues(text, float.PositiveInfinity, float.PositiveInfinity).x);
+        label.enableWordWrapping = false;
         label.overflowMode = TextOverflowModes.Ellipsis;
-        label.enableAutoSizing = true;
-        label.fontSizeMin = FontTiny;
-        label.fontSizeMax = FontSm;
+        label.enableAutoSizing = false;
+        label.raycastTarget = false;
         var labelRt = label.GetComponent<RectTransform>();
         labelRt.anchorMin = new Vector2(0, 0);
         labelRt.anchorMax = new Vector2(1, 0);
-        labelRt.offsetMin = new Vector2(4f, NodeNameBottom);
-        labelRt.offsetMax = new Vector2(-4f, NodeNameTop);
+        labelRt.offsetMin = new Vector2(NodeNameSidePadding, NodeNameBottom);
+        labelRt.offsetMax = new Vector2(-NodeNameSidePadding, NodeNameTop);
 
         Color progressColor = state == SkillNodeState.Owned
             ? Palette.Gold
-            : state == SkillNodeState.Gated ? Palette.Locked : accent;
+            : state == SkillNodeState.Gated ? Palette.Body : accent;
         BuildSkillNodeProgress(nodeGo.transform, currentLevel, maxLevel,
             progressColor);
+        if (state == SkillNodeState.Gated || (implemented && currentLevel >= maxLevel))
+            BuildSkillNodeBadge(nodeGo.transform, state == SkillNodeState.Gated);
 
         var visual = new SkillTreeNodeVisual
         {
@@ -4698,7 +4602,7 @@ public class PurchaseMenu
             BorderSelected = borderSelected,
             BorderHover = borderHover,
             LabelNormal = labelColor,
-            LabelSelected = Palette.Body,
+            LabelSelected = Palette.RowButtonText,
             IconNormalSize = new Vector2(NodeIconSize, NodeIconSize),
             IconSelectedSize = new Vector2(NodeIconSelectedSize, NodeIconSelectedSize),
             Group = group,
@@ -4750,6 +4654,7 @@ public class PurchaseMenu
             iconGo.transform.SetParent(paneGo.transform, false);
             var raw = iconGo.AddComponent<RawImage>();
             raw.texture = iconTexture;
+            raw.uvRect = UpgradeIconLoader.VisibleUvRect(iconTexture);
             raw.color = Color.white;
             raw.raycastTarget = false;
             var rt = raw.rectTransform;
@@ -4760,9 +4665,8 @@ public class PurchaseMenu
             rt.anchoredPosition = Vector2.zero;
             var fitter = iconGo.AddComponent<AspectRatioFitter>();
             fitter.aspectMode = AspectRatioFitter.AspectMode.FitInParent;
-            fitter.aspectRatio = iconTexture.width > 0 && iconTexture.height > 0
-                ? (float)iconTexture.width / iconTexture.height
-                : 1f;
+            fitter.aspectRatio = raw.uvRect.width * iconTexture.width
+                / (raw.uvRect.height * iconTexture.height);
             return paneRt;
         }
 
@@ -4785,34 +4689,15 @@ public class PurchaseMenu
 
     private static void BuildSkillNodeProgress(Transform parent, int currentLevel, int maxLevel, Color accent)
     {
-        if (parent == null || maxLevel <= 0)
-            return;
-
-        int safeMax = Mathf.Clamp(maxLevel, 1, 6);
-        float pipW = 7f;
-        float gap = 3f;
-        float totalW = safeMax * pipW + (safeMax - 1) * gap;
-        var holder = new GameObject("NodeProgress");
-        holder.transform.SetParent(parent, false);
-        var rt = holder.AddComponent<RectTransform>();
-        rt.anchorMin = new Vector2(0.5f, 0);
-        rt.anchorMax = new Vector2(0.5f, 0);
-        rt.pivot = new Vector2(0.5f, 0.5f);
-        rt.sizeDelta = new Vector2(totalW, 8f);
-        rt.anchoredPosition = new Vector2(0f, 13f);
-
-        for (int i = 0; i < safeMax; i++)
-        {
-            bool filled = i < currentLevel;
-            var pip = UI.MakePanel("NodePip_" + i, holder.transform,
-                filled
-                    ? Palette.Alpha(accent, FillStrong)
-                    : Palette.Alpha(Palette.Dim, 0.36f),
-                new Vector2(0, 0), new Vector2(0, 1),
-                new Vector2(i * (pipW + gap), 1f),
-                new Vector2(i * (pipW + gap) + pipW, -1f));
-            pip.GetComponent<Image>().raycastTarget = false;
-        }
+        if (parent == null || maxLevel <= 0) return;
+        var rank = UI.MakeText("NodeRank", parent, $"{currentLevel} / {maxLevel}",
+            FontXs, accent, TextAlignmentOptions.Center);
+        rank.fontStyle = FontStyles.Bold;
+        rank.raycastTarget = false;
+        rank.rectTransform.anchorMin = Vector2.zero;
+        rank.rectTransform.anchorMax = new Vector2(1f, 0f);
+        rank.rectTransform.offsetMin = new Vector2(4f, 3f);
+        rank.rectTransform.offsetMax = new Vector2(-4f, 15f);
     }
 
     private static void SetSelectedSkillTreeNode(SkillTreeNodeVisual visual)
@@ -4858,16 +4743,7 @@ public class PurchaseMenu
 
         Color accent = Palette.Accent;
         bool gateLocked = IsSkillTreeNodeGateLocked(node, 0);
-        var nameHdr = stack.Panel("PlannedNameHdr", Palette.BgHeader, InspectorNameH);
-        UI.AddPanelTexture(nameHdr.transform, TexMid, node.UpgradeId.GetHashCode());
-        AddBorder(nameHdr.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("NameAccent", nameHdr.transform, Palette.Accent,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(4, 0));
-        UI.MakeText("Name", nameHdr.transform,
-            node.DisplayName, FontMd, Palette.Primary,
-            TextAlignmentOptions.MidlineLeft)
-            .GetComponent<RectTransform>().offsetMin = new Vector2(14, 0);
+        BuildInspectorNameBand(stack, node.DisplayName, node.UpgradeId.GetHashCode());
 
         var statusBand = BuildInspectorBand(stack, "PlannedStatusBand",
             Palette.Alpha(Palette.BgRow, 1f));
@@ -4889,22 +4765,27 @@ public class PurchaseMenu
         stack.Fill(msg.GetComponent<RectTransform>(), 72f, Space5);
 
         string label = gateLocked
-            ? $"LOCKED  {treeInvestment}/{node.GateRequirement} TREE LEVELS"
+            ? FormatClassLevelLock(treeInvestment, node.GateRequirement)
             : "- PLANNED -";
-        var (button, _) = UI.MakeButton("PlannedPurchaseBtn",
+        var (button, buttonLabel) = UI.MakeButton("PlannedPurchaseBtn",
             _detailView.transform,
             label, FontSm, PurchaseButtonBg(false), PurchaseButtonHover(false),
             gateLocked ? Palette.Locked : Palette.Dim,
             new Vector2(0, 0), new Vector2(1, 0),
             new Vector2(Space2, Space2), new Vector2(-Space2, InspectorFootH));
         AddButtonDepth(button.gameObject, node.UpgradeId.GetHashCode());
-        button.interactable = false;
+        SetPurchaseButtonInteractable(button, buttonLabel, false);
     }
 
     private static bool IsSkillTreeNodeGateLocked(Y4NGZSkillTreeNodeDefinition node, int currentLevel)
     {
         return Y4NGZUpgradeManager.IsGateLocked(node, currentLevel);
     }
+
+    // One wording for the tier gate wherever the inspector shows it: the class
+    // levels bought so far against the tier's requirement.
+    private static string FormatClassLevelLock(int investment, int requirement)
+        => $"LOCKED  {investment} / {requirement} CLASS LEVELS";
 
     private struct SkillTreeLockState
     {
@@ -4925,7 +4806,7 @@ public class PurchaseMenu
         if (Y4NGZUpgradeManager.IsGateLocked(node, currentLevel))
         {
             state.GateLocked = true;
-            state.Label = $"LOCKED  {treeInvestment}/{node.GateRequirement} TREE LEVELS";
+            state.Label = FormatClassLevelLock(treeInvestment, node.GateRequirement);
             return state;
         }
 
@@ -4985,59 +4866,11 @@ public class PurchaseMenu
         return SafeCurrency() >= price ? SkillNodeState.Affordable : SkillNodeState.TokenLocked;
     }
 
-    /// <summary>
-    /// One small caption per tier row, naming the row and nothing else (#258).
-    /// A shut tier reads a shade brighter than an open one so the band still
-    /// separates them, but the requirement itself belongs to the right
-    /// inspector, which states it whenever a gated node is selected.
-    /// </summary>
-    private static void BuildSkillTreeTierLabels(
-        Y4NGZSkillTreeDefinition tree,
-        int treeInvestment,
-        SkillTreeLayout layout)
-    {
-        if (tree == null || layout == null || _scrollContent == null)
-            return;
 
-        for (int i = 0; i < layout.TierRows.Count; i++)
-        {
-            (int tier, float top) = layout.TierRows[i];
-            int requirement = tree.GetGateRequirement(tier);
-            bool unlocked = requirement <= 0 || treeInvestment >= requirement;
 
-            var label = UI.MakeText("TierRowLabel_" + tier, _scrollContent,
-                "TIER " + tier, FontXs,
-                unlocked ? Palette.Alpha(Palette.Dim, 0.62f) : Palette.Locked,
-                TextAlignmentOptions.MidlineLeft);
-            label.fontStyle = FontStyles.Bold;
-            label.characterSpacing = 1f;
-            label.raycastTarget = false;
-            label.enableWordWrapping = false;
-            label.overflowMode = TextOverflowModes.Ellipsis;
-            label.enableAutoSizing = true;
-            label.fontSizeMin = FontMicro;
-            label.fontSizeMax = FontXs;
-
-            var rt = label.GetComponent<RectTransform>();
-            rt.anchorMin = new Vector2(0, 1);
-            rt.anchorMax = new Vector2(1, 1);
-            rt.offsetMin = new Vector2(TierLabelInset, -(top - Space1));
-            rt.offsetMax = new Vector2(-TierLabelInset, -(top - Space1 - TierLabelH));
-        }
-    }
-
-    private static int GetTreeInvestment(
-        Y4NGZSkillTreeClass treeClass,
+    private static int GetTreeInvestment(Y4NGZSkillTreeClass treeClass,
         Dictionary<string, Y4NGZUpgradeNode> upgradesById)
-    {
-        if (upgradesById == null || upgradesById.Count == 0)
-            return 0;
-
-        return Y4NGZUpgradeManager.GetSkillTreeNodes(treeClass)
-            .Sum(x => upgradesById.TryGetValue(x.UpgradeId, out Y4NGZUpgradeNode upgrade)
-                ? Mathf.Max(0, upgrade.GetCurrentLevel())
-                : 0);
-    }
+        => Y4NGZUpgradeManager.GetTreeInvestment(treeClass);
 
     private static void CycleSkillTree(int direction)
     {
@@ -5097,21 +4930,21 @@ public class PurchaseMenu
             case "escape_protocol":
                 return "Passive exit awareness. Every seven seconds, nearby exits will receive a dim outline when the player is within range.";
             case "quick_hands":
-                return "Faster hold and interact actions. This receives the interaction-speed behavior previously bundled into Sprinter.";
+                return "Faster hold interactions and longer reach.";
             case "deathbound":
                 return "Binds the far-left hotbar slot so its held item stays with the player through death and respawn.";
             case "field_operations":
                 return "Grants the Field Operations tablet.";
             case "turret_hacker":
-                return "Improves drill, pump, and battery field repairs, and adds on-site hacking of cameras, locked doors, and turrets.";
+                // WP12: the "drill, pump, and battery field repairs" claim was never implemented -
+                // F-TECH-10 deleted CanRepairBatteries and GetDrillPumpRepairSpeedMultiplier.
+                return "On-site hacking of locked doors and turrets.";
             case "courier_drone":
                 return "Deploys a courier drone companion. Toggle it between your position and the main entrance to retrieve nearby staged scrap.";
             case "buddy_system":
                 return "Nearby teammates receive scaling speed and damage-reduction bonuses while close to the upgraded player.";
             case "ping":
                 return "Uses the vanilla pointing behavior to mark locations or outline enemies, interactables, items, and traps for the crew.";
-            case "rally_call":
-                return "An active crew rally that grants nearby players speed and damage reduction, and breaks current Ghost Girl haunting on activation.";
             case "worklight_beacon":
                 return "Throws sticky worklight beacons that illuminate the area where they land.";
             case "inspire":
@@ -5119,61 +4952,6 @@ public class PurchaseMenu
             default:
                 return "This upgrade file is planned for a later implementation phase.";
         }
-    }
-
-    // Category header band. It reads as a calm surface break: slightly
-    // brighter fill and extra breathing room instead of ruler-line clutter.
-    private static void BuildSubCategoryHeader(
-        string subCategory, float yTop, float height, int fileCount, int purchasedLevels, int totalLevels)
-    {
-        if (!SubCategoryColors.TryGetValue(subCategory, out var accent))
-            accent = Palette.Accent;
-
-        const float pad = 4f;
-
-        var bar = new GameObject("SubCatHeader_" + subCategory);
-        bar.transform.SetParent(_scrollContent, false);
-        var barImg = bar.AddComponent<Image>();
-        barImg.color = new Color(
-            Mathf.Min(1f, Palette.BgHeader.r * 1.10f),
-            Mathf.Min(1f, Palette.BgHeader.g * 1.04f),
-            Mathf.Min(1f, Palette.BgHeader.b * 1.02f),
-            0.82f);
-        barImg.raycastTarget = false;
-        var barRt = barImg.rectTransform;
-        barRt.anchorMin = new Vector2(0, 1);
-        barRt.anchorMax = new Vector2(1, 1);
-        barRt.pivot     = new Vector2(0.5f, 1f);
-        barRt.offsetMin = new Vector2(pad,  -(yTop + height));
-        barRt.offsetMax = new Vector2(-pad, -yTop);
-        UI.AddPanelTexture(bar.transform, TexMid, subCategory.GetHashCode());
-        MakeAccentLine(bar.transform, "CategoryBottomWear",
-            new Vector2(0, 0), new Vector2(1, 0),
-            new Vector2(18, 2), new Vector2(-18, 5),
-            new Color(0f, 0f, 0f, 0.28f));
-
-        var label = UI.MakeText("Label", bar.transform,
-            subCategory.ToUpperInvariant(),
-            FontMd, new Color(accent.r, accent.g, accent.b, 0.96f),
-            TextAlignmentOptions.MidlineLeft);
-        label.fontStyle = FontStyles.Bold;
-        var lrt = label.GetComponent<RectTransform>();
-        lrt.anchorMin = new Vector2(0, 0);
-        lrt.anchorMax = new Vector2(0.56f, 1);
-        lrt.offsetMin = new Vector2(22, 0);
-        lrt.offsetMax = new Vector2(-8, 0);
-
-        string countLabel = fileCount == 1 ? "1 FILE" : fileCount + " FILES";
-        string levelLabel = totalLevels > 0 ? $"{purchasedLevels} / {totalLevels} LEVELS" : countLabel;
-        var meta = UI.MakeText("Meta", bar.transform,
-            countLabel + "    " + levelLabel,
-            FontSm, Palette.Dim, TextAlignmentOptions.MidlineRight);
-        var mrt = meta.GetComponent<RectTransform>();
-        mrt.anchorMin = new Vector2(0.56f, 0);
-        mrt.anchorMax = new Vector2(1, 1);
-        mrt.offsetMin = new Vector2(4, 0);
-        mrt.offsetMax = new Vector2(-16, 0);
-
     }
 
     private static void SetSelectedUpgradeRow(UpgradeRowVisual visual)
@@ -5228,13 +5006,6 @@ public class PurchaseMenu
             bool maxed          = upgrade.GetRemainingLevels() == 0;
             bool selected       = currentSelection != null
                 && string.Equals(currentSelection.Id, upgrade.Id, StringComparison.OrdinalIgnoreCase);
-
-            // Sub-category accent colour - overrides the legacy
-            // per-upgrade UpgradeColorType so row tints match the
-            // sub-category header. Falls back to the old palette only
-            // for upgrades not present in the sub-category mapping.
-            // Colour-group separator removed - sub-category headers now
-            // own the visual grouping (see BuildSubCategoryHeader).
 
             float yTop = yCursor;
 
@@ -5542,8 +5313,8 @@ public class PurchaseMenu
             _employeePreviewTicker = _employeePreviewRoot.GetComponent<EmployeePreviewTicker>();
     }
 
-    // TEMPORARY - blank-employee-preview investigation, see
-    // .planning/debug/model-replacement-employee-preview.md. Normally 0f, so the panel
+    // TEMPORARY - blank-employee-preview investigation (model-replacement employee
+    // preview renders empty). Normally 0f, so the panel
     // behind the render texture supplies the visible plate. Forced to 1f to make the
     // clear itself visible: if the panel becomes an opaque plate that is still empty the
     // camera IS rendering and the model is not being drawn (cause #3 or #4); if the
@@ -6068,8 +5839,8 @@ public class PurchaseMenu
     }
 
     /// <summary>
-    /// TEMPORARY - blank-employee-preview investigation, see
-    /// .planning/debug/model-replacement-employee-preview.md. Sits immediately before
+    /// TEMPORARY - blank-employee-preview investigation (model-replacement employee
+    /// preview renders empty). Sits immediately before
     /// Camera.Render, after every early-out in RenderEmployeePreviewIfDue, so the absence
     /// of the line is itself the signal. Read it as: no line at all -> the camera never
     /// renders (cause #1, the liveness compare invalidating every tick); zero active
@@ -6295,7 +6066,11 @@ public class PurchaseMenu
 
     private static void ClearDetailViewChildren()
     {
+        ClearInspectorFocusTargets();
         if (_detailView == null) return;
+        var oldScroll = _detailView.transform.Find("DescScroll")?.GetComponent<ScrollRect>();
+        if (oldScroll != null) _detailScrollPosition = ScrollPosition(oldScroll);
+        else { _detailScrollOwner = null; _detailScrollPosition = 1f; }
 
         foreach (Transform child in _detailView.transform)
         {
@@ -6332,16 +6107,7 @@ public class PurchaseMenu
             ? tree.DisplayName
             : "Upgrades";
 
-        var nameHdr = stack.Panel("ClassNameHdr", Palette.BgHeader, InspectorNameH);
-        UI.AddPanelTexture(nameHdr.transform, TexMid, displayName.GetHashCode());
-        AddBorder(nameHdr.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("ClassNameAccent", nameHdr.transform, Palette.Accent,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(4, 0));
-        TMP_Text nameText = UI.MakeText("ClassName", nameHdr.transform,
-            displayName, FontMd, Palette.Primary, TextAlignmentOptions.MidlineLeft);
-        nameText.fontStyle = FontStyles.Bold;
-        nameText.GetComponent<RectTransform>().offsetMin = new Vector2(14, 0);
+        BuildInspectorNameBand(stack, displayName, displayName.GetHashCode());
     }
 
     private static void RenderEmoteInspector()
@@ -6357,6 +6123,7 @@ public class PurchaseMenu
         bool hasSelection = selObj != null;
         bool owned = false;
         int price = 0;
+        bool priceResolved = false;
         string selectedName = hasSelection ? "SELECTED EMOTE" : "SELECT EMOTE";
         string tierName = "";
         Color titleColor = hasSelection ? Palette.Primary : Palette.Dim;
@@ -6374,25 +6141,17 @@ public class PurchaseMenu
                     selectedName = Humanize(e.displayName);
                     tierName = e.rarityName;
                     price = GetEmotePriceForRarity(e.rarity);
+                    priceResolved = true;
                     titleColor = e.rarityColor;
                     break;
                 }
             }
         }
 
-        var nameHdr = stack.Panel("EmoteNameHdr", Palette.BgHeader, InspectorNameH);
-        UI.AddPanelTexture(nameHdr.transform, TexMid, selectedName.GetHashCode());
-        AddBorder(nameHdr.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("NameAccent", nameHdr.transform, titleColor,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(5, 0));
-        UI.MakeText("Name", nameHdr.transform,
-            selectedName, FontMd, titleColor,
-            TextAlignmentOptions.MidlineLeft)
-            .GetComponent<RectTransform>().offsetMin = new Vector2(16, 0);
+        BuildInspectorNameBand(stack, selectedName, selectedName.GetHashCode());
 
         int curBxp = SafeCurrency();
-        bool canAfford = hasSelection && !owned && price > 0 && curBxp >= price;
+        bool canAfford = hasSelection && !owned && priceResolved && curBxp >= price;
         var statusBand = BuildInspectorBand(stack, "EmoteStatusBand",
             Palette.Alpha(Palette.BgRow, 1f));
         AddInspectorMetric(statusBand.transform, 0, 3, "TIER",
@@ -6402,7 +6161,9 @@ public class PurchaseMenu
             !hasSelection ? "WAITING" : owned ? "OWNED" : "LOCKED",
             owned ? Palette.Gold : hasSelection ? Palette.Body : Palette.Dim);
         AddInspectorMetric(statusBand.transform, 2, 3, "COST",
-            hasSelection && !owned ? FormatMarks(price) : owned ? "COMPLETE" : "--",
+            hasSelection && !owned && priceResolved
+                ? FormatPurchasePrice(price)
+                : owned ? "COMPLETE" : "--",
             canAfford || owned ? Palette.Gold : Palette.Warning);
 
         string bodyText;
@@ -6410,10 +6171,12 @@ public class PurchaseMenu
             bodyText = "Select an emote from the list to preview it here.";
         else if (owned)
             bodyText = "Owned. Selecting or equipping emotes will use this employee render.";
+        else if (!priceResolved)
+            bodyText = "The selected emote is no longer available from its provider.";
         else if (canAfford)
-            bodyText = $"{tierName.ToUpperInvariant()} FILE READY\nCost: {FormatMarks(price)}";
+            bodyText = $"{tierName.ToUpperInvariant()} FILE READY\nCost: {FormatPurchasePrice(price)}";
         else
-            bodyText = $"{tierName.ToUpperInvariant()} FILE LOCKED\nCost: {FormatMarks(price)}\nAvailable: {FormatMarks(curBxp)}";
+            bodyText = $"{tierName.ToUpperInvariant()} FILE LOCKED\nCost: {FormatPurchasePrice(price)}\nAvailable: {FormatMarks(curBxp)}";
 
         var msg = UI.MakeText("EmoteInspectorMessage", _detailView.transform,
             bodyText, FontMd, Palette.Body, TextAlignmentOptions.TopLeft);
@@ -6436,22 +6199,30 @@ public class PurchaseMenu
             buttonHl = PurchaseButtonHover(false);
             buttonText = Palette.Gold;
         }
+        else if (!priceResolved)
+        {
+            buttonLabel = "PRICE UNAVAILABLE";
+            buttonBg = PurchaseButtonBg(false);
+            buttonHl = PurchaseButtonHover(false);
+            buttonText = Palette.Dim;
+        }
         else
         {
-            buttonLabel = $"PURCHASE  {FormatMarks(price)}";
+            buttonLabel = $"PURCHASE  {FormatPurchasePrice(price)}";
             buttonBg = PurchaseButtonBg(canAfford);
             buttonHl = PurchaseButtonHover(canAfford);
             buttonText = canAfford ? Palette.Accent : Palette.Warning;
         }
 
-        var (buyBtn, _buyLbl) = UI.MakeButton(
+        var (buyBtn, buyLbl) = UI.MakeButton(
             "EmotePurchaseBtn", _detailView.transform,
             buttonLabel, FontSm, buttonBg, buttonHl, buttonText,
             new Vector2(0, 0), new Vector2(1, 0),
             new Vector2(Space2, Space2), new Vector2(-Space2, InspectorFootH));
         AddButtonDepth(buyBtn.gameObject, selectedName.GetHashCode());
         UI.AddPanelTexture(buyBtn.transform, TexMid, selectedName.GetHashCode());
-        buyBtn.interactable = canAfford;
+        SetPurchaseButtonInteractable(buyBtn, buyLbl, canAfford);
+        RegisterInspectorAction(buyBtn, "emote");
         buyBtn.onClick.AddListener(() =>
         {
             if (!canAfford) { MenuAudio.PlayDeny(); return; }
@@ -6471,10 +6242,11 @@ public class PurchaseMenu
         string selectedId = _selectedCosmeticForPurchase;
         bool hasSelection = !string.IsNullOrEmpty(selectedId);
         var data = PlayerLevelStore.Get();
-        int price = Mathf.Max(0, Plugin.CosmeticPrice.Value);
+        int price = ResolvePurchasePrice(Plugin.CosmeticPrice.Value);
         int curTokens = SafeCurrency();
-        bool owned = hasSelection && data.cosmetics.Contains(selectedId);
-        bool equipped = owned && IsMoreCompanyCosmeticEquipped(selectedId);
+        _cosmeticState ??= CosmeticStateService.Capture();
+        bool owned = hasSelection && _cosmeticState.IsOwned(selectedId);
+        bool equipped = hasSelection && _cosmeticState.IsEquipped(selectedId);
         bool canAfford = hasSelection && !owned && curTokens >= price;
 
         string selectedName = hasSelection
@@ -6483,22 +6255,8 @@ public class PurchaseMenu
         string typeName = hasSelection && !string.IsNullOrEmpty(_selectedCosmeticTypeLabel)
             ? _selectedCosmeticTypeLabel
             : "COSMETIC";
-        Color titleColor = !hasSelection
-            ? Palette.Dim
-            : owned
-                ? (equipped ? Palette.Gold : Palette.Primary)
-                : canAfford ? Palette.Sale : Palette.Warning;
 
-        var nameHdr = stack.Panel("CosmeticNameHdr", Palette.BgHeader, InspectorNameH);
-        UI.AddPanelTexture(nameHdr.transform, TexMid, selectedName.GetHashCode());
-        AddBorder(nameHdr.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("NameAccent", nameHdr.transform, titleColor,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(5, 0));
-        UI.MakeText("Name", nameHdr.transform,
-            selectedName, FontMd, titleColor,
-            TextAlignmentOptions.MidlineLeft)
-            .GetComponent<RectTransform>().offsetMin = new Vector2(16, 0);
+        BuildInspectorNameBand(stack, selectedName, selectedName.GetHashCode());
 
         var statusBand = BuildInspectorBand(stack, "CosmeticStatusBand",
             Palette.Alpha(Palette.BgRow, 1f));
@@ -6509,20 +6267,20 @@ public class PurchaseMenu
             !hasSelection ? "WAITING" : equipped ? "EQUIPPED" : owned ? "OWNED" : "LOCKED",
             equipped || owned ? Palette.Gold : hasSelection ? Palette.Body : Palette.Dim);
         AddInspectorMetric(statusBand.transform, 2, 3, "COST",
-            hasSelection && !owned ? FormatMarks(price) : owned ? "COMPLETE" : "--",
+            hasSelection && !owned ? FormatPurchasePrice(price) : owned ? "COMPLETE" : "--",
             canAfford || owned ? Palette.Gold : Palette.Warning);
 
         string bodyText;
         if (!hasSelection)
             bodyText = "Select a cosmetic file from the grid.";
         else if (equipped)
-            bodyText = "Equipped on the employee render.";
+            bodyText = "Currently equipped.";
         else if (owned)
             bodyText = "Unlocked in this save.";
         else if (canAfford)
-            bodyText = $"COSMETIC FILE READY\nCost: {FormatMarks(price)}";
+            bodyText = $"COSMETIC FILE READY\nCost: {FormatPurchasePrice(price)}";
         else
-            bodyText = $"COSMETIC FILE LOCKED\nCost: {FormatMarks(price)}\nAvailable: {FormatMarks(curTokens)}";
+            bodyText = $"COSMETIC FILE LOCKED\nCost: {FormatPurchasePrice(price)}\nAvailable: {FormatMarks(curTokens)}";
 
         var msg = UI.MakeText("CosmeticInspectorMessage", _detailView.transform,
             bodyText, FontMd, Palette.Body, TextAlignmentOptions.TopLeft);
@@ -6540,31 +6298,43 @@ public class PurchaseMenu
         }
         else if (owned)
         {
-            buttonLabel = equipped ? "- EQUIPPED -" : "- OWNED -";
-            buttonBg = PurchaseButtonBg(false);
-            buttonHl = PurchaseButtonHover(false);
+            buttonLabel = equipped ? "UNEQUIP" : "EQUIP";
+            buttonBg = PurchaseButtonBg(true);
+            buttonHl = PurchaseButtonHover(true);
             buttonText = Palette.Gold;
         }
         else
         {
-            buttonLabel = $"PURCHASE  {FormatMarks(price)}";
+            buttonLabel = $"PURCHASE  {FormatPurchasePrice(price)}";
             buttonBg = PurchaseButtonBg(canAfford);
             buttonHl = PurchaseButtonHover(canAfford);
             buttonText = canAfford ? Palette.Accent : Palette.Warning;
         }
 
-        var (buyBtn, _buyLbl) = UI.MakeButton(
+        var (buyBtn, buyLbl) = UI.MakeButton(
             "CosmeticPurchaseBtn", _detailView.transform,
             buttonLabel, FontSm, buttonBg, buttonHl, buttonText,
             new Vector2(0, 0), new Vector2(1, 0),
             new Vector2(Space2, Space2), new Vector2(-Space2, InspectorFootH));
         AddButtonDepth(buyBtn.gameObject, selectedName.GetHashCode());
         UI.AddPanelTexture(buyBtn.transform, TexMid, selectedName.GetHashCode());
-        buyBtn.interactable = canAfford;
+        SetPurchaseButtonInteractable(buyBtn, buyLbl,
+            hasSelection && (equipped || _cosmeticState.Ready) && (owned || canAfford));
+        RegisterInspectorAction(buyBtn, "cosmetic");
+        string selectedScope = _cosmeticState.ScopeKey;
         buyBtn.onClick.AddListener(() =>
         {
-            if (!canAfford) { MenuAudio.PlayDeny(); return; }
-            PurchaseSelectedCosmetic();
+            var live = CosmeticStateService.Capture();
+            if (!string.Equals(live.ScopeKey, selectedScope, StringComparison.Ordinal) ||
+                live.IsEquipped(selectedId) != equipped || live.IsOwned(selectedId) != owned)
+            { MenuAudio.PlayDeny(); showPlayerLevel(); return; }
+            if (equipped || owned)
+            {
+                ToggleMoreCompanyCosmeticSelection(selectedId);
+                MenuAudio.PlayClick();
+                RefreshPlayerLevelAfterCosmeticChange();
+            }
+            else PurchaseSelectedCosmetic(selectedId, selectedScope, price);
         });
     }
 
@@ -6648,6 +6418,32 @@ public class PurchaseMenu
         return band;
     }
 
+    /// <summary>
+    /// The selected item's name, the same way in every inspector: uppercase and
+    /// bold on the header plate behind an accent marker, shrinking from FontMdLg
+    /// to FontSm before it ellipsizes. It carries no state colour; affordability
+    /// lives in the COST metric and the button.
+    /// </summary>
+    private static GameObject BuildInspectorNameBand(InspectorStack stack, string name, int seed)
+    {
+        var band = stack.Panel("NameHdr", Palette.BgHeader, InspectorNameH);
+        UI.AddPanelTexture(band.transform, TexMid, seed);
+        AddBorder(band.transform, 3f, 0f, Palette.BorderDim);
+        UI.MakePanel("NameAccent", band.transform, Palette.Accent,
+            new Vector2(0, 0), new Vector2(0, 1),
+            new Vector2(0, 0), new Vector2(4, 0));
+        var text = UI.MakeText("Name", band.transform, (name ?? "").ToUpperInvariant(),
+            FontMdLg, Palette.Primary, TextAlignmentOptions.MidlineLeft);
+        text.fontStyle = FontStyles.Bold;
+        text.enableWordWrapping = false;
+        text.overflowMode = TextOverflowModes.Ellipsis;
+        text.enableAutoSizing = true;
+        text.fontSizeMin = FontSm;
+        text.fontSizeMax = FontMdLg;
+        text.rectTransform.offsetMin = new Vector2(14, 0);
+        return band;
+    }
+
     private static void AddInspectorMetric(
         Transform parent, int index, int total, string label, string value, Color valueColor)
     {
@@ -6716,7 +6512,9 @@ public class PurchaseMenu
 
         currentSelection = currentUpgrade;
         _selectedSkillTreeNodeId = skillNode?.UpgradeId ?? currentUpgrade.Id;
-        location = nameof(showUpgrades) + "," + currentUpgrade.SharedUpgrade;
+        location = _augmentsActive
+            ? nameof(showAugments)
+            : nameof(showUpgrades) + "," + currentUpgrade.SharedUpgrade;
         if (_detailView == null) return;
         _detailView.SetActive(true);
 
@@ -6736,17 +6534,7 @@ public class PurchaseMenu
             : currentUpgrade.Name;
 
         Color detailTypeColor = Palette.Accent;
-        var nameHdr = stack.Panel("NameHdr", Palette.BgHeader, InspectorNameH);
-        UI.AddPanelTexture(nameHdr.transform, TexMid, displayName.GetHashCode());
-        AddBorder(nameHdr.transform, 3f, 0f, Palette.BorderDim);
-        UI.MakePanel("NameAccent", nameHdr.transform, Palette.Accent,
-            new Vector2(0, 0), new Vector2(0, 1),
-            new Vector2(0, 0), new Vector2(4, 0));
-        UI.MakeText("Name", nameHdr.transform,
-            displayName, FontMd, Palette.Primary,
-            TextAlignmentOptions.MidlineLeft)
-            .GetComponent<RectTransform>().offsetMin = new Vector2(14, 0);
-
+        BuildInspectorNameBand(stack, displayName, displayName.GetHashCode());
 
         // - Build description: stats + world-building -
         string statsText  = "";
@@ -6767,17 +6555,52 @@ public class PurchaseMenu
             new Vector2(-InspectorSide, -stack.Cursor),
             addScrollbar: true);
         var descBg = descScroll.AddComponent<Image>();
-        descBg.color = Palette.BgInput;
+        descBg.color = Palette.Alpha(Palette.BgInput, 0.94f);
         descBg.raycastTarget = false;
         UI.AddPanelTexture(descScroll.transform, TexFaint, currentUpgrade.Name.GetHashCode() ^ 0x57C4);
         AddBorder(descScroll.transform, 3f, 0f, Palette.BorderDim);
 
         // Stats section (per-level info) - orange accent
         float descY = 0f;
+        string activationTip = AbilityControlTips.Instruction(currentUpgrade.Id);
+        if (!string.IsNullOrEmpty(activationTip))
+        {
+            var controls = UI.MakeText("AbilityControls", descContent, activationTip, FontMd, Palette.Body,
+                TextAlignmentOptions.MidlineLeft);
+            controls.rectTransform.anchorMin = new Vector2(0, 1);
+            controls.rectTransform.anchorMax = new Vector2(1, 1);
+            controls.rectTransform.offsetMin = new Vector2(10f, -32f);
+            controls.rectTransform.offsetMax = new Vector2(-10f, 0f);
+            descY = 34f;
+        }
+        descY = AddAbilityInspectorStatus(descContent, currentUpgrade.Id, descY);
+        // The button reports the tier gate before the prerequisite, so a node in a locked
+        // tier would never name what it needs. This line does, whatever the gate says.
+        if (skillNode?.PrerequisiteUpgradeIds != null && skillNode.PrerequisiteUpgradeIds.Count > 0)
+        {
+            bool prerequisiteMet = !Y4NGZUpgradeManager.IsPrerequisiteLocked(skillNode, 0);
+            var requires = UI.MakeText("Requires", descContent,
+                "REQUIRES: " + Y4NGZUpgradeManager.GetPrerequisiteDisplayName(skillNode).ToUpperInvariant(),
+                FontSm, prerequisiteMet ? Palette.Gold : Palette.Muted, TextAlignmentOptions.MidlineLeft);
+            requires.enableWordWrapping = false;
+            requires.overflowMode = TextOverflowModes.Ellipsis;
+            requires.rectTransform.anchorMin = new Vector2(0, 1);
+            requires.rectTransform.anchorMax = new Vector2(1, 1);
+            requires.rectTransform.offsetMin = new Vector2(10f, -(descY + 24f));
+            requires.rectTransform.offsetMax = new Vector2(-10f, -descY);
+            descY += 26f;
+        }
         if (levelDetails.Count > 0)
         {
-            descY = BuildUpgradeLevelDetailRows(
-                descContent,
+            var levelRoot = new GameObject("LevelRows", typeof(RectTransform)).GetComponent<RectTransform>();
+            levelRoot.SetParent(descContent, false);
+            levelRoot.anchorMin = new Vector2(0, 1);
+            levelRoot.anchorMax = new Vector2(1, 1);
+            levelRoot.pivot = new Vector2(0.5f, 1f);
+            levelRoot.sizeDelta = new Vector2(0f, 0f);
+            levelRoot.anchoredPosition = new Vector2(0f, -descY);
+            descY += BuildUpgradeLevelDetailRows(
+                levelRoot,
                 levelDetails,
                 summaryText,
                 detailTypeColor);
@@ -6798,8 +6621,8 @@ public class PurchaseMenu
             statsTmp.ForceMeshUpdate();
             float statsH = statsTmp.preferredHeight + 12f;
             statsRt.sizeDelta = new Vector2(-12f, statsH);
-            statsRt.anchoredPosition = new Vector2(0, -6f);
-            descY = statsH + 12f;
+            statsRt.anchoredPosition = new Vector2(0, -(descY + 6f));
+            descY += statsH + 12f;
         }
 
         // World-building text follows with whitespace instead of another rule.
@@ -6838,15 +6661,16 @@ public class PurchaseMenu
             descText.ForceMeshUpdate();
             float fbH = descText.preferredHeight + 12f;
             fallbackRt.sizeDelta = new Vector2(-12f, fbH);
-            fallbackRt.anchoredPosition = new Vector2(0, -6f);
-            descY = fbH + 12f;
+            fallbackRt.anchoredPosition = new Vector2(0, -(descY + 6f));
+            descY += fbH + 12f;
         }
 
         // Set scroll content height
         var descCrt = descContent.GetComponent<RectTransform>();
         descCrt.sizeDelta = new Vector2(0, descY + 8f);
         var descSR = descScroll.GetComponent<ScrollRect>();
-        UI.ResetScrollToTop(descSR, descCrt);
+        RestoreScroll(descSR, _detailScrollOwner == currentUpgrade.Id ? _detailScrollPosition : 1f);
+        _detailScrollOwner = currentUpgrade.Id;
 
         // button row at bottom
         float btnY  = 8f;
@@ -6864,7 +6688,7 @@ public class PurchaseMenu
         }
         else if (gateLocked && skillNode != null)
         {
-            btnLabel = $"LOCKED  {treeInvestment}/{skillNode.GateRequirement} TREE LEVELS";
+            btnLabel = FormatClassLevelLock(treeInvestment, skillNode.GateRequirement);
             btnBg    = PurchaseButtonBg(false);
             btnHl    = PurchaseButtonHover(false);
             btnTxt   = Palette.Muted;
@@ -6878,7 +6702,7 @@ public class PurchaseMenu
         }
         else
         {
-            btnLabel = $"PURCHASE  {FormatMarks(effectivePrice)}";
+            btnLabel = $"PURCHASE  {FormatPurchasePrice(effectivePrice)}";
             btnBg    = PurchaseButtonBg(canAfford);
             btnHl    = PurchaseButtonHover(canAfford);
             btnTxt   = canAfford ? Palette.Accent : Palette.Warning;
@@ -6893,7 +6717,7 @@ public class PurchaseMenu
         AddButtonDepth(purchaseBtn.gameObject, displayName.GetHashCode());
         UI.AddPanelTexture(purchaseBtn.transform, TexMid, displayName.GetHashCode());
 
-        purchaseBtn.interactable = !maxed && !gateLocked && !prerequisiteLocked;
+        SetPurchaseButtonInteractable(purchaseBtn, purchaseLbl, !maxed && !gateLocked && !prerequisiteLocked);
 
         if (hasNotice)
         {
@@ -6908,6 +6732,7 @@ public class PurchaseMenu
             noticeRt.offsetMax = new Vector2(-14, PurchaseNoticeTop - 2f);
         }
 
+        RegisterInspectorAction(purchaseBtn, "upgrade");
         purchaseBtn.onClick.AddListener(() =>
         {
             if (gateLocked)
@@ -6932,18 +6757,32 @@ public class PurchaseMenu
                 // danger red even though the resting wallet color is themed.
                 PulseCurrency(Palette.Danger);
                 SetPurchaseNotice(currentUpgrade.Id, "NOT ENOUGH TOKENS", Palette.Warning);
-                showUpgrades(currentUpgrade.SharedUpgrade, resetScroll: false);
+                ShowActiveUpgradeCatalog(currentUpgrade.SharedUpgrade);
                 return;
             }
 
             // Read the tier at click time, like the price above, so the tier the sound announces
             // is the tier actually bought. The jingle only plays once the purchase went through.
             int purchasedTier = currentUpgrade.GetCurrentLevel() + 1;
+            int investmentBefore = skillNode == null ? 0 : Y4NGZUpgradeManager.GetTreeInvestment(skillNode.TreeClass);
             Plugin.ExtendedLogging($"Purchasing: {currentUpgrade.Name}");
-            Y4NGZUpgradePurchaseResult result =
-                UpgradeApi.TriggerUpgradeRankup(currentUpgrade, quotedPrice);
+            // A successful rankup raises UpgradesChanged from inside this call. The rebuild that
+            // event drives would destroy this very button mid-click, so it stands down while
+            // _purchasing is set and the repaint at the end of this handler covers it (#435).
+            Y4NGZUpgradePurchaseResult result;
+            _purchasing = true;
+            try
+            {
+                result = UpgradeApi.TriggerUpgradeRankup(currentUpgrade, quotedPrice);
+            }
+            finally
+            {
+                _purchasing = false;
+            }
             if (result == Y4NGZUpgradePurchaseResult.Success)
             {
+                if (skillNode != null) RecordTierUnlocks(skillNode.TreeClass, investmentBefore);
+                if (purchasedTier == 1) AbilityControlTips.Queue(currentUpgrade.Id);
                 ClearPurchaseNotice();
                 MenuAudio.PlayPurchase(purchasedTier);
                 PulseCurrency(Palette.Gold);
@@ -6952,13 +6791,14 @@ public class PurchaseMenu
             {
                 MenuAudio.PlayDeny();
                 PulseCurrency(Palette.Danger);
-                SetPurchaseNotice(currentUpgrade.Id, DescribePurchaseFailure(result), Palette.Danger);
+                SetPurchaseNotice(currentUpgrade.Id,
+                    DescribePurchaseFailure(result, currentUpgrade.Id), Palette.Danger);
             }
 
             RefreshCurrencyDisplay();
             // Always re-render: a failed attempt must repaint the price label it was refused
             // against, not leave the stale quote on screen.
-            showUpgrades(currentUpgrade.SharedUpgrade, resetScroll: false);
+            ShowActiveUpgradeCatalog(currentUpgrade.SharedUpgrade);
         });
     }
 
@@ -7489,6 +7329,9 @@ public class PurchaseMenu
     // tab/category/tier switches pass true.
     public static void showPlayerLevel(bool resetScroll = false)
     {
+        float previousScroll = !resetScroll && _renderedCosCategory == _activeCosCategory
+            ? ScrollPosition(_cosScrollRect) : 1f;
+        _cosmeticState = CosmeticStateService.Capture();
         currentSelection = null;
         location = nameof(showPlayerLevel);
         _activeView = () => showPlayerLevel(resetScroll: false);
@@ -7534,7 +7377,7 @@ public class PurchaseMenu
         else if (_activeCosCategory == CosCatCosmetics)
             RenderCosmeticInspector();
         else
-            RenderInspectorPlaceholder(_activeCosCategory, "Inspecting or equipping player items will use this employee render.");
+            RenderSuitInspector();
 
         // - Right-hand content area (per-category) -
         var contentArea = new GameObject("CosContentArea");
@@ -7546,6 +7389,7 @@ public class PurchaseMenu
         carea.offsetMax = new Vector2(0, 0);
 
         float scrollLeftOffset = 0f;
+        if (_activeCosCategory == CosCatCosmetics) BuildCosmeticFilters(contentArea.transform);
 
         // Per-category scroll view - own ScrollRect, own content,
         // resets to top on every showPlayerLevel call.
@@ -7553,8 +7397,8 @@ public class PurchaseMenu
         var (scrollGo, scrollContent) = UI.MakeScrollView("CosScroll",
             contentArea.transform,
             new Vector2(0, 0), new Vector2(1, 1),
-            new Vector2(scrollLeftOffset, 0), new Vector2(0, 0),
-            addScrollbar: _activeCosCategory == CosCatCosmetics || _activeCosCategory == CosCatEmotes);
+            new Vector2(scrollLeftOffset, 0), new Vector2(0, _activeCosCategory == CosCatCosmetics ? -CosmeticListTop : 0f),
+            addScrollbar: true);
         _cosScrollContent = scrollContent;
         _cosScrollRect    = scrollGo.GetComponent<ScrollRect>();
 
@@ -7570,7 +7414,8 @@ public class PurchaseMenu
 
         var contentRt = scrollContent.GetComponent<RectTransform>();
         contentRt.sizeDelta = new Vector2(0, yCursor + 6f);
-        if (resetScroll) ResetScrollForRebuild(_cosScrollRect, contentRt);
+        RestoreScroll(_cosScrollRect, previousScroll);
+        _renderedCosCategory = _activeCosCategory;
 
         CommitFocusTargets();
     }
@@ -7684,8 +7529,8 @@ public class PurchaseMenu
     }
 
     // - Player level: suits section (single column, full-width rows) -
-    // Returns the new yCursor. Rows are full-width to mirror the
-    // ENHANCEMENTS row geometry - same height (RowH) and same fill style.
+    // Returns the new yCursor. Full-width rows at the Employee File record
+    // height, uppercase names, with the ownable row's fill style.
     private static float BuildSuitsSection(Transform content, float yCursor)
     {
         var sor = StartOfRound.Instance;
@@ -7713,40 +7558,37 @@ public class PurchaseMenu
         }
 
         var data  = PlayerLevelStore.Get();
-        int price = Mathf.Max(0, Plugin.SuitPrice.Value);
+        int price = ResolvePurchasePrice(Plugin.SuitPrice.Value);
         int bxp   = SafeCurrency();
 
         const float pad = 4f;
-        const float spacing = 3f;
+        const float spacing = Space1;
         for (int idx = 0; idx < suits.Count; idx++)
         {
             int    unlockableId = suits[idx].unlockableId;
             string suitName     = suits[idx].name;
-            bool   owned        = suits[idx].isDefault || data.suits.Contains(suitName);
-            string ownedRight   = "[OWNED]";
+            bool equipped = sor.localPlayerController != null && sor.localPlayerController.currentSuitID == unlockableId;
+            bool   owned        = equipped || suits[idx].isDefault || data.suits.Contains(suitName, StringComparer.OrdinalIgnoreCase);
+            string ownedRight   = equipped ? "[EQUIPPED]" : "[OWNED]";
 
+            // The row shows the name uppercased; the focus key below stays on the
+            // raw suit name so it never changes with presentation.
             var (suitBtn, _) = BuildOwnableRow(
-                content, "Suit_" + suitName, suitName, ownedRight,
+                content, "Suit_" + suitName, suitName.ToUpperInvariant(), ownedRight,
                 price, owned, /*highlightOwned*/ false, bxp,
                 yCursor, pad,
                 onActivateOwned: () =>
                 {
-                    MenuAudio.PlayClick();
-                    TrySwitchSuit(unlockableId);
-                    showPlayerLevel();
+                    SelectSuitForInspection(unlockableId);
                 },
                 onPurchase: () =>
                 {
-                    if (!TryDeductCurrency(price)) { MenuAudio.PlayDeny(); return; }
-                    MenuAudio.PlayPurchaseRandom();
-                    if (!data.suits.Contains(suitName)) data.suits.Add(suitName);
-                    PlayerLevelStore.Save();
-                    showPlayerLevel();
-                });
+                    SelectSuitForInspection(unlockableId);
+                }, selected: _selectedSuitId == unlockableId, rowHeight: RecordRowH);
             RegisterFocusTarget("suit:" + suitName,
                 suitBtn != null ? suitBtn.GetComponent<RectTransform>() : null,
                 suitBtn, idx, 0, _cosScrollRect);
-            yCursor += RowH + spacing;
+            yCursor += RecordRowH + spacing;
         }
         return yCursor;
     }
@@ -7776,7 +7618,7 @@ public class PurchaseMenu
 
         var selectedList = _mcSelectedField?.GetValue(null) as IList;
         var data         = PlayerLevelStore.Get();
-        int price        = Mathf.Max(0, Plugin.CosmeticPrice.Value);
+        int price        = ResolvePurchasePrice(Plugin.CosmeticPrice.Value);
         int bxp          = SafeCurrency();
         var cards = new List<(string cosmeticId, string label, string typeLabel, Texture2D iconTex, bool owned, bool equipped, bool selected)>();
         foreach (DictionaryEntry entry in rawDict)
@@ -7802,8 +7644,9 @@ public class PurchaseMenu
                 catch { }
             }
 
-            bool   owned      = data.cosmetics.Contains(cosmeticId);
-            bool   equipped   = owned && IsMoreCompanyCosmeticEquipped(cosmeticId, selectedList);
+            bool   owned      = _cosmeticState.IsOwned(cosmeticId);
+            bool   equipped   = _cosmeticState.IsEquipped(cosmeticId);
+            if (_cosmeticFilter == "OWNED" && !owned || _cosmeticFilter == "EQUIPPED" && !equipped) continue;
             string prettyId   = GetCosmeticDisplayName(cosmeticId, entry.Value, iconTex, typeStr, out bool fromTypeFallback);
             string prettyType = HumanizeCosmeticType(typeStr);
             string label      = !string.IsNullOrEmpty(prettyType)
@@ -7817,7 +7660,13 @@ public class PurchaseMenu
             cards.Add((cosmeticId, label, prettyType, iconTex, owned, equipped, selected));
         }
 
-        if (cards.Count == 0) return yCursor + 18f;
+        cards = cards.OrderBy(x => x.label, StringComparer.OrdinalIgnoreCase).ToList();
+        if (cards.Count == 0)
+        {
+            var empty = UI.MakeText("NoMatchingCosmetics", content, "No cosmetics in this filter.", FontMd, Palette.Body);
+            empty.rectTransform.sizeDelta = new Vector2(0f, 40f);
+            return yCursor + 40f;
+        }
 
         const int columns = 3;
         const float pad = 4f;
@@ -7871,37 +7720,25 @@ public class PurchaseMenu
         Color statusColor;
         string statusText;
 
-        if (selected && !owned)
+        // Only the price speaks to affordability. A whole grid tinted Warning at zero
+        // tokens read as a wall of errors, so unowned cards keep the neutral plate.
+        if (owned)
         {
-            Color c = bxp >= price ? Palette.Sale : Palette.Warning;
-            float tint = bxp >= price ? 0.16f : 0.075f;
-            normalCol = new Color(c.r * tint, c.g * tint, c.b * tint, 0.76f);
-            hoverCol = new Color(c.r * (tint + 0.08f), c.g * (tint + 0.08f), c.b * (tint + 0.08f), 0.84f);
-            labelColor = bxp >= price ? Palette.Primary : Palette.Dim;
-            statusColor = bxp >= price ? Palette.Sale : Palette.Warning;
-            statusText = FormatMarks(price);
-        }
-        else if (owned)
-        {
-            Color g = Palette.Gold;
-            float tint = equipped ? 0.22f : 0.13f;
+            float tint = equipped ? 0.22f : 0.14f;
             float alpha = equipped ? 0.78f : 0.62f;
-            normalCol = new Color(g.r * tint, g.g * tint, g.b * tint, alpha);
-            hoverCol = new Color(g.r * (tint + 0.08f), g.g * (tint + 0.08f), g.b * (tint + 0.08f),
-                Mathf.Min(1f, alpha + 0.08f));
+            normalCol = Palette.Shade(Palette.Gold, tint, alpha);
+            hoverCol = Palette.Shade(Palette.Gold, tint + 0.08f, Mathf.Min(1f, alpha + 0.08f));
             labelColor = Palette.Primary;
             statusColor = Palette.Gold;
             statusText = equipped ? "EQUIPPED" : "OWNED";
         }
         else
         {
-            Color c = canAfford ? Palette.Sale : Palette.Warning;
-            float tint = canAfford ? 0.10f : 0.055f;
-            normalCol = new Color(c.r * tint, c.g * tint, c.b * tint, canAfford ? 0.68f : 0.52f);
-            hoverCol = new Color(c.r * (tint + 0.08f), c.g * (tint + 0.08f), c.b * (tint + 0.08f), 0.78f);
-            labelColor = canAfford ? Palette.Primary : Palette.Dim;
+            normalCol = Palette.Alpha(Palette.BgInput, selected ? FillPlate : FillBand);
+            hoverCol = Palette.Alpha(Palette.BgRowHover, FillStrong);
+            labelColor = Palette.Primary;
             statusColor = canAfford ? Palette.Sale : Palette.Warning;
-            statusText = FormatMarks(price);
+            statusText = FormatPurchasePrice(price);
         }
 
         var card = new GameObject("CosCard_" + cosmeticId);
@@ -7918,7 +7755,7 @@ public class PurchaseMenu
         AddBorder(card.transform, 2f, 0f,
             equipped || selected
                 ? Palette.Gold
-                : new Color(Palette.Accent.r, Palette.Accent.g, Palette.Accent.b, 0.42f));
+                : Palette.Alpha(Palette.Accent, FillMuted));
 
         var btn = card.AddComponent<Button>();
         var cb = btn.colors;
@@ -7994,14 +7831,6 @@ public class PurchaseMenu
         btn.onClick.AddListener(() =>
         {
             SelectCosmeticForInspection(capturedId, capturedLabel, capturedType);
-
-            if (owned)
-            {
-                MenuAudio.PlayClick();
-                ToggleMoreCompanyCosmeticSelection(capturedId);
-                RefreshPlayerLevelAfterCosmeticChange();
-                return;
-            }
 
             MenuAudio.PlayClick();
             showPlayerLevel();
@@ -8195,16 +8024,21 @@ public class PurchaseMenu
         return yCursor;
     }
 
-    private static void PurchaseSelectedCosmetic()
+    private static void PurchaseSelectedCosmetic(string cosmeticId, string quotedScope, int quotedPrice)
     {
-        string cosmeticId = _selectedCosmeticForPurchase;
         if (string.IsNullOrEmpty(cosmeticId)) { MenuAudio.PlayDeny(); return; }
 
+        var live = CosmeticStateService.Capture();
+        if (!live.Ready || !SaveKey.TryGetCurrent(out string scope) || scope != quotedScope ||
+            !string.Equals(live.ScopeKey, quotedScope, StringComparison.Ordinal) ||
+            !live.KnownIds.Contains(cosmeticId, StringComparer.OrdinalIgnoreCase))
+        { MenuAudio.PlayDeny(); return; }
         var data = PlayerLevelStore.Get();
         data.cosmetics ??= new List<string>();
-        if (data.cosmetics.Contains(cosmeticId)) { MenuAudio.PlayDeny(); return; }
+        if (live.IsOwned(cosmeticId)) { MenuAudio.PlayDeny(); return; }
 
-        int price = Mathf.Max(0, Plugin.CosmeticPrice.Value);
+        int price = ResolvePurchasePrice(Plugin.CosmeticPrice.Value);
+        if (price != quotedPrice) { MenuAudio.PlayDeny(); showPlayerLevel(); return; }
         if (!TryDeductCurrency(price)) { MenuAudio.PlayDeny(); return; }
 
         MenuAudio.PlayPurchaseRandom();
@@ -8225,6 +8059,7 @@ public class PurchaseMenu
         if (TmeIsEmoteUnlocked(emoteObj)) { MenuAudio.PlayDeny(); return; }
 
         int price = 0;
+        bool priceResolved = false;
         var all = GetAllPurchasableEmotes();
         if (all != null)
         {
@@ -8233,10 +8068,12 @@ public class PurchaseMenu
                 if (ReferenceEquals(e.obj, emoteObj))
                 {
                     price = GetEmotePriceForRarity(e.rarity);
+                    priceResolved = true;
                     break;
                 }
             }
         }
+        if (!priceResolved) { MenuAudio.PlayDeny(); return; }
         if (!TryDeductCurrency(price)) { MenuAudio.PlayDeny(); return; }
         MenuAudio.PlayPurchaseRandom();
         TmeUnlockEmoteLocal(emoteObj);
@@ -8282,7 +8119,7 @@ public class PurchaseMenu
         int price, bool owned, bool highlightOwned, int bxp,
         float yTop, float pad,
         Action onActivateOwned, Action onPurchase,
-        bool selected = false)
+        bool selected = false, float rowHeight = RowH)
     {
         var row = new GameObject(name);
         row.transform.SetParent(parent, false);
@@ -8291,7 +8128,7 @@ public class PurchaseMenu
         rowRt.anchorMin = new Vector2(0, 1);
         rowRt.anchorMax = new Vector2(1, 1);
         rowRt.pivot     = new Vector2(0.5f, 1f);
-        rowRt.offsetMin = new Vector2(pad, -(yTop + RowH));
+        rowRt.offsetMin = new Vector2(pad, -(yTop + rowHeight));
         rowRt.offsetMax = new Vector2(-pad, -yTop);
 
         bool canAfford = owned || bxp >= price;
@@ -8300,34 +8137,28 @@ public class PurchaseMenu
         //   maxed/owned    - gold tinted, partial alpha
         //   highlightOwned - brighter gold (used for equipped cosmetic /
         //                    selected emote)
-        //   for-sale       - cyan tint at low intensity (mirrors the
-        //                    "purchasable" affordance), red-ish if broke
+        //   for-sale       - the neutral input plate whether or not it is
+        //                    affordable; only the price badge turns Warning
         Color normalCol, hoverCol, textColor, rightColor;
         string rightStr;
 
         if (owned)
         {
-            Color g = Palette.Gold;
             float baseTint  = highlightOwned ? 0.22f : 0.14f;
             float baseAlpha = highlightOwned ? 0.78f : 0.66f;
-            normalCol = new Color(g.r * baseTint, g.g * baseTint, g.b * baseTint, baseAlpha);
-            hoverCol  = new Color(g.r * (baseTint + 0.10f), g.g * (baseTint + 0.10f), g.b * (baseTint + 0.10f),
-                                  Mathf.Min(1f, baseAlpha + 0.05f));
+            normalCol = Palette.Shade(Palette.Gold, baseTint, baseAlpha);
+            hoverCol  = Palette.Shade(Palette.Gold, baseTint + 0.10f, Mathf.Min(1f, baseAlpha + 0.05f));
             textColor  = Palette.Primary;
             rightColor = Palette.Gold;
             rightStr   = ownedRight;
         }
         else
         {
-            Color c = Palette.Sale;
-            float baseTint  = canAfford ? 0.12f : 0.055f;
-            float baseAlpha = canAfford ? 0.70f : 0.54f;
-            normalCol = new Color(c.r * baseTint, c.g * baseTint, c.b * baseTint, baseAlpha);
-            hoverCol  = new Color(c.r * (baseTint + 0.10f), c.g * (baseTint + 0.10f), c.b * (baseTint + 0.10f),
-                                  Mathf.Min(1f, baseAlpha + 0.10f));
-            textColor  = canAfford ? Palette.Primary : Palette.Dim;
-            rightColor = canAfford ? Palette.Sale  : Palette.Warning;
-            rightStr   = FormatMarks(price);
+            normalCol  = Palette.Alpha(Palette.BgInput, FillBand);
+            hoverCol   = Palette.Alpha(Palette.BgRowHover, FillStrong);
+            textColor  = Palette.Primary;
+            rightColor = canAfford ? Palette.Sale : Palette.Warning;
+            rightStr   = FormatPurchasePrice(price);
         }
 
         var rowBtn = row.AddComponent<Button>();
@@ -8351,7 +8182,7 @@ public class PurchaseMenu
         if (selected)
         {
             var rail = UI.MakePanel("OwnableSelectedRail", row.transform,
-                new Color(Palette.Accent.r, Palette.Accent.g, Palette.Accent.b, 0.82f),
+                Palette.Alpha(Palette.Accent, FillPlate),
                 new Vector2(0, 0), new Vector2(0, 1),
                 new Vector2(0, 5), new Vector2(5, -5));
             rail.GetComponent<Image>().raycastTarget = false;
@@ -9123,15 +8954,15 @@ public class PurchaseMenu
     private static int GetEmotePriceForRarity(int rarity)
     {
         if (_tierPriceConfigs.TryGetValue(rarity, out var ce) && ce != null)
-            return Mathf.Max(0, ce.Value);
+            return ResolvePurchasePrice(ce.Value);
         if (_discoveredTiers != null)
         {
             int idx = _discoveredTiers.FindIndex(t => t.rarity == rarity);
             int n   = _discoveredTiers.Count;
             if (idx >= 0 && n > 0)
-                return GetDefaultEmoteTierPrice(idx, n);
+                return ResolvePurchasePrice(GetDefaultEmoteTierPrice(idx, n));
         }
-        return 1;
+        return ResolvePurchasePrice(1);
     }
 
     private static bool TmeIsEmoteUnlocked(object emote)
@@ -9167,30 +8998,37 @@ public class PurchaseMenu
     // 40-BXP price as 1 BXP.
     private static int ConvertPriceToBxp(Y4NGZUpgradeNode node, int rawPrice)
     {
-        if (rawPrice == int.MaxValue) return rawPrice;
-        return Mathf.Max(0, rawPrice);
+        return ResolvePurchasePrice(rawPrice);
     }
 
-    private static int GetRawTierPrice(Y4NGZUpgradeNode node, int zeroBasedTier)
-    {
-        if (node == null) return 0;
-        if (zeroBasedTier <= 0) return node.UnlockPrice;
-
-        int priceIndex = zeroBasedTier - 1;
-        if (node.Prices != null && priceIndex >= 0 && priceIndex < node.Prices.Length)
-            return node.Prices[priceIndex];
-
-        return int.MaxValue;
-    }
-
+    /// <summary>
+    /// Price to buy the rank above <paramref name="zeroBasedTier"/>, straight off the registered
+    /// node. A unique-only native variant aggregates the full-native steps it skips and credits
+    /// the full ranks this save already owns (#435), so reading the node's authored
+    /// <c>UnlockPrice</c>/<c>Prices</c> here would quote a fresh-save number to a part-progressed
+    /// player. The node already applies the token-cost policy; resolving again is idempotent.
+    /// </summary>
     private static int GetTierPriceBxp(Y4NGZUpgradeNode node, int zeroBasedTier)
     {
-        return ConvertPriceToBxp(node, GetRawTierPrice(node, zeroBasedTier));
+        if (node == null) return 0;
+        return ConvertPriceToBxp(node, node.GetPriceForLevel(Mathf.Max(0, zeroBasedTier)));
     }
 
     private static string FormatBxpPrice(int price)
     {
-        return price == int.MaxValue ? "MAXED" : FormatMarks(price);
+        return price == int.MaxValue ? "MAXED" : FormatPurchasePrice(price);
+    }
+
+    private static int ResolvePurchasePrice(int configuredPrice)
+    {
+        return global::Y4NGZUpgrades.PurchaseTokenCostPolicy.Resolve(
+            configuredPrice,
+            global::Y4NGZUpgrades.Plugin.PurchasesCostTokens);
+    }
+
+    private static string FormatPurchasePrice(int amount)
+    {
+        return amount <= 0 ? "FREE" : FormatMarks(amount);
     }
 
     private static string FormatMarks(int amount)
@@ -9201,15 +9039,32 @@ public class PurchaseMenu
     private static Color PurchaseButtonBg(bool enabled)
     {
         return enabled
-            ? new Color(Palette.BgHeader.r, Palette.BgHeader.g, Palette.BgHeader.b, 0.74f)
-            : new Color(Palette.BgRow.r, Palette.BgRow.g, Palette.BgRow.b, 0.42f);
+            ? Palette.Alpha(Palette.BgHeader, 0.74f)
+            : Palette.Alpha(Palette.BgRow, FillPlate);
     }
 
     private static Color PurchaseButtonHover(bool enabled)
     {
         return enabled
-            ? new Color(Palette.BgHeader.r, Palette.BgHeader.g, Palette.BgHeader.b, 0.92f)
-            : new Color(Palette.BgRowHover.r, Palette.BgRowHover.g, Palette.BgRowHover.b, 0.56f);
+            ? Palette.Alpha(Palette.BgHeader, FillStrong)
+            : Palette.Alpha(Palette.BgRowHover, FillStrong);
+    }
+
+    /// <summary>
+    /// Sets an inspector action button's interactable state. A refused button keeps its
+    /// opaque plate - the Button's disabled tint would otherwise multiply it back down to
+    /// a ghost over the ship - and a bold label, so the reason it gives stays legible.
+    /// </summary>
+    private static void SetPurchaseButtonInteractable(Button button, TMP_Text label, bool interactable)
+    {
+        if (button == null) return;
+        button.interactable = interactable;
+        if (interactable) return;
+
+        ColorBlock colors = button.colors;
+        colors.disabledColor = Color.white;
+        button.colors = colors;
+        if (label != null) label.fontStyle = FontStyles.Bold;
     }
 
     private static void OpenCursor()
@@ -9290,17 +9145,26 @@ public class PurchaseMenu
         ClearPurchaseNotice();
 
         if (wasVisible && _root != null && _root.activeInHierarchy && _detailView != null)
-            showUpgrades(selection.SharedUpgrade, resetScroll: false);
+            ShowActiveUpgradeCatalog(selection.SharedUpgrade);
     }
 
-    private static string DescribePurchaseFailure(Y4NGZUpgradePurchaseResult result)
+    /// <summary>
+    /// Why the manager refused, in the player's terms. A family whose identity is still
+    /// unsettled reports the wait rather than a missing mod (#435): Late Game Upgrades is
+    /// installed and loading, and the rank on offer would change meaning the moment it finishes.
+    /// </summary>
+    private static string DescribePurchaseFailure(Y4NGZUpgradePurchaseResult result, string upgradeId)
     {
         switch (result)
         {
             case Y4NGZUpgradePurchaseResult.PriceChanged:
-                return "PRICE CHANGED - NOTHING CHARGED";
+                return "PRICE CHANGED - NOTHING CHARGED - BUY AGAIN AT THE NEW QUOTE";
             case Y4NGZUpgradePurchaseResult.SaveUnavailable:
                 return "SAVE NOT READY - NOTHING CHARGED";
+            case Y4NGZUpgradePurchaseResult.ProviderUnavailable:
+                return Y4NGZUpgradeManager.IsFamilyPending(upgradeId)
+                    ? "LATE GAME UPGRADES IS STILL LOADING - NOTHING CHARGED"
+                    : "PROVIDER NOT READY - NOTHING CHARGED";
             case Y4NGZUpgradePurchaseResult.NotEnoughCurrency:
                 return "NOT ENOUGH TOKENS";
             case Y4NGZUpgradePurchaseResult.Maxed:
@@ -9321,13 +9185,16 @@ public class PurchaseMenu
         int amount = 0;
         try { amount = CurrencyManager.Instance.CurrencyAmount; } catch { }
 
-        _currencyText.color = amount <= LowCurrency ? Palette.Warning : Palette.Gold;
+        // Always the positive wallet slot: in a one-to-five token economy a
+        // low-balance warning would be red almost all the time. A refused
+        // purchase still flashes Danger through PulseCurrency.
+        _currencyText.color = Palette.Gold;
         _currencyText.text  = FormatMarks(amount);
     }
 
     private static void PulseCurrency(Color flashColor)
     {
-        if (_currencyText == null || _root == null) return;
+        if (_currencyText == null || _root == null || (Plugin.ReduceMenuMotion?.Value ?? false)) return;
         var host = _root.GetComponent<MenuController>();
         if (host != null && host.isActiveAndEnabled)
             host.StartCoroutine(PulseCurrencyRoutine(_currencyText, flashColor));
@@ -9390,118 +9257,24 @@ public class PurchaseMenu
         internal string Effect = "";
     }
 
-    private static readonly Dictionary<string, UpgradeCopy> UpgradeCopyText =
-        new Dictionary<string, UpgradeCopy>(StringComparer.OrdinalIgnoreCase)
+    // #366: the catalog row IS the copy. UpgradeCatalogTable.Description is parsed by
+    // ExtractUpgradeLevelEffects into the file summary and the per-level rows, so there is no
+    // second authored copy of any upgrade's text to drift.
+    //
+    // The one exception is capability-aware trimming: when the mod that supplies part of an
+    // upgrade's effect is not installed, showing that line would advertise a dead effect. Each
+    // entry below returns a fully authored replacement for exactly those combinations, and
+    // returns null whenever the catalog text is already correct as written.
+    private static readonly Dictionary<string, Func<UpgradeCopy>> UpgradeCopyVariants =
+        new Dictionary<string, Func<UpgradeCopy>>(StringComparer.OrdinalIgnoreCase)
     {
-        { "Sprinter", new UpgradeCopy(
-            "Combines mobility, stamina, climbing, terrain handling, quiet movement, and fall training.",
-            "Movement speed, sinking movement, and ladder speed improve.",
-            "Stamina capacity, stamina recovery, traction, and ladder speed improve further.",
-            "Jump height improves, uphill movement penalties are reduced, and ladder speed reaches peak output.",
-            "Footstep noise drops and crouch movement improves.",
-            "Jumping improves again and fall damage is reduced.") },
-        { "Quick Hands", new UpgradeCopy(
-            "Improves hold/interact speed and close pickup handling.",
-            "Hold interactions are 10% faster and grab reach increases slightly.",
-            "Hold interactions are 20% faster and grab reach improves further.",
-            "Hold interactions are 30% faster and grab reach reaches its cap.") },
-        { "Light Feet", new UpgradeCopy(
-            "Reduces automated hazard response to employee movement.",
-            "Landmine footstep detection is disabled.",
-            "Turrets take longer to fire after spotting the employee.",
-            "Lightning strikes no longer kill or damage the employee.") },
-        { "Lethal Hands", new UpgradeCopy(
-            "Authorizes empty-handed combat and improves punch force by tier.",
-            "Empty-hand punches deal 0.5x enemy punch damage.",
-            "Empty-hand punches deal 1.0x enemy punch damage.",
-            "Empty-hand punches deal 1.5x damage and briefly stun targets.") },
-        { "Bait Bomb", new UpgradeCopy(
-            "Throws a single-use lure bomb that redirects hostile attention.",
-            "Bomb beeps for 3 seconds and attracts enemies within 10m.",
-            "Bomb range increases to 20m and active time increases to 6 seconds.",
-            "Bomb detonates after beeping and ignites enemies caught in the blast.") },
-        { "Pumping Iron", new UpgradeCopy(
-            "Increases valid melee weapon hit force; empty-hand punches are excluded.",
-            "Valid melee weapon hits gain +1 force.",
-            "Valid melee weapon hits gain +2 force.",
-            "Valid melee weapon hits gain +3 force.") },
-        { "Deathbound", new UpgradeCopy(
-            "Binds the far-left hotbar slot through death.",
-            "The item held in the far-left hotbar slot stays with you through death and respawn.") },
-        { "Adrenaline Rush", new UpgradeCopy(
-            "Triggers emergency movement and survival bonuses when health collapses.",
-            "Dropping to 20 HP or lower grants a 30% movement speed surge.",
-            "Once per round, a lethal enemy or trap hit leaves you at 1 HP with brief invincibility.") },
-        { "Lone Wolf", new UpgradeCopy(
-            "Activates survival bonuses when you are the last living employee outside the ship.",
-            "Last-survivor state grants a 30% movement speed bonus.",
-            "Lone Wolf also restores stamina while active.",
-            "Lone Wolf briefly reveals nearby enemies when it activates.") },
-        { "Shadow Step", new UpgradeCopy(
-            "Reduces enemy awareness and later unlocks a short invisibility cloak.",
-            "Crouching reduces enemy detection range.",
-            "Walking also receives reduced detection; sprinting remains fully detectable.",
-            "Configured key activates a 6 second cloak with a 120 second cooldown.") },
-        { "Resilience", new UpgradeCopy(
-            "Raises maximum health, restores critical injuries over time, and culminates in a countershock.",
-            "Max health increases by 20 and critical injuries regenerate toward stable health.",
-            "Max health increases by 40 and the regeneration cap improves.",
-            "Max health increases by 60 with improved injury regeneration.",
-            "Max health increases by 80 and enemy melee hits reflect back with a brief stun.") },
-        { "Transporter", new UpgradeCopy(
-            "Reduces the operational penalty of hauling heavy quota objects.",
-            "Carry-weight penalty is reduced by 20%.",
-            "Carry-weight penalty is reduced by 40%.",
-            "Carry-weight penalty is reduced by 60%.") },
-        { "Field Optics", new UpgradeCopy(
-            "Upgrades issued optics - scanner glass and lamp alike - so you spot scrap sooner and light more of the room.",
-            "Scanner range +15%, flashlight brightness +10%, cone width +10%.",
-            "Scanner range +30%, flashlight brightness +15%, cone width +20%.",
-            "Scanner range +45%, flashlight brightness +40%, cone width +30%.") },
-        { "Squad Sight", new UpgradeCopy(
-            "Outlines teammates through walls or visibility blockers.",
-            "Eligible teammate outlines appear within 15m.",
-            "Eligible teammate outlines appear within 30m.") },
-        { "Field Operations", new UpgradeCopy(
-            "Grants the Field Operations tablet.",
-            "Grants access to the Field Operations tablet.") },
-        { "Field Mechanic", new UpgradeCopy(
-            "Improves field repairs and adds on-site hacking of facility security hardware.",
-            "Placed drills and pumps are less likely to break, drill/pump repairs complete 50% faster, and Company CCTV cameras can be disabled with a 1.2s hold interaction.",
-            "Batteries can now be repaired, and standard locked doors can be hacked open with a 1.2s hold interaction, no key required.",
-            "Disable turrets from the Field Operations tablet or with a nearby hold interaction.") },
-        { "Worklight Beacon", new UpgradeCopy(
-            "Throws recoverable sticky worklights that illuminate the area where they land.",
-            "Carry three brighter sticky worklight beacons.",
-            "Carry five stronger worklight beacons.",
-            "Carry nine maximum-brightness worklight beacons.") },
-        { "Deeper Pockets", new UpgradeCopy(
-            "Expands the employee carry harness with additional item slots.",
-            "Adds 1 extra inventory slot.",
-            "Adds 2 extra inventory slots.",
-            "Adds 3 extra inventory slots and allows carrying two two-handed items.") },
-        { "Chameleon", new UpgradeCopy(
-            "Adaptive camouflage plating confuses security camera tracking.",
-            "Security cameras take 15% longer to detect you.",
-            "Security cameras take 30% longer to detect you.",
-            "Security cameras take 50% longer to detect you.") },
-        { "Scavenger", new UpgradeCopy(
-            "Squeezes extra value out of everything scavenged in the field.",
-            "Ammo pickups grant 10% more rounds and your fuel chute deposits are worth 10% more.",
-            "Ammo pickups grant 20% more rounds and fuel deposits are worth 20% more.",
-            "Ammo pickups grant 30% more rounds and fuel deposits are worth 30% more.") },
-        { "Overachiever", new UpgradeCopy(
-            "Eager careerists earn extra upgrade tokens with every promotion.",
-            "Each level-up grants 1 extra upgrade token.",
-            "Each level-up grants 2 extra upgrade tokens.",
-            "Each level-up grants 4 extra upgrade tokens.") },
-        { "Veteran", new UpgradeCopy(
-            "A veteran Foreman doesn't get rattled - the Company goes easy on survivors.",
-            "Quota increases caused by crew deaths are capped at 10% of the pre-penalty quota per round-end.",
-            "The quota deadline is extended to 4 days instead of 3.") },
-        { "Inspire", new UpgradeCopy(
-            "Uses Ping on a nearby dead teammate for a once-per-round revive attempt.",
-            "Pinging a dead body within 7m has a 25% chance to revive the player. The use is consumed only on success.") },
+        { "scavenger", BuildScavengerUpgradeCopy },
+        { "turret_hacker", BuildFieldMechanicUpgradeCopy },
+        { "sixth_sense", BuildSixthSenseUpgradeCopy },
+        { "command_net", BuildCommandNetUpgradeCopy },
+        { "field_operations", BuildFieldOperationsUpgradeCopy },
+        { "quota_guard", BuildVeteranUpgradeCopy },
+        { "deathbound", BuildDeathboundUpgradeCopy },
     };
 
     private static readonly UpgradeCopy ScavengerAmmoOnlyCopy = new UpgradeCopy(
@@ -9512,37 +9285,9 @@ public class PurchaseMenu
 
     private static readonly UpgradeCopy ScavengerFuelOnlyCopy = new UpgradeCopy(
         "Extracts more value from fuel delivered through the chute.",
-        "Fuel-chute deposits are worth 10% more.",
-        "Fuel-chute deposits are worth 20% more.",
-        "Fuel-chute deposits are worth 30% more.");
-
-    private static readonly Dictionary<string, string> UpgradeFlavorText =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-    {
-        { "Sprinter", "Company fitness program, billed per breath, step, ladder rung, and questionable landing." },
-        { "Quick Hands", "Approved for employees with steady hands and unstable priorities." },
-        { "Light Feet", "Every quiet step is one less form to fill out." },
-        { "Lethal Hands", "The Company reminds you that hands are not covered equipment." },
-        { "Bait Bomb", "The Company-approved way to make bad decisions look elsewhere." },
-        { "Pumping Iron", "Morale in a scoop. Side effects pending approval." },
-        { "Deathbound", "Some things stay on the employee, even after the employee stops staying." },
-        { "Adrenaline Rush", "Panic, refined and monetized." },
-        { "Lone Wolf", "Solo productivity metrics, violently interpreted." },
-        { "Shadow Step", "A personnel movement exception for poorly lit hallways." },
-        { "Resilience", "Resilience training with fewer lectures." },
-        { "Transporter", "Carry more so the quota can ask for even more." },
-        { "Field Optics", "Because missing scrap in the dark is a personal failure." },
-        { "Field Operations", "Tablet privileges granted. Responsibility regrettably follows." },
-        { "Field Mechanic", "For when the facility breaks, and then breaks back." },
-        { "Worklight Beacon", "Stick it where the dark keeps winning." },
-        { "Squad Sight", "Perfect trust, now with plausible deniability." },
-        { "Deeper Pockets", "More pockets, more problems, mostly more quota." },
-        { "Chameleon", "The cameras still see you. They just take a while to believe it." },
-        { "Scavenger", "One employee's trash is the Company's untaxed revenue." },
-        { "Overachiever", "Ambition is its own reward. The extra tokens are just bookkeeping." },
-        { "Veteran", "Seen it all, billed for most of it. The Company respects a survivor." },
-        { "Inspire", "Motivation so strong it occasionally violates company death policy." },
-    };
+        "Fuel chute deposits are worth 10% more.",
+        "Fuel chute deposits are worth 20% more.",
+        "Fuel chute deposits are worth 30% more.");
 
     private static List<UpgradeLevelDetail> BuildUpgradeLevelDetails(
         Y4NGZUpgradeNode node,
@@ -9574,7 +9319,7 @@ public class PurchaseMenu
                 Complete = tier <= currentLevel,
                 Next = !maxed && tier == Mathf.Clamp(currentLevel + 1, 1, maxTier),
                 Price = tier <= currentLevel ? int.MaxValue : GetTierPriceBxp(node, tier - 1),
-                Effect = GetUpgradeTierEffect(node, tier, maxTier, effects)
+                Effect = GetUpgradeTierEffect(node, tier, effects)
             });
         }
 
@@ -9582,6 +9327,9 @@ public class PurchaseMenu
         return result;
     }
 
+    // The authored summary leads (#435): the player reads what the file does before the rank
+    // ladder that sells it. A rank the catalog does not describe still gets a row, carrying its
+    // price and no sentence.
     private static float BuildUpgradeLevelDetailRows(
         Transform parent,
         List<UpgradeLevelDetail> levels,
@@ -9592,6 +9340,35 @@ public class PurchaseMenu
             return 0f;
 
         float y = 6f;
+        if (!string.IsNullOrWhiteSpace(summaryText))
+        {
+            var summaryHeader = UI.MakeText("SummaryHeader", parent,
+                "DESCRIPTION", FontMd, Palette.Gold, TextAlignmentOptions.MidlineLeft);
+            summaryHeader.fontStyle = FontStyles.Bold;
+            var shRt = summaryHeader.GetComponent<RectTransform>();
+            shRt.anchorMin = new Vector2(0, 1);
+            shRt.anchorMax = new Vector2(1, 1);
+            shRt.pivot = new Vector2(0.5f, 1f);
+            shRt.sizeDelta = new Vector2(-12f, 22f);
+            shRt.anchoredPosition = new Vector2(0f, -y);
+            y += 24f;
+
+            var summary = UI.MakeText("Summary", parent,
+                UpgradeLevelCopy.EnsurePeriod(summaryText), FontSm, Palette.Body,
+                TextAlignmentOptions.TopLeft);
+            summary.enableWordWrapping = true;
+            summary.overflowMode = TextOverflowModes.Overflow;
+            var sumRt = summary.GetComponent<RectTransform>();
+            sumRt.anchorMin = new Vector2(0, 1);
+            sumRt.anchorMax = new Vector2(1, 1);
+            sumRt.pivot = new Vector2(0.5f, 1f);
+            summary.ForceMeshUpdate();
+            float summaryH = Mathf.Max(34f, summary.preferredHeight + 8f);
+            sumRt.sizeDelta = new Vector2(-12f, summaryH);
+            sumRt.anchoredPosition = new Vector2(0f, -y);
+            y += summaryH + 12f;
+        }
+
         var header = UI.MakeText("LevelsHeader", parent,
             "LEVELS", FontMd, Palette.Gold, TextAlignmentOptions.MidlineLeft);
         header.fontStyle = FontStyles.Bold;
@@ -9610,36 +9387,6 @@ public class PurchaseMenu
             y += rowH + 8f;
         }
 
-        if (!string.IsNullOrWhiteSpace(summaryText))
-        {
-            y += 8f;
-
-            var summaryHeader = UI.MakeText("SummaryHeader", parent,
-                "FILE SUMMARY", FontMd, Palette.Gold, TextAlignmentOptions.MidlineLeft);
-            summaryHeader.fontStyle = FontStyles.Bold;
-            var shRt = summaryHeader.GetComponent<RectTransform>();
-            shRt.anchorMin = new Vector2(0, 1);
-            shRt.anchorMax = new Vector2(1, 1);
-            shRt.pivot = new Vector2(0.5f, 1f);
-            shRt.sizeDelta = new Vector2(-12f, 22f);
-            shRt.anchoredPosition = new Vector2(0f, -y);
-            y += 24f;
-
-            var summary = UI.MakeText("Summary", parent,
-                EnsurePeriod(summaryText), FontSm, Palette.Body, TextAlignmentOptions.TopLeft);
-            summary.enableWordWrapping = true;
-            summary.overflowMode = TextOverflowModes.Overflow;
-            var sumRt = summary.GetComponent<RectTransform>();
-            sumRt.anchorMin = new Vector2(0, 1);
-            sumRt.anchorMax = new Vector2(1, 1);
-            sumRt.pivot = new Vector2(0.5f, 1f);
-            summary.ForceMeshUpdate();
-            float summaryH = Mathf.Max(34f, summary.preferredHeight + 8f);
-            sumRt.sizeDelta = new Vector2(-12f, summaryH);
-            sumRt.anchoredPosition = new Vector2(0f, -y);
-            y += summaryH + 6f;
-        }
-
         return y;
     }
 
@@ -9649,28 +9396,31 @@ public class PurchaseMenu
         float y,
         Color accent)
     {
+        // A rank with no authored copy collapses to its price line rather than padding the row
+        // with an invented sentence (#435).
+        string effectText = UpgradeLevelCopy.EnsurePeriod(detail.Effect);
+        bool hasEffect = effectText.Length != 0;
         const float minHeight = 64f;
-        float height = minHeight;
+        const float priceOnlyHeight = 38f;
+        float height = hasEffect ? minHeight : priceOnlyHeight;
 
         bool emphasized = detail.Next;
         bool future = !detail.Complete && !detail.Next;
         Color rowBg = emphasized
-            ? new Color(Palette.Gold.r, Palette.Gold.g, Palette.Gold.b, 0.10f)
-            : new Color(Palette.BgRow.r, Palette.BgRow.g, Palette.BgRow.b, detail.Complete ? 0.16f : 0.05f);
+            ? Palette.Alpha(Palette.Gold, 0.10f)
+            : Palette.Alpha(Palette.BgRow, detail.Complete ? 0.16f : 0.05f);
         var row = UI.MakePanel("LevelRow_" + detail.Tier, parent,
             rowBg,
             new Vector2(0, 1), new Vector2(1, 1),
             new Vector2(0f, -(y + height)), new Vector2(-8f, -y));
-        var group = row.AddComponent<CanvasGroup>();
-        group.alpha = future ? 0.56f : 1f;
         Image rowImg = row.GetComponent<Image>();
         if (rowImg != null)
             rowImg.raycastTarget = false;
         if (emphasized)
         {
             UI.MakePanel("LevelRowAccent", row.transform, Palette.Gold,
-                new Vector2(1, 0), new Vector2(1, 1),
-                new Vector2(-5f, 0f), new Vector2(0f, 0f))
+                new Vector2(0, 0), new Vector2(0, 1),
+                new Vector2(0f, 0f), new Vector2(2f, 0f))
                 .GetComponent<Image>().raycastTarget = false;
         }
 
@@ -9680,7 +9430,7 @@ public class PurchaseMenu
             ? "COMPLETE"
             : "COST: " + FormatBxpPrice(detail.Price);
         var cost = UI.MakeText("LevelCost", row.transform,
-            status, FontSm, emphasized ? Palette.Gold : future ? Palette.Dim : Palette.Accent,
+            status, FontSm, emphasized ? Palette.Gold : future ? Palette.Muted : Palette.Accent,
             TextAlignmentOptions.MidlineLeft);
         cost.fontStyle = FontStyles.Bold;
         cost.enableWordWrapping = false;
@@ -9688,36 +9438,46 @@ public class PurchaseMenu
         var costRt = cost.GetComponent<RectTransform>();
         costRt.anchorMin = new Vector2(0, 1);
         costRt.anchorMax = new Vector2(1, 1);
-        costRt.offsetMin = new Vector2(72f, -26f);
-        costRt.offsetMax = new Vector2(-16f, -6f);
+        if (hasEffect)
+        {
+            costRt.offsetMin = new Vector2(54f, -26f);
+            costRt.offsetMax = new Vector2(-16f, -6f);
+        }
+        else
+        {
+            // Alone in the row, the price sits on the diamond's centre line.
+            costRt.offsetMin = new Vector2(54f, -(priceOnlyHeight - 9f));
+            costRt.offsetMax = new Vector2(-16f, -9f);
+        }
 
-        var effect = UI.MakeText("LevelEffect", row.transform,
-            EnsurePeriod(detail.Effect), FontSm,
-            future
-                ? new Color(Palette.Body.r, Palette.Body.g, Palette.Body.b, 0.72f)
-                : Palette.Body,
-            TextAlignmentOptions.TopLeft);
-        effect.enableWordWrapping = true;
-        effect.overflowMode = TextOverflowModes.Overflow;
-        var effectRt = effect.GetComponent<RectTransform>();
-        effectRt.anchorMin = new Vector2(0, 0);
-        effectRt.anchorMax = new Vector2(1, 1);
-        effectRt.offsetMin = new Vector2(72f, 8f);
-        effectRt.offsetMax = new Vector2(-16f, -28f);
+        float resolvedHeight = priceOnlyHeight;
+        if (hasEffect)
+        {
+            var effect = UI.MakeText("LevelEffect", row.transform,
+                effectText, FontSm,
+                future ? Palette.Muted : Palette.Body,
+                TextAlignmentOptions.TopLeft);
+            effect.enableWordWrapping = true;
+            effect.overflowMode = TextOverflowModes.Overflow;
+            var effectRt = effect.GetComponent<RectTransform>();
+            effectRt.anchorMin = new Vector2(0, 0);
+            effectRt.anchorMax = new Vector2(1, 1);
+            effectRt.offsetMin = new Vector2(54f, 8f);
+            effectRt.offsetMax = new Vector2(-16f, -28f);
 
-        RectTransform parentRt = parent as RectTransform;
-        float parentWidth = parentRt != null ? parentRt.rect.width : 0f;
-        if (parentWidth <= 0f)
-            parentWidth = InspectorW - (InspectorSide * 2f) - 14f;
-        float effectWidth = Mathf.Max(120f, parentWidth - 96f);
-        float effectHeight = effect.GetPreferredValues(effect.text, effectWidth, Mathf.Infinity).y;
-        float resolvedHeight = Mathf.Max(minHeight, Mathf.Ceil(effectHeight) + 40f);
+            RectTransform parentRt = parent as RectTransform;
+            float parentWidth = parentRt != null ? parentRt.rect.width : 0f;
+            if (parentWidth <= 0f)
+                parentWidth = InspectorW - (InspectorSide * 2f) - 14f;
+            float effectWidth = Mathf.Max(120f, parentWidth - 78f);
+            float effectHeight = effect.GetPreferredValues(effect.text, effectWidth, Mathf.Infinity).y;
+            resolvedHeight = Mathf.Max(minHeight, Mathf.Ceil(effectHeight) + 40f);
+        }
 
         var rowRt = row.GetComponent<RectTransform>();
         rowRt.offsetMin = new Vector2(0f, -(y + resolvedHeight));
         rowRt.offsetMax = new Vector2(-8f, -y);
         return resolvedHeight;
-
     }
 
     private static void BuildLevelNumberDiamond(
@@ -9734,8 +9494,8 @@ public class PurchaseMenu
         rt.anchorMin = new Vector2(0, 0.5f);
         rt.anchorMax = new Vector2(0, 0.5f);
         rt.pivot = new Vector2(0.5f, 0.5f);
-        rt.sizeDelta = new Vector2(34f, 34f);
-        rt.anchoredPosition = new Vector2(34f, 0f);
+        rt.sizeDelta = new Vector2(24f, 24f);
+        rt.anchoredPosition = new Vector2(26f, 0f);
         rt.localRotation = Quaternion.Euler(0f, 0f, 45f);
 
         Color marker = emphasized
@@ -9743,10 +9503,10 @@ public class PurchaseMenu
             : complete
                 ? accent
                 : future
-                    ? Palette.Dim
+                    ? Palette.Muted
                     : Palette.Accent;
         AddBorder(diamond.transform, 2f, 0f,
-            new Color(marker.r, marker.g, marker.b, emphasized ? 0.94f : future ? 0.56f : 0.76f));
+            Palette.Alpha(marker, emphasized ? 0.94f : 0.76f));
 
         var label = UI.MakeText("LevelDiamondNumber", diamond.transform,
             tier.ToString(), FontMd, marker, TextAlignmentOptions.Center);
@@ -9782,6 +9542,14 @@ public class PurchaseMenu
 
         var sb = new StringBuilder();
 
+        string summary = GetUpgradeSummary(node, copy, descriptionText);
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            AppendSectionHeader(sb, "DESCRIPTION");
+            sb.Append(ColorTag(Palette.Body, UpgradeLevelCopy.EnsurePeriod(summary))).Append('\n');
+            sb.Append('\n');
+        }
+
         AppendSectionHeader(sb, "LEVELS");
         for (int tier = 1; tier <= maxTier; tier++)
         {
@@ -9795,27 +9563,24 @@ public class PurchaseMenu
                 price = GetTierPriceBxp(node, tier - 1);
 
             AppendTierAuthorization(sb, node, tier, tierLabel,
-                GetUpgradeTierEffect(node, tier, maxTier, effects),
+                GetUpgradeTierEffect(node, tier, effects),
                 price);
-        }
-
-        string summary = GetUpgradeSummary(node, copy, descriptionText);
-        if (!string.IsNullOrWhiteSpace(summary))
-        {
-            sb.Append('\n');
-            AppendSectionHeader(sb, "FILE SUMMARY");
-            sb.Append(ColorTag(Palette.Body, EnsurePeriod(summary))).Append('\n');
         }
 
         statsText = sb.ToString();
     }
 
+    /// <summary>
+    /// Returns an authored override for this upgrade, or null to use the catalog text as written.
+    /// Only the capability-variant table can override; there is no second static copy of any
+    /// upgrade's prose (#366).
+    /// </summary>
     private static UpgradeCopy GetUpgradeCopy(Y4NGZUpgradeNode node)
     {
         if (node == null) return null;
-        if (string.Equals(node.Id, "scavenger", StringComparison.OrdinalIgnoreCase))
-            return BuildScavengerUpgradeCopy();
-        return UpgradeCopyText.TryGetValue(node.Name, out var copy) ? copy : null;
+        return UpgradeCopyVariants.TryGetValue(node.Id ?? "", out Func<UpgradeCopy> build)
+            ? build()
+            : null;
     }
 
     private static UpgradeCopy BuildScavengerUpgradeCopy()
@@ -9827,8 +9592,125 @@ public class PurchaseMenu
         if (fuelActive && !ammunitionActive)
             return ScavengerFuelOnlyCopy;
 
-        return UpgradeCopyText["Scavenger"];
+        // Both providers present: the catalog text already names both effects.
+        return null;
     }
+
+    /// <summary>
+    /// Field Mechanic's first level is two independent effects from two different plugins, and
+    /// without either it is not sold (#441); the unique-only variant has no door level. The
+    /// lines follow the ladder actually sold, one per level.
+    /// </summary>
+    private static UpgradeCopy BuildFieldMechanicUpgradeCopy()
+    {
+        string[] levels = FieldMechanicCopy.SelectLevels(
+            OptionalPluginCapabilities.ShipSystems,
+            OptionalPluginCapabilities.LethalCctv,
+            Y4NGZUpgradeManager.ModeOf(TurretHackerUpgrade.UPGRADE_ID) == NativeFamilyMode.UniqueOnly);
+        return levels == null ? null : new UpgradeCopy(FieldMechanicCopy.Summary, levels);
+    }
+
+    /// <summary>
+    /// Sixth Sense outlines mainframes, stashes and contract objectives only when one of the
+    /// Y4NGZ facility plugins is present to define them. Everything else is vanilla.
+    /// </summary>
+    private static UpgradeCopy BuildSixthSenseUpgradeCopy()
+    {
+        if (HasFacilityObjectives)
+            return null;
+
+        return new UpgradeCopy(
+            "Outlines what you cannot see. Anything in direct line of sight is skipped; only "
+            + "occluded targets are drawn.",
+            "Main entrance and fire exits outline within 15m. Turrets and landmines only within 5m.",
+            "Also outlines grabbable scrap and items within 10m.",
+            "Also outlines living enemies within 15m.");
+    }
+
+    /// <summary>
+    /// Command Net's minimap plots security cameras only with LethalCCTV and objectives only with
+    /// Y4NGZCompany. Crew, entrances and enemies are vanilla and always tracked.
+    /// </summary>
+    private static UpgradeCopy BuildCommandNetUpgradeCopy()
+    {
+        bool cameras = OptionalPluginCapabilities.LethalCctv;
+        bool objectives = OptionalPluginCapabilities.Contracted;
+        if (cameras && objectives)
+            return null;
+
+        string extra;
+        if (cameras)
+            extra = ", plus security cameras";
+        else if (objectives)
+            extra = ", plus objectives";
+        else
+            extra = "";
+
+        return new UpgradeCopy(
+            "Passive comms and a tactical display that cost no inventory slot.",
+            "A built-in walkie channel. Hold the Command Net key to transmit with no "
+            + "walkie-talkie in hand.",
+            "Teammates are outlined for 5 seconds whenever they take damage.",
+            "A corner minimap once you step out of the ship room, tracking crew, entrances and "
+            + "enemies" + extra + ".");
+    }
+
+    /// <summary>
+    /// The tablet's stash codes, camera control, alarms and lockdown are LethalCCTV rows. Scan,
+    /// map, drone link and the mainframe uplink ship with this plugin and are always present.
+    /// </summary>
+    private static UpgradeCopy BuildFieldOperationsUpgradeCopy()
+    {
+        if (OptionalPluginCapabilities.LethalCctv)
+            return null;
+
+        return new UpgradeCopy(
+            "Grants the Field Operations tablet.",
+            "Unlocks the tablet: scan, interior map, drone link, and a mainframe uplink that "
+            + "takes 10 seconds to establish and then offers a scrap sweep and a trap shutdown.");
+    }
+
+    /// <summary>
+    /// Veteran's halved death fine is vanilla. The quota-increase cap is installed only when
+    /// Y4NGZCompany owns the quota rules, so it is advertised only then.
+    /// </summary>
+    private static UpgradeCopy BuildVeteranUpgradeCopy()
+    {
+        if (!OptionalPluginCapabilities.Contracted)
+            return null;
+
+        return new UpgradeCopy(
+            "The Company goes easy on a crew that keeps showing up. The whole crew uses the "
+            + "highest level anyone has bought.",
+            "The end-of-round credit penalty for dead crew is halved, and quota increases caused "
+            + "by crew deaths are capped at 10% of the pre-penalty quota.",
+            "The next quota sets a 4 day deadline instead of 3.");
+    }
+
+    /// <summary>
+    /// Deathbound's red slot tint is drawn by an external UI theme; without one the slot is
+    /// protected but looks ordinary.
+    ///
+    /// F-TECH-15: UiTheme.WriteExternalProtectedSlotResolver tries "Y4NGZUI.UiTheme, Y4NGZUI"
+    /// FIRST and only then the Y4NGZCompany type, so a Y4NGZUI-only install already tints the
+    /// slot. Keying the fallback copy on Contracted alone described the tint as missing there.
+    /// </summary>
+    private static UpgradeCopy BuildDeathboundUpgradeCopy()
+    {
+        if (OptionalPluginCapabilities.Contracted || OptionalPluginCapabilities.Y4NGZUi)
+            return null;
+
+        return new UpgradeCopy(
+            "Binds the far-left hotbar slot through death.",
+            "The item in the far-left hotbar slot is not dropped on death and returns with you "
+            + "on respawn.");
+    }
+
+    /// <summary>Any plugin that can define mainframes, stashes or contract objectives.</summary>
+    private static bool HasFacilityObjectives =>
+        OptionalPluginCapabilities.Contracted
+        || OptionalPluginCapabilities.LethalCctv
+        || OptionalPluginCapabilities.ShipSystems;
 
 
     private static void AppendSectionHeader(StringBuilder sb, string label)
@@ -9849,69 +9731,44 @@ public class PurchaseMenu
             line += "   COST: " + FormatBxpPrice(price);
 
         sb.Append(ColorTag(Palette.Accent, line)).Append('\n');
-        sb.Append(ColorTag(Palette.Body, EnsurePeriod(effect))).Append('\n');
+        // A rank the catalog does not describe gets its price line and nothing else (#435).
+        if (effect.Length != 0)
+            sb.Append(ColorTag(Palette.Body, effect)).Append('\n');
     }
 
+    /// <summary>
+    /// The authored effect for one rank, or an empty string when the catalog row does not
+    /// describe it. Imported rows and unique-only variants author only the ranks that do
+    /// something, so the inspector shows those ranks with a price and no sentence rather than
+    /// with fabricated "unlocks the next level" filler (#435).
+    /// </summary>
     private static string GetUpgradeTierEffect(
         Y4NGZUpgradeNode node,
         int tier,
-        int maxTier,
         Dictionary<int, string> parsedEffects)
     {
         if (parsedEffects != null
             && parsedEffects.TryGetValue(tier, out string parsed)
-            && !IsPlaceholderUpgradeText(parsed))
-            return SummarizeEffectText(parsed);
+            && !UpgradeLevelCopy.IsPlaceholder(parsed))
+            return UpgradeLevelCopy.Summarize(parsed);
 
         UpgradeCopy copy = GetUpgradeCopy(node);
         if (copy != null && tier >= 1 && tier <= copy.TierEffects.Length)
-            return EnsurePeriod(copy.TierEffects[tier - 1]);
+            return UpgradeLevelCopy.EnsurePeriod(copy.TierEffects[tier - 1]);
 
-        return tier >= maxTier
-            ? "Final level for this upgrade file."
-            : "Unlocks the next level.";
+        return "";
     }
 
     private static string GetUpgradeSummary(Y4NGZUpgradeNode node, UpgradeCopy copy, string parsedSummary)
     {
         if (copy != null && !string.IsNullOrWhiteSpace(copy.Summary))
-            return EnsurePeriod(copy.Summary);
+            return UpgradeLevelCopy.EnsurePeriod(copy.Summary);
 
-        string cleaned = CleanDescriptionText(parsedSummary);
-        if (!string.IsNullOrWhiteSpace(cleaned) && !IsPlaceholderUpgradeText(cleaned))
-            return SummarizeEffectText(cleaned);
+        string cleaned = UpgradeLevelCopy.CleanDescriptionText(parsedSummary);
+        if (!string.IsNullOrWhiteSpace(cleaned) && !UpgradeLevelCopy.IsPlaceholder(cleaned))
+            return UpgradeLevelCopy.Summarize(cleaned);
 
         return GetFallbackFlavorText(node);
-    }
-
-    private static bool IsPlaceholderUpgradeText(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return true;
-        string lower = StripRichText(text).ToLowerInvariant();
-        return lower.Contains("no native runtime effect")
-            || lower.Contains("no current effect")
-            || lower.Contains("no effect yet")
-            || lower.Contains("currently implemented");
-    }
-
-    private static string SummarizeEffectText(string text)
-    {
-        string cleaned = CleanEffectText(text);
-        if (cleaned.Length == 0) return "Unlocks this level.";
-        if (cleaned.Length <= 118) return EnsurePeriod(cleaned);
-
-        string[] sentences = Regex.Split(cleaned, @"(?<=[.!?])\s+");
-        for (int i = 0; i < sentences.Length; i++)
-        {
-            string sentence = sentences[i].Trim();
-            if (sentence.Length > 0 && sentence.Length <= 118)
-                return EnsurePeriod(sentence);
-        }
-
-        string clipped = cleaned.Substring(0, Mathf.Min(cleaned.Length, 114)).Trim();
-        int lastSpace = clipped.LastIndexOf(' ');
-        if (lastSpace > 72) clipped = clipped.Substring(0, lastSpace).Trim();
-        return EnsurePeriod(clipped);
     }
 
     private static string ColorTag(Color color, string text)
@@ -9923,174 +9780,19 @@ public class PurchaseMenu
     private static Dictionary<int, string> ExtractUpgradeLevelEffects(
         Y4NGZUpgradeNode node, int maxTier, out string loreText)
     {
-        var effects = new Dictionary<int, string>();
-        var loreLines = new List<string>();
-        loreText = "";
-
         string description = "";
         try { description = node.Description ?? ""; } catch { }
-        if (string.IsNullOrWhiteSpace(description)) return effects;
-
-        string[] lines = description.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-        for (int i = 0; i < lines.Length; i++)
-        {
-            string line = StripRichText(lines[i]).Trim();
-            if (line.Length == 0)
-            {
-                AddLoreLine(loreLines, "");
-                continue;
-            }
-
-            if (IsDuplicateUpgradeTitle(line, node.Name))
-                continue;
-
-            if (TryParseLevelEffectLine(line, out int tier, out string effect) &&
-                tier >= 1 && tier <= maxTier)
-            {
-                effects[tier] = effect;
-                continue;
-            }
-
-            if (maxTier == 1 && effects.Count == 0 && HasLeadingPrice(line))
-            {
-                effects[1] = CleanEffectText(RemoveLeadingPrice(line));
-                continue;
-            }
-
-            AddLoreLine(loreLines, line);
-        }
-
-        loreText = BuildLoreText(loreLines);
-        return effects;
+        return UpgradeLevelCopy.ExtractLevelEffects(description, node?.Name, maxTier, out loreText);
     }
 
-    private static bool TryParseLevelEffectLine(string line, out int tier, out string effect)
-    {
-        tier = 0;
-        effect = "";
-
-        string working = RemoveLeadingPrice(line);
-        var match = Regex.Match(working,
-            @"\b(?:lvl|level|tier)\s*(\d+)\b\s*[:\-\)]?\s*(.*)$",
-            RegexOptions.IgnoreCase);
-        if (!match.Success) return false;
-
-        if (!int.TryParse(match.Groups[1].Value, out tier)) return false;
-        effect = CleanEffectText(match.Groups[2].Value);
-        return effect.Length > 0;
-    }
-
-    private static string StripRichText(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return "";
-        return Regex.Replace(text, "<.*?>", "");
-    }
-
-    private static bool HasLeadingPrice(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return false;
-        return Regex.IsMatch(text,
-            @"^\s*(?:\$|\[\s*(?:BXP|MARKS?|TOKENS?)\s*\]|\d+\s*(?:BXP|BXPS|MARK|MARKS|TOKEN|TOKENS|PC)\b|\d+\s*[-:])",
-            RegexOptions.IgnoreCase);
-    }
-
-    private static string RemoveLeadingPrice(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "";
-
-        string cleaned = text.Trim();
-        cleaned = Regex.Replace(cleaned,
-            @"^\s*\[\s*(?:BXP|MARKS?|TOKENS?)\s*\]\s*\d+\s*(?:[-:]\s*)?",
-            "",
-            RegexOptions.IgnoreCase);
-        cleaned = Regex.Replace(cleaned,
-            @"^\s*\$\d+(?:\s*/\s*\d+\s*(?:PC|BXP|BXPS|MARK|MARKS|TOKEN|TOKENS)?)?\s*(?:[-:]\s*)?",
-            "",
-            RegexOptions.IgnoreCase);
-        cleaned = Regex.Replace(cleaned,
-            @"^\s*\d+\s*(?:PC|BXP|BXPS|MARK|MARKS|TOKEN|TOKENS)\s*(?:[-:]\s*)?",
-            "",
-            RegexOptions.IgnoreCase);
-        cleaned = Regex.Replace(cleaned,
-            @"^\s*\d+\s*[-:]\s+",
-            "",
-            RegexOptions.IgnoreCase);
-
-        return cleaned.Trim();
-    }
-
-    private static string CleanEffectText(string text)
-    {
-        string cleaned = StripRichText(text);
-        cleaned = Regex.Replace(cleaned, @"^\s*[-:]\s*", "");
-        cleaned = RemoveLeadingPrice(cleaned);
-        cleaned = Regex.Replace(cleaned, @"^\s*[-:]\s*", "");
-        cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
-        return cleaned.Trim(' ', '.', ';');
-    }
-
-    private static string CleanDescriptionText(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "";
-
-        string cleaned = StripRichText(text).Trim();
-        cleaned = Regex.Replace(cleaned,
-            @"^\s*(?:description|overview|effect|effects)\s*:\s*",
-            "",
-            RegexOptions.IgnoreCase);
-        cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
-        if (cleaned.Length == 0) return "";
-        return EnsurePeriod(cleaned);
-    }
-
-    private static string EnsurePeriod(string text)
-    {
-        string cleaned = string.IsNullOrWhiteSpace(text) ? "Unlocks this level" : text.Trim();
-        char last = cleaned[cleaned.Length - 1];
-        return last == '.' || last == '!' || last == '?' ? cleaned : cleaned + ".";
-    }
-
-    private static bool IsDuplicateUpgradeTitle(string line, string upgradeName)
-    {
-        string a = NormalizeTitle(line);
-        string b = NormalizeTitle(upgradeName);
-        return a.Length > 0 && a == b;
-    }
-
-    private static string NormalizeTitle(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "";
-        return Regex.Replace(text.ToLowerInvariant(), @"[^a-z0-9]+", "");
-    }
-
-    private static void AddLoreLine(List<string> loreLines, string line)
-    {
-        if (line.Length == 0)
-        {
-            if (loreLines.Count > 0 && loreLines[loreLines.Count - 1].Length != 0)
-                loreLines.Add("");
-            return;
-        }
-
-        loreLines.Add(line);
-    }
-
-    private static string BuildLoreText(List<string> loreLines)
-    {
-        while (loreLines.Count > 0 && loreLines[0].Length == 0)
-            loreLines.RemoveAt(0);
-        while (loreLines.Count > 0 && loreLines[loreLines.Count - 1].Length == 0)
-            loreLines.RemoveAt(loreLines.Count - 1);
-
-        return string.Join("\n", loreLines).Trim();
-    }
-
+    /// <summary>
+    /// Last resort for a node with no authored catalog description at all. The per-upgrade flavor
+    /// table that used to sit in front of this was unreachable - every catalog row authors a
+    /// "Description:" line - and was deleted with #366.
+    /// </summary>
     private static string GetFallbackFlavorText(Y4NGZUpgradeNode node)
     {
-        if (node != null && UpgradeFlavorText.TryGetValue(node.Name, out var flavor))
-            return flavor;
-
-        string sub = GetSubCategory(node?.Name);
+        string sub = GetSubCategory(node?.Id);
         if (string.Equals(sub, SubSpeed, StringComparison.OrdinalIgnoreCase))
             return "Movement paperwork is easier when the employee is still moving.";
         if (string.Equals(sub, SubDexterity, StringComparison.OrdinalIgnoreCase))
@@ -10118,6 +9820,7 @@ public class PurchaseMenu
 
         if (location == null) return;
         if      (location == nameof(showEmployeeFile)) showEmployeeFile();
+        else if (location == nameof(showAugments))    showAugments();
         else if (location == nameof(showUpgrades) + ",True")  showUpgrades(true);
         else if (location == nameof(showUpgrades) + ",False") showUpgrades(false);
         else if (location == nameof(showUpgradeGui) && currentSelection != null) showUpgradeGui(currentSelection);

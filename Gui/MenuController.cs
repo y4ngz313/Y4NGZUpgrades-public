@@ -60,6 +60,8 @@ public class MenuController : MonoBehaviour
         catch (System.Exception e) { LogKeyboardFaultOnce(e); }
 
         IngameKeybinds keybinds = Plugin.Keybinds;
+        ApplyMenuScale();
+        PurchaseMenu.TickAppearanceState();
         if (UpgradeInput.WasPressed(keybinds?.PlayerMenuClose)
             || (!typing && UpgradeInput.WasPressed(keybinds?.PurchaseMenu)))
         {
@@ -116,7 +118,7 @@ public class MenuController : MonoBehaviour
     private void ApplyMenuScale()
     {
         if (_panelRt != null)
-            _panelRt.localScale = Vector3.one * PurchaseMenu.MenuScale;
+            _panelRt.localScale = Vector3.one * PurchaseMenu.FittedMenuScale(_root.GetComponent<RectTransform>());
     }
 
     private IEnumerator AnimateOpen()
@@ -125,7 +127,7 @@ public class MenuController : MonoBehaviour
         ApplyMenuScale();
 
         float t = 0f;
-        while (t < OpenDuration)
+        while (t < OpenDuration && !(Plugin.ReduceMenuMotion?.Value ?? false))
         {
             t += Time.unscaledDeltaTime;
             float n    = Mathf.Clamp01(t / OpenDuration);
@@ -154,7 +156,7 @@ public class MenuController : MonoBehaviour
         float startAlpha = _canvasGroup != null ? _canvasGroup.alpha : 1f;
 
         float t = 0f;
-        while (t < CloseDuration)
+        while (t < CloseDuration && !(Plugin.ReduceMenuMotion?.Value ?? false))
         {
             t += Time.unscaledDeltaTime;
             float n    = Mathf.Clamp01(t / CloseDuration);

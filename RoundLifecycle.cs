@@ -58,24 +58,33 @@ namespace Y4NGZUpgrades
 
             RoundStarted += Interactive.Patches.CombatFeedbackPatch.OnRoundStarted;
             RoundStarted += Interactive.Patches.WorldFeedbackPatch.OnRoundStarted;
-            RoundStarted += Patches.AdrenalineRushPatch.OnRoundStarted;
+            RoundStarted += Patches.NineLivesPatch.OnRoundStarted;
+            RoundStarted += Upgrades.LoneWolfUpgrade.Cleanup;
             RoundStarted += Patches.CommandNetPatch.OnRoundStarted;
             RoundStarted += Patches.CourierDronePatch.OnRoundStarted;
             RoundStarted += Patches.EscapeArtistDoubleJumpPatch.OnRoundStarted;
-            RoundStarted += Patches.EscapeReflexPatch.OnRoundStarted;
             RoundStarted += Patches.FieldMechanicCompanyPatch.OnRoundStarted;
+            RoundStarted += Patches.FieldTabletMainframeNet.OnRoundStarted;
             RoundStarted += Patches.ForemanPingPatch.OnRoundStarted;
             RoundStarted += Patches.ForemanSupportPatch.OnRoundStarted;
-            RoundStarted += Patches.GlowInTheDarkPatch.OnRoundStarted;
             RoundStarted += Patches.LedgeMantlePatch.OnRoundStarted;
             RoundStarted += Patches.NativeFistsPatch.OnRoundStarted;
             RoundStarted += Patches.PanicSlidePatch.OnRoundStarted;
             RoundStarted += Patches.ShadowStepPatch.OnRoundStarted;
-            RoundStarted += Patches.ShoulderCheckPatch.OnRoundStarted;
             RoundStarted += Patches.SixthSensePatch.OnRoundStarted;
+            // #459: the host's battery-break latch; kept only while its break is unresolved.
+            RoundStarted += Patches.ShipBatteryXpPatch.OnRoundStarted;
             RoundStarted += Patches.SquadSightPatch.OnRoundStarted;
+            // F-INFRA-4 (WP1 request): the per-turret Light Feet hold-fire timer table is keyed
+            // on Turret instances from the previous scene, so it has to be cleared per round.
+            RoundStarted += Patches.TurretPatch.OnRoundStarted;
             RoundStarted += Patches.TurretHackerPatch.OnRoundStarted;
             RoundStarted += Patches.WorklightBeaconPatch.OnRoundStarted;
+            // Resilience adds its reserve layer only while bonus health is active. Clear that
+            // child layer at every round boundary, including abandoned rounds.
+            RoundStarted += HUD.ResilienceHealthPresentation.Restore;
+            // WP12 dead-code sweep: GlowInTheDarkPatch and ShoulderCheckPatch are deleted - both
+            // were gated on accessors whose names matched no catalog row, so neither could act.
             // The weapon, grenade and grenade-launcher per-round resets moved to
             // BetterArmory.ArmoryRoundLifecycle (#266), which postfixes the same
             // StartOfRound.openingDoorsSequence for the same reason (#214).
@@ -173,6 +182,9 @@ namespace Y4NGZUpgrades
         private static void PostSetShipReadyToLand()
         {
             ForceRoundOver("ship ready to land");
+            // #458: Company clears its report ledger here; a crewmate's late share from this
+            // round must not re-populate it.
+            Patches.ProgressionReportShareNetwork.CloseRound();
         }
 
         [HarmonyPatch(typeof(GameNetworkManager), "Disconnect")]

@@ -15,6 +15,12 @@ namespace Y4NGZUpgrades.Patches
     {
         internal static bool IsLightningStrike = false;
 
+        // F-GHOST-13: the only acknowledgement that Light Feet L3 ate a strike was a Debug log
+        // line. A single strike reaches both the KillPlayer and the DamagePlayer guard, so the
+        // rate limit is shared - the player gets one tip per strike, not two.
+        private const float SaveTipCooldownSeconds = 20f;
+        private static float _nextSaveTipAt;
+
         [HarmonyPrefix]
         [HarmonyPatch(typeof(StormyWeather), "LightningStrike")]
         private static void LightningStrikePrefix()
@@ -50,6 +56,7 @@ namespace Y4NGZUpgrades.Patches
                     && LightFeetUpgrade.HasTier(LightFeetUpgrade.TIER_GROUNDED))
                 {
                     Plugin.Log.LogDebug("Light Feet T3: Prevented lightning kill on local player.");
+                    NotifyLightningSave();
                     return false;
                 }
             }
@@ -71,6 +78,7 @@ namespace Y4NGZUpgrades.Patches
                     && LightFeetUpgrade.HasTier(LightFeetUpgrade.TIER_GROUNDED))
                 {
                     Plugin.Log.LogDebug("Light Feet T3: Prevented lightning damage on local player.");
+                    NotifyLightningSave();
                     return false;
                 }
             }
@@ -79,6 +87,14 @@ namespace Y4NGZUpgrades.Patches
                 Plugin.Log.LogError($"StormyWeatherPatch.PreventLightningDamage failed: {e}");
             }
             return true;
+        }
+
+        private static void NotifyLightningSave()
+        {
+            if (UnityEngine.Time.time < _nextSaveTipAt) return;
+
+            _nextSaveTipAt = UnityEngine.Time.time + SaveTipCooldownSeconds;
+            HUDManager.Instance?.DisplayTip("LIGHT FEET", "Grounded. The strike passed through you.");
         }
     }
 }

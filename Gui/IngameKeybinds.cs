@@ -9,14 +9,16 @@ public class IngameKeybinds : LcInputActions
     [InputAction("<Keyboard>/p", Name="PurchaseMenu")]
     public InputAction PurchaseMenu { get; set; } = null!;
 
-    [InputAction("<Keyboard>/g", Name="[Y4NGZ] Shadow Step")]
+    // F-SHADOW-3: default moved off G, which vanilla binds to the emote wheel.
+    [InputAction("<Keyboard>/x", Name="[Y4NGZ] Shadow Step")]
     public InputAction ShadowStep { get; set; } = null!;
 
     [InputAction("<Keyboard>/q", Name="[Y4NGZ] Foreman Ping")]
     public InputAction ForemanPing { get; set; } = null!;
 
-    [InputAction("<Keyboard>/r", Name="[Y4NGZ] Rally Call")]
-    public InputAction RallyCall { get; set; } = null!;
+    // F-FOREMAN-A-6 / WP12 sweep: the "[Y4NGZ] Rally Call" action is gone with RallyCallUpgrade
+    // and the Rally half of ForemanSupportPatch. It also freed <Keyboard>/r, which BetterArmory
+    // uses for "[Y4NGZ] Reload Weapon" (see the note below).
 
     [InputAction("<Keyboard>/y", Name="[Y4NGZ] Field Tablet")]
     public InputAction FieldTablet { get; set; } = null!;
@@ -54,6 +56,9 @@ public class IngameKeybinds : LcInputActions
     [InputAction("<Keyboard>/enter", Name="[Y4NGZ] Player Menu Select")]
     public InputAction PlayerMenuSelect { get; set; } = null!;
 
+    [InputAction("<Keyboard>/tab", Name="[Y4NGZ] Player Menu Details / Items")]
+    public InputAction PlayerMenuInspector { get; set; } = null!;
+
     [InputAction("<Keyboard>/leftArrow", Name="[Y4NGZ] Tablet Previous Tab")]
     public InputAction TabletPreviousTab { get; set; } = null!;
 
@@ -81,7 +86,9 @@ public class IngameKeybinds : LcInputActions
     [InputAction("<Keyboard>/minus", Name="[Y4NGZ] Tablet Zoom Out")]
     public InputAction TabletZoomOut { get; set; } = null!;
 
-    [InputAction("<Keyboard>/escape", Name="[Y4NGZ] Drone Pilot Exit")]
+    // F-DRONE sweep: Escape is the vanilla pause key, so an exit bound to it opened the quick
+    // menu in the same frame it left the drone. Backspace is unbound in vanilla gameplay.
+    [InputAction("<Keyboard>/backspace", Name="[Y4NGZ] Drone Pilot Exit")]
     public InputAction DronePilotExit { get; set; } = null!;
 
     [InputAction("<Keyboard>/space", Name="[Y4NGZ] Drone Pilot Ascend")]
@@ -134,7 +141,6 @@ public class IngameKeybinds : LcInputActions
             yield return PurchaseMenu;
             yield return ShadowStep;
             yield return ForemanPing;
-            yield return RallyCall;
             yield return FieldTablet;
             yield return CommandNetTransmit;
             yield return WorklightBeacon;
@@ -147,6 +153,7 @@ public class IngameKeybinds : LcInputActions
             yield return PlayerMenuLeft;
             yield return PlayerMenuRight;
             yield return PlayerMenuSelect;
+            yield return PlayerMenuInspector;
             yield return TabletPreviousTab;
             yield return TabletNextTab;
             yield return TabletUp;
@@ -186,7 +193,6 @@ public class IngameKeybinds : LcInputActions
             yield return PurchaseMenu;
             yield return ShadowStep;
             yield return ForemanPing;
-            yield return RallyCall;
             yield return FieldTablet;
             yield return CommandNetTransmit;
             yield return WorklightBeacon;
